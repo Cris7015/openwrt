@@ -83,6 +83,15 @@ define Device/tplink_archer-vr1200v-v2
 endef
 TARGET_DEVICES += tplink_archer-vr1200v-v2
 
+define Device/tplink_archer-xr500v-v1
+  DEVICE_VENDOR := TP-Link
+  DEVICE_MODEL := Archer XR500v
+  DEVICE_VARIANT := v1
+  DEVICE_DTS := en751221_tplink_archer-xr500v-v1
+  DEVICE_PACKAGES := kmod-usb3 kmod-mt76x2
+endef
+TARGET_DEVICES += tplink_archer-xr500v-v1
+
 define Device/zyxel_pmg5617ga
   DEVICE_VENDOR := Zyxel
   DEVICE_MODEL := PMG5617GA

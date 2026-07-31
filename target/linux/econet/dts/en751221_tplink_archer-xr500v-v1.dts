@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+
+#include "en751221.dtsi"
+
+/ {
+	model = "TP-Link Archer XR500v v1";
+	compatible = "tplink,archer-xr500v-v1", "econet,en751221";
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x10000000>;
+	};
+
+	chosen {
+		stdout-path = "/serial@1fbf0000:115200";
+		linux,usable-memory-range = <0x00020000 0x0ffe0000>;
+	};
+};
+
+&nand {
+	status = "okay";
+	econet,bmt;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "bootloader";
+			reg = <0x0 0x40000>;
+			read-only;
+		};
+
+		partition@40000 {
+			label = "romfile";
+			reg = <0x40000 0x40000>;
+			read-only;
+		};
+
+		partition@80000 {
+			label = "kernel";
+			reg = <0x80000 0x300000>;
+			read-only;
+		};
+
+		partition@380000 {
+			label = "rootfs_stock";
+			reg = <0x380000 0x1000000>;
+			read-only;
+		};
+
+		partition@1380000 {
+			label = "misc";
+			reg = <0x1380000 0x480000>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				macaddr_misc_f100: macaddr@f100 {
+					compatible = "mac-base";
+					reg = <0xf100 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+
+				eeprom_misc_e0000: eeprom@e0000 {
+					reg = <0xe0000 0x200>;
+				};
+			};
+		};
+
+		partition@1800000 {
+			label = "kernel1";
+			reg = <0x1800000 0x300000>;
+		};
+
+		partition@1b00000 {
+			label = "rootfs1";
+			reg = <0x1b00000 0x1000000>;
+			linux,rootfs;
+		};
+
+		partition@2b00000 {
+			label = "others";
+			reg = <0x2b00000 0x4e0000>;
+			read-only;
+		};
+
+		partition@2fe0000 {
+			label = "bootflag";
+			reg = <0x2fe0000 0x20000>;
+			read-only;
+		};
+	};
+};
+
+&gmac0 {
+	status = "okay";
+	nvmem-cells = <&macaddr_misc_f100 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&pcie1 {
+	status = "okay";
+};
+
+&slot1 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		nvmem-cells = <&eeprom_misc_e0000>, <&macaddr_misc_f100 2>;
+		nvmem-cell-names = "eeprom", "mac-address";
+	};
+};
+
+&usb {
+	mediatek,u3p-dis-msk = <0x1>;
+};
