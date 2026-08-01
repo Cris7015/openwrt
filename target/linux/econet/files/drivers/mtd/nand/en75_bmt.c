@@ -67,6 +67,22 @@
  *   This boolean property enables the BMT, if it is not present on the
  *   MTD device, the BMT will not be enabled.
  *
+ * - econet,esmt-f50l1g41a-oem-fdm;
+ *   Opt in to the XR500v OEM FDM layout, where logical bytes 0..3 are stored
+ *   at physical OOB bytes 0, 8, 9 and 10. This property requires one of the
+ *   static modes below; without it the original BMT scan and writer are used.
+ *
+ * - econet,bmt-read-only;
+ *   Diagnostic mode. Scan and validate the existing BBT/BMT, but do not
+ *   erase pending reserve blocks, update tables or enable remapping.
+ *
+ * - econet,bmt-write-through;
+ *   Validate and use the existing BBT/BMT for address translation, while
+ *   exposing the MTD writable without dynamic remapping or table updates.
+ *   A physical erase/write failure is returned to the caller.  This is useful
+ *   for controlled installation on a lab device before the full BMT update
+ *   transaction has been validated.
+ *
  * - econet,enable-remap;
  *   This boolean property enables remapping of observed worn blocks. It can
  *   be placed either on the device or on a partition within a fixed partitions
@@ -158,6 +174,9 @@ const char *log_pfx			= "en75_bmt";
 const char *name_can_write_factory_bbt	= "econet,can-write-factory-bbt";
 const char *name_factory_badblocks	= "econet,factory-badblocks";
 const char *name_enable_remap		= "econet,enable-remap";
+const char *name_esmt_oem_fdm		= "econet,esmt-f50l1g41a-oem-fdm";
+const char *name_read_only		= "econet,bmt-read-only";
+const char *name_write_through		= "econet,bmt-write-through";
 const char *name_assert_reserve_size	= "econet,assert-reserve-size";
 const char *name_bbt_table_size	= "econet,bbt-table-size";
 
@@ -289,6 +308,15 @@ struct en75_bmt_m {
 
 	/* Unless set, fail any attempt to write the BBT. */
 	s8 can_write_factory_bbt;
+
+	/* Use the XR500v ESMT OEM FDM mapping and strict table selection. */
+	s8 esmt_oem_fdm;
+
+	/* Scan tables without enabling any write or remap path. */
+	s8 read_only;
+
+	/* Allow direct writes, but never change mappings or on-flash tables. */
+	s8 write_through;
 };
 
 /*
@@ -404,6 +432,37 @@ static bool block_index_is_sane(const struct en75_bmt_m *ctx,
 	if (!user_block && bi.index < ctx->reserve_area_begin)
 		return false;
 	return true;
+}
+
+/*
+ * OEM logical FDM byte 0 is the physical bad-block marker.  The F50L1G41A
+ * then has seven ECC bytes before the first free OOB region, so logical FDM
+ * bytes 1..3 live at physical bytes 8..10.
+ */
+#define OEM_ESMT_FDM_LEN		4
+#define OEM_ESMT_FDM_PHYS_LEN		11
+
+static const u8 oem_esmt_fdm_phys[OEM_ESMT_FDM_LEN] = { 0, 8, 9, 10 };
+
+static int oem_esmt_fdm_layout_valid(const struct en75_bmt_m *ctx)
+{
+	struct mtd_info *mtd = ctx->mtk->mtd;
+	struct mtd_oob_region free;
+
+	if (ctx->mtk->oob_offset || mtd->oobsize < OEM_ESMT_FDM_PHYS_LEN ||
+	    mtd_ooblayout_free(mtd, 0, &free) ||
+	    free.offset != 8 || free.length < 3)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
+static void oem_esmt_fdm_gather(
+	const u8 phys[static OEM_ESMT_FDM_PHYS_LEN],
+	u8 logical[static OEM_ESMT_FDM_LEN])
+{
+	for (int i = 0; i < OEM_ESMT_FDM_LEN; i++)
+		logical[i] = phys[oem_esmt_fdm_phys[i]];
 }
 
 /*
@@ -824,26 +883,156 @@ enum block_is_bad {
 	BB_FACTORY_BAD,
 	/* Marked bad by us */
 	BB_WORN,
+	/* Reserve-pool block retired through OEM logical FDM byte 1. */
+	BB_POOL_BAD,
 	/* We don't know */
 	BB_UNKNOWN_BAD,
 };
 
-static enum block_is_bad fdm_is_bad(u8 fdm[static 4])
+static enum block_is_bad fdm_is_bad(const struct en75_bmt_m *ctx,
+				    const u8 fdm[static 4])
 {
-	if (fdm[0] == 0xff && fdm[1] == 0xff)
-		return BB_GOOD;
+	if (!ctx->esmt_oem_fdm) {
+		if (fdm[0] == 0xff && fdm[1] == 0xff)
+			return BB_GOOD;
+		if (fdm[0] == BLOCK_WORN_MARK)
+			return BB_WORN;
+		if (fdm[0] == 0x00 || fdm[1] == 0x00)
+			return BB_FACTORY_BAD;
+		return BB_UNKNOWN_BAD;
+	}
+
+	if (fdm[0] == 0xff)
+		return fdm[1] == 0xff ? BB_GOOD : BB_POOL_BAD;
 	if (fdm[0] == BLOCK_WORN_MARK)
 		return BB_WORN;
-	if (fdm[0] == 0x00 || fdm[1] == 0x00)
+	if (fdm[0] == 0x00)
 		return BB_FACTORY_BAD;
 	return BB_UNKNOWN_BAD;
 }
 
-static bool fdm_is_mapped(u8 fdm[static 4])
+static bool fdm_raw_bad_for_geometry(const u8 fdm[static 4])
 {
-	if (fdm[0] != 0xff || fdm[1] != 0xff)
+	return fdm[0] != 0xff;
+}
+
+static bool fdm_skips_pool_block(const u8 fdm[static 4])
+{
+	return fdm[0] != 0xff || fdm[1] != 0xff;
+}
+
+static bool fdm_is_mapped(const u8 fdm[static 4])
+{
+	if (fdm_skips_pool_block(fdm))
 		return false;
 	return fdm[2] != 0xff || fdm[3] != 0xff;
+}
+
+/*
+ * The ESMT F50L1G41A layout used by the OEM does not store the first four
+ * logical FDM bytes contiguously.  Its physical OOB layout starts with the
+ * bad-block marker at byte 0, followed by ECC bytes 1..7 and user metadata at
+ * bytes 8..15.  The OEM compacts those areas, so logical FDM bytes 0..3 are
+ * physical bytes 0, 8, 9 and 10.
+ *
+ * Only boards which explicitly opt in use this mapping. The legacy scan and
+ * writer continue to use the original contiguous FDM representation.
+ */
+static int r_read_oem_esmt_fdm_page(const struct en75_bmt_m *ctx, u16 block,
+				    u8 *data, u32 datalen,
+				    u8 fdm[static 4])
+{
+	struct mtd_info *mtd = ctx->mtk->mtd;
+	u8 phys[OEM_ESMT_FDM_PHYS_LEN];
+	struct mtd_oob_ops ops = {
+		.mode = MTD_OPS_PLACE_OOB,
+		.ooboffs = 0,
+		.oobbuf = phys,
+		.ooblen = sizeof(phys),
+		.datbuf = data,
+		.len = datalen,
+	};
+	int ret;
+
+	ret = oem_esmt_fdm_layout_valid(ctx);
+	if (ret)
+		return ret;
+
+	memset(data, 0xff, datalen);
+	memset(phys, 0xff, sizeof(phys));
+	memset(fdm, 0xff, 4);
+	ret = ctx->mtk->_read_oob(mtd,
+				   ((loff_t)block) << ctx->mtk->blk_shift,
+				   &ops);
+	if (ret < 0)
+		return ret;
+	if (ops.retlen != datalen || ops.oobretlen != sizeof(phys))
+		return -EIO;
+
+	oem_esmt_fdm_gather(phys, fdm);
+
+	return ret;
+}
+
+static int r_read_oem_esmt_fdm_page_normalized(
+	const struct en75_bmt_m *ctx, u16 block, u8 *data, u32 datalen,
+	u8 fdm[static 4])
+{
+	int ret = r_read_oem_esmt_fdm_page(ctx, block, data, datalen, fdm);
+
+	if (ret > 0) {
+		pr_info("%s: %d bitflips\n", __func__, ret);
+		return 0;
+	}
+
+	return ret;
+}
+
+static int r_read_fdm_page_normalized(const struct en75_bmt_m *ctx,
+				      u16 block, u8 *data, u32 datalen,
+				      u8 fdm[static 4])
+{
+	if (ctx->esmt_oem_fdm)
+		return r_read_oem_esmt_fdm_page_normalized(ctx, block, data,
+							   datalen, fdm);
+
+	return bbt_nand_read(blk_pg(block), data, datalen, fdm, 4);
+}
+
+/*
+ * Read the first-page marker window without asking the ECC engine to decode
+ * page data.  The OEM uses logical FDM byte 0 alone while calculating the
+ * reserve geometry, even when that block's data is no longer decodable.
+ */
+static int r_read_oem_esmt_fdm_raw(const struct en75_bmt_m *ctx, u16 block,
+				   u8 fdm[static OEM_ESMT_FDM_LEN])
+{
+	struct mtd_info *mtd = ctx->mtk->mtd;
+	u8 phys[OEM_ESMT_FDM_PHYS_LEN];
+	struct mtd_oob_ops ops = {
+		.mode = MTD_OPS_RAW,
+		.ooboffs = 0,
+		.oobbuf = phys,
+		.ooblen = sizeof(phys),
+	};
+	int ret;
+
+	ret = oem_esmt_fdm_layout_valid(ctx);
+	if (ret)
+		return ret;
+
+	memset(phys, 0xff, sizeof(phys));
+	memset(fdm, 0xff, OEM_ESMT_FDM_LEN);
+	ret = ctx->mtk->_read_oob(mtd,
+				   ((loff_t)block) << ctx->mtk->blk_shift,
+				   &ops);
+	if (ret < 0)
+		return ret;
+	if (ops.retlen || ops.oobretlen != sizeof(phys))
+		return -EIO;
+
+	oem_esmt_fdm_gather(phys, fdm);
+	return 0;
 }
 
 static void r_reconstruct_bmt(struct en75_bmt_m *ctx)
@@ -870,10 +1059,10 @@ static void r_reconstruct_bmt(struct en75_bmt_m *ctx)
 		u8 fdm[4];
 		int ret;
 
-		ret = bbt_nand_read(blk_pg(i),
-				    ctx->mtk->data_buf, ctx->mtk->pg_size,
-				    fdm, sizeof(fdm));
-		if (ret < 0 || fdm_is_bad(fdm))
+		ret = r_read_fdm_page_normalized(
+			ctx, i, ctx->mtk->data_buf,
+			ctx->mtk->pg_size, fdm);
+		if (ret < 0 || fdm_is_bad(ctx, fdm))
 			continue;
 
 		/* Vendor firmware uses host order. */
@@ -918,13 +1107,14 @@ static int r_reconstruct_bbt(struct bbt_table *bbt_out, const struct en75_bmt_m 
 		if (is_mapped)
 			continue;
 
-		ret = bbt_nand_read(blk_pg(i),
-				    ctx->mtk->data_buf, ctx->mtk->pg_size,
-				    fdm, sizeof(fdm));
+		ret = r_read_fdm_page_normalized(
+			ctx, i, ctx->mtk->data_buf,
+			ctx->mtk->pg_size, fdm);
 		if (!ret) {
-			enum block_is_bad status = fdm_is_bad(fdm);
+			enum block_is_bad status = fdm_is_bad(ctx, fdm);
 
-			if (status == BB_GOOD || status == BB_WORN)
+			if (status == BB_GOOD || status == BB_WORN ||
+			    status == BB_POOL_BAD)
 				continue;
 		}
 
@@ -954,6 +1144,7 @@ static int try_parse_bbt(struct bbt_table *out, u8 *buf, int len, u16 table_size
 	if (len < bbt_size)
 		return -EINVAL;
 
+	memset(&workspace, 0, sizeof(workspace));
 	memcpy(&workspace, buf, bbt_size);
 
 	if (strncmp(workspace.header.signature, "RAWB", 4))
@@ -964,7 +1155,8 @@ static int try_parse_bbt(struct bbt_table *out, u8 *buf, int len, u16 table_size
 
 	sort_bbt(&workspace);
 
-	memcpy(out, &workspace, bbt_size);
+	if (out)
+		memcpy(out, &workspace, bbt_size);
 	return 0;
 }
 
@@ -994,11 +1186,266 @@ static int try_parse_bmt(struct bmt_table *out, u8 *buf, int len)
 		bmt_checksum(&workspace, workspace.header.size))
 		return -EINVAL;
 
-	memcpy(out, &workspace, sizeof(workspace));
+	if (out)
+		memcpy(out, &workspace, sizeof(workspace));
 	return 0;
 }
 
-static int r_scan_reserve(struct en75_bmt_m *ctx)
+union table_candidate {
+	struct bmt_table bmt;
+	struct bbt_table bbt;
+};
+
+/*
+ * Read a first page without normalising a positive MTD return value.  The
+ * generic bbt_nand_read() helper converts corrected-bit counts to zero, which
+ * is useful normally but hides evidence needed by the read-only diagnostic.
+ */
+static int r_read_candidate_page(const struct en75_bmt_m *ctx, u16 block,
+				 u8 fdm[static 4], int *attempts)
+{
+	u8 *data_buf = ctx->mtk->data_buf;
+	u32 pg_size = ctx->mtk->pg_size;
+	int ret = -EIO;
+
+	for (int i = 0; i < INITIAL_READ_TRIES; i++) {
+		ret = r_read_oem_esmt_fdm_page(ctx, block, data_buf,
+					       pg_size, fdm);
+		*attempts = i + 1;
+		if (ret >= 0)
+			break;
+	}
+
+	return ret;
+}
+
+static bool r_copy_bmt_candidate(struct bmt_table *out, const u8 *buf, int len)
+{
+	if (len < sizeof(*out) || memcmp(buf, "BMT", 3))
+		return false;
+
+	memcpy(out, buf, sizeof(*out));
+	return true;
+}
+
+static bool r_copy_bbt_candidate(struct bbt_table *out, const u8 *buf, int len,
+				 u16 table_size)
+{
+	size_t bbt_size = sizeof(out->header) +
+			  table_size * sizeof(out->table[0]);
+
+	if (len < bbt_size || memcmp(buf, "RAWB", 4))
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	memcpy(out, buf, bbt_size);
+	return true;
+}
+
+static bool r_bmt_ranges_valid(const struct en75_bmt_m *ctx,
+			       const struct bmt_table *candidate)
+{
+	int pool_size = reserve_block_count(ctx);
+
+	if (candidate->header.size > pool_size)
+		return false;
+
+	for (int i = 0; i < candidate->header.size; i++) {
+		const struct bmt_entry entry = candidate->table[i];
+
+		if (entry.from >= ctx->reserve_area_begin ||
+		    entry.to < ctx->reserve_area_begin ||
+		    entry.to >= ctx->mtk->total_blks)
+			return false;
+	}
+
+	return true;
+}
+
+static bool r_bbt_ranges_valid(const struct en75_bmt_m *ctx,
+			       const struct bbt_table *candidate)
+{
+	if (candidate->header.size > ctx->bbt_table_size)
+		return false;
+
+	for (int i = 0; i < candidate->header.size; i++)
+		if (candidate->table[i] >= ctx->reserve_area_begin)
+			return false;
+
+	return true;
+}
+
+/* Compare the complete checksum domain, excluding unused header fields. */
+static bool r_bmt_candidates_identical(const struct bmt_table *a,
+				       const struct bmt_table *b,
+				       int pool_size)
+{
+	return a->header.version == b->header.version &&
+	       a->header.size == b->header.size &&
+	       a->header.checksum == b->header.checksum &&
+	       !memcmp(a->table, b->table,
+		       pool_size * sizeof(a->table[0]));
+}
+
+static bool r_bbt_candidates_identical(const struct bbt_table *a,
+				       const struct bbt_table *b,
+				       u16 table_size)
+{
+	return a->header.version == b->header.version &&
+	       a->header.size == b->header.size &&
+	       a->header.checksum == b->header.checksum &&
+	       !memcmp(a->table, b->table,
+		       table_size * sizeof(a->table[0]));
+}
+
+/*
+ * Repeat the reserve scan after its exact size is known.  This mirrors the
+ * OEM's scan direction and copy preference: highest acceptable BMT, lowest
+ * acceptable BBT.  Selection here is intentionally stricter than the OEM:
+ * marked, unreadable, unsupported-version or out-of-range tables are never
+ * promoted into the in-memory state.
+ */
+static int r_select_table_copies(struct en75_bmt_m *ctx)
+{
+	union table_candidate *candidate;
+	int pool_size = reserve_block_count(ctx);
+	int selected_bmt = -1;
+	int selected_bbt = -1;
+	bool bmt_conflict = false;
+	bool bbt_conflict = false;
+	u8 fdm[4];
+
+	if (pool_size <= 0 || pool_size > MAX_BMT_SIZE) {
+		pr_err("%s: reserve size %d cannot be checked as an OEM BMT domain\n",
+		       log_pfx, pool_size);
+		return -EOVERFLOW;
+	}
+
+	candidate = kmalloc(sizeof(*candidate), GFP_KERNEL);
+	if (!candidate)
+		return -ENOMEM;
+
+	memset(&ctx->bmt, 0, sizeof(ctx->bmt));
+	memset(&ctx->bbt, 0, sizeof(ctx->bbt));
+
+	/* OEM load_bmt_data(): scan from the end and keep the first valid copy. */
+	for (int block = ctx->mtk->total_blks - 1;
+	     block >= ctx->reserve_area_begin; block--) {
+		const char *relation = "rejected";
+		bool current_ok;
+		bool oem_ok;
+		bool ranges_ok;
+		bool acceptable;
+		int attempts = 0;
+		int ret;
+
+		ret = r_read_candidate_page(ctx, block, fdm, &attempts);
+		if (!r_copy_bmt_candidate(&candidate->bmt,
+					  ctx->mtk->data_buf,
+					  ctx->mtk->pg_size))
+			continue;
+
+		current_ok = candidate->bmt.header.checksum ==
+			bmt_checksum(&candidate->bmt, candidate->bmt.header.size);
+		oem_ok = candidate->bmt.header.checksum ==
+			bmt_checksum(&candidate->bmt, pool_size);
+		ranges_ok = r_bmt_ranges_valid(ctx, &candidate->bmt);
+		acceptable = ret >= 0 && !fdm_skips_pool_block(fdm) &&
+			     candidate->bmt.header.version == 1 &&
+			     oem_ok && ranges_ok;
+
+		if (acceptable && selected_bmt < 0) {
+			memcpy(&ctx->bmt, &candidate->bmt, sizeof(ctx->bmt));
+			selected_bmt = block;
+			relation = "selected-highest";
+		} else if (acceptable) {
+			if (r_bmt_candidates_identical(
+				    &ctx->bmt, &candidate->bmt, pool_size)) {
+				relation = "identical";
+			} else {
+				relation = "CONFLICT";
+				bmt_conflict = true;
+			}
+		}
+
+		pr_info("%s: BMT candidate block=%d ret=%d attempts=%d fdm=%02x:%02x:%02x:%02x version=%u size=%u current-csum=%s oem-csum[%d]=%s ranges=%s relation=%s\n",
+			log_pfx, block, ret, attempts,
+			fdm[0], fdm[1], fdm[2], fdm[3],
+			candidate->bmt.header.version,
+			candidate->bmt.header.size,
+			current_ok ? "ok" : "bad", pool_size,
+			oem_ok ? "ok" : "bad",
+			ranges_ok ? "ok" : "bad", relation);
+	}
+
+	/* OEM load_bbt_data(): scan from the pool start and keep the first. */
+	for (int block = ctx->reserve_area_begin;
+	     block < ctx->mtk->total_blks; block++) {
+		const char *relation = "rejected";
+		bool checksum_ok;
+		bool ranges_ok;
+		bool acceptable;
+		int attempts = 0;
+		int ret;
+
+		ret = r_read_candidate_page(ctx, block, fdm, &attempts);
+		if (!r_copy_bbt_candidate(&candidate->bbt,
+					  ctx->mtk->data_buf,
+					  ctx->mtk->pg_size,
+					  ctx->bbt_table_size))
+			continue;
+
+		checksum_ok = candidate->bbt.header.checksum ==
+			bbt_checksum(&candidate->bbt, ctx->bbt_table_size);
+		ranges_ok = r_bbt_ranges_valid(ctx, &candidate->bbt);
+		acceptable = ret >= 0 && !fdm_skips_pool_block(fdm) &&
+			     candidate->bbt.header.version == 1 &&
+			     checksum_ok && ranges_ok;
+
+		if (acceptable && selected_bbt < 0) {
+			memcpy(&ctx->bbt, &candidate->bbt, sizeof(ctx->bbt));
+			selected_bbt = block;
+			relation = "selected-lowest";
+		} else if (acceptable) {
+			if (r_bbt_candidates_identical(
+				    &ctx->bbt, &candidate->bbt,
+				    ctx->bbt_table_size)) {
+				relation = "identical";
+			} else {
+				relation = "CONFLICT";
+				bbt_conflict = true;
+			}
+		}
+
+		pr_info("%s: BBT candidate block=%d ret=%d attempts=%d fdm=%02x:%02x:%02x:%02x version=%u size=%u csum[%u]=%s ranges=%s relation=%s\n",
+			log_pfx, block, ret, attempts,
+			fdm[0], fdm[1], fdm[2], fdm[3],
+			candidate->bbt.header.version,
+			candidate->bbt.header.size,
+			ctx->bbt_table_size,
+			checksum_ok ? "ok" : "bad",
+			ranges_ok ? "ok" : "bad", relation);
+	}
+
+	if (selected_bmt >= 0)
+		pr_info("%s: selected high-to-low diagnostic BMT copy at block %d\n",
+			log_pfx, selected_bmt);
+	if (selected_bbt >= 0) {
+		pr_info("%s: selected low-to-high diagnostic BBT copy at block %d\n",
+			log_pfx, selected_bbt);
+		sort_bbt(&ctx->bbt);
+	}
+
+	kfree(candidate);
+	if (bmt_conflict || bbt_conflict) {
+		pr_err("%s: conflicting valid table copies; refusing attach\n",
+		       log_pfx);
+		return -EUCLEAN;
+	}
+	return 0;
+}
+
+static int r_scan_reserve_legacy(struct en75_bmt_m *ctx)
 {
 	u16 total_blks = ctx->mtk->total_blks;
 	int cursor = total_blks - 1;
@@ -1025,7 +1472,7 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		for (int i = 0; i < INITIAL_READ_TRIES; i++) {
 			ret = bbt_nand_read(blk_pg(cursor),
 					    data_buf,
-					   pg_size,
+					    pg_size,
 					    fdm, sizeof(fdm));
 			if (!ret)
 				break;
@@ -1035,23 +1482,27 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 			.status = BS_INVALID
 		};
 
-		if (ret || fdm_is_bad(fdm)) {
-			pr_info("%s: skipping bad block %d in reserve area\n", log_pfx, cursor);
+		if (ret || fdm_is_bad(ctx, fdm)) {
+			pr_info("%s: skipping bad block %d in reserve area\n",
+				log_pfx, cursor);
 			bif.status = BS_BAD;
 		} else if (fdm_is_mapped(fdm)) {
 			pr_debug("%s: found mapped block %d\n", log_pfx, cursor);
 			bif.status = BS_MAPPED;
-		} else if (!try_parse_bbt(&ctx->bbt, data_buf, pg_size, ctx->bbt_table_size)) {
+		} else if (!try_parse_bbt(&ctx->bbt, data_buf, pg_size,
+					  ctx->bbt_table_size)) {
 			pr_info("%s: found BBT in block %d\n", log_pfx, cursor);
 			bif.status = BS_BBT;
 		} else if (!try_parse_bmt(&ctx->bmt, data_buf, pg_size)) {
 			pr_info("%s: found BMT in block %d\n", log_pfx, cursor);
 			bif.status = BS_BMT;
-		} else if (block_is_erased(data_buf, pg_size, fdm, sizeof(fdm))) {
+		} else if (block_is_erased(data_buf, pg_size, fdm,
+					   sizeof(fdm))) {
 			pr_debug("%s: found available block %d\n", log_pfx, cursor);
 			bif.status = BS_AVAILABLE;
 		} else {
-			pr_debug("%s: found block needing erase %d\n", log_pfx, cursor);
+			pr_debug("%s: found block needing erase %d\n",
+				 log_pfx, cursor);
 			bif.status = BS_NEED_ERASE;
 		}
 
@@ -1067,6 +1518,123 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		return -ENOSPC;
 	}
 	ctx->reserve_area_begin = cursor;
+	return 0;
+}
+
+static int r_scan_reserve_esmt(struct en75_bmt_m *ctx)
+{
+	u16 total_blks = ctx->mtk->total_blks;
+	int cursor = total_blks - 1;
+	int raw_good_blocks = 0;
+	int rblock = 0;
+	u8 raw_fdm[OEM_ESMT_FDM_LEN];
+
+	/*
+	 * Phase A mirrors calc_bmt_pool_size(): only logical FDM byte 0
+	 * contributes to geometry.  Logical byte 1 retires a pool block, but it
+	 * must not move reserve_area_begin or change the BMT checksum domain.
+	 */
+	for (; cursor > 0; cursor--) {
+		int ret = -EIO;
+
+		for (int i = 0; i < INITIAL_READ_TRIES; i++) {
+			ret = r_read_oem_esmt_fdm_raw(ctx, cursor, raw_fdm);
+			if (!ret)
+				break;
+		}
+		if (ret) {
+			pr_err("%s: cannot determine raw marker for reserve block %d: %d\n",
+			       log_pfx, cursor, ret);
+			return ret;
+		}
+
+		if (!fdm_raw_bad_for_geometry(raw_fdm) &&
+		    ++raw_good_blocks >= REQUIRED_GOOD_BLOCKS(total_blks))
+			break;
+	}
+	if (!cursor) {
+		pr_err("%s: not enough raw-good blocks found, need %d got %d\n",
+		       log_pfx, REQUIRED_GOOD_BLOCKS(total_blks), raw_good_blocks);
+		return -ENOSPC;
+	}
+
+	ctx->reserve_area_begin = cursor;
+	ctx->rblocks = kcalloc(reserve_block_count(ctx),
+			       sizeof(*ctx->rblocks), GFP_KERNEL);
+	if (!ctx->rblocks)
+		return -ENOMEM;
+
+	/*
+	 * Phase B classifies the now-fixed pool.  Both OEM marker bytes make a
+	 * block unavailable, but neither a logical-byte-1 marker nor a data ECC
+	 * failure is allowed to retroactively alter the geometry from phase A.
+	 */
+	for (int block = total_blks - 1; block >= ctx->reserve_area_begin;
+	     block--) {
+		u8 page_fdm[OEM_ESMT_FDM_LEN];
+		u8 *data_buf = ctx->mtk->data_buf;
+		u32 pg_size = ctx->mtk->pg_size;
+		int marker_ret = -EIO;
+		int data_ret = -EIO;
+
+		for (int i = 0; i < INITIAL_READ_TRIES; i++) {
+			marker_ret = r_read_oem_esmt_fdm_raw(ctx, block, raw_fdm);
+			if (!marker_ret)
+				break;
+		}
+
+		if (!marker_ret && !fdm_skips_pool_block(raw_fdm)) {
+			for (int i = 0; i < INITIAL_READ_TRIES; i++) {
+				data_ret = r_read_oem_esmt_fdm_page_normalized(
+					ctx, block, data_buf, pg_size, page_fdm);
+				if (!data_ret)
+					break;
+			}
+		}
+
+		struct block_info bif = {
+			.index = { .index = block },
+			.status = BS_INVALID
+		};
+
+		if (marker_ret) {
+			pr_warn("%s: marker read failed for reserve block %d: %d\n",
+				log_pfx, block, marker_ret);
+			bif.status = BS_BAD;
+		} else if (fdm_skips_pool_block(raw_fdm)) {
+			pr_info("%s: skipping OEM-marked block %d in reserve area\n",
+				log_pfx, block);
+			bif.status = BS_BAD;
+		} else if (data_ret) {
+			pr_info("%s: skipping unreadable block %d in reserve area: %d\n",
+				log_pfx, block, data_ret);
+			bif.status = BS_BAD;
+		} else if (memcmp(raw_fdm, page_fdm, OEM_ESMT_FDM_LEN)) {
+			pr_warn("%s: inconsistent raw/ECC FDM for reserve block %d\n",
+				log_pfx, block);
+			bif.status = BS_BAD;
+		} else if (!try_parse_bbt(NULL, data_buf, pg_size,
+					  ctx->bbt_table_size)) {
+			pr_info("%s: found BBT in block %d\n", log_pfx, block);
+			bif.status = BS_BBT;
+		} else if (!try_parse_bmt(NULL, data_buf, pg_size)) {
+			pr_info("%s: found BMT in block %d\n", log_pfx, block);
+			bif.status = BS_BMT;
+		} else if (fdm_is_mapped(raw_fdm)) {
+			pr_debug("%s: found mapped block %d\n", log_pfx, block);
+			bif.status = BS_MAPPED;
+		} else if (block_is_erased(data_buf, pg_size, raw_fdm,
+					   sizeof(raw_fdm))) {
+			pr_debug("%s: found available block %d\n", log_pfx, block);
+			bif.status = BS_AVAILABLE;
+		} else {
+			pr_debug("%s: found block needing erase %d\n", log_pfx, block);
+			bif.status = BS_NEED_ERASE;
+		}
+
+		ctx->rblocks[rblock++] = bif;
+	}
+
 	return 0;
 }
 
@@ -1208,9 +1776,11 @@ static int add_remap_range(struct en75_bmt_m *ctx, u16 begin_block, u16 size_blo
 
 static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 {
+	struct device_node *parts_np;
 	u32 factory_badblocks[MAX_FACTORY_BAD_BLOCKS_OF];
 	int factory_badblocks_count = -1;
 	int assert_reserve_size = -1;
+	bool child_remap = false;
 	u32 bbt_table_size;
 	int ret;
 
@@ -1223,8 +1793,29 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 		return -EINVAL;
 	}
 	ctx->bbt_table_size = bbt_table_size;
+	ctx->esmt_oem_fdm = of_property_read_bool(np, name_esmt_oem_fdm);
+	ctx->read_only = of_property_read_bool(np, name_read_only);
+	ctx->write_through = of_property_read_bool(np, name_write_through);
+	if (ctx->read_only && ctx->write_through) {
+		pr_err("%s: %s and %s are mutually exclusive\n", log_pfx,
+		       name_read_only, name_write_through);
+		return -EINVAL;
+	}
+	if ((ctx->read_only || ctx->write_through) && !ctx->esmt_oem_fdm) {
+		pr_err("%s: %s or %s requires %s\n", log_pfx,
+		       name_read_only, name_write_through, name_esmt_oem_fdm);
+		return -EINVAL;
+	}
+	if (ctx->esmt_oem_fdm && !ctx->read_only && !ctx->write_through) {
+		pr_err("%s: %s requires a static BMT mode\n", log_pfx,
+		       name_esmt_oem_fdm);
+		return -EINVAL;
+	}
 
-	ret = r_scan_reserve(ctx);
+	if (ctx->esmt_oem_fdm)
+		ret = r_scan_reserve_esmt(ctx);
+	else
+		ret = r_scan_reserve_legacy(ctx);
 	if (ret)
 		return ret;
 
@@ -1235,8 +1826,22 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 			return -EINVAL;
 		}
 	}
+	if (ctx->esmt_oem_fdm) {
+		ret = r_select_table_copies(ctx);
+		if (ret)
+			return ret;
+	}
+	if (ctx->write_through &&
+	    (!ctx->bmt.header.version || !ctx->bbt.header.version)) {
+		pr_err("%s: write-through requires existing valid BMT and BBT\n",
+		       log_pfx);
+		return -EIO;
+	}
 
-	if (of_property_read_bool(np, name_can_write_factory_bbt))
+	/* Diagnostic mode must override even a contradictory write property. */
+	ctx->can_write_factory_bbt = 0;
+	if (!ctx->read_only && !ctx->write_through &&
+	    of_property_read_bool(np, name_can_write_factory_bbt))
 		ctx->can_write_factory_bbt = 1;
 
 	ret = of_property_read_variable_u32_array(np, name_factory_badblocks,
@@ -1245,7 +1850,33 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 	if (ret >= 0)
 		factory_badblocks_count = ret;
 
-	if (of_property_read_bool(np, name_enable_remap)) {
+	if (ctx->write_through) {
+		parts_np = of_get_child_by_name(np, "partitions");
+		for_each_child_of_node_scoped(parts_np, part_np) {
+			if (of_property_read_bool(part_np, name_enable_remap)) {
+				child_remap = true;
+				break;
+			}
+		}
+		if (parts_np)
+			of_node_put(parts_np);
+
+		if (of_property_read_bool(np, name_can_write_factory_bbt) ||
+		    factory_badblocks_count >= 0 ||
+		    of_property_read_bool(np, name_enable_remap) || child_remap) {
+			pr_err("%s: write-through conflicts with BBT/remap write properties\n",
+			       log_pfx);
+			return -EINVAL;
+		}
+	}
+
+	if (ctx->read_only) {
+		pr_info("%s: read-only diagnostic mode; remapping disabled\n",
+			log_pfx);
+	} else if (ctx->write_through) {
+		pr_warn("%s: writable pass-through mode; dynamic remapping and table updates disabled\n",
+			log_pfx);
+	} else if (of_property_read_bool(np, name_enable_remap)) {
 		add_remap_range(ctx, 0, ctx->reserve_area_begin);
 	} else {
 		struct device_node *parts_np;
@@ -1365,8 +1996,14 @@ static int pub_init(struct device_node *np)
 	int ret;
 
 	ret = w_init(&en75_bmt_m, np);
-	if (!ret)
+	if (!ret && !en75_bmt_m.read_only && !en75_bmt_m.write_through)
 		w_sync_tables(&en75_bmt_m);
+	else if (!ret && en75_bmt_m.read_only)
+		pr_info("%s: read-only diagnostic mode; table sync skipped\n",
+			log_pfx);
+	else if (!ret)
+		pr_info("%s: writable pass-through mode; table sync skipped\n",
+			log_pfx);
 	return ret;
 }
 
@@ -1390,6 +2027,14 @@ static bool pub_remap_block(
 	u16 block;
 	struct block_info *maybe_mapped_block = NULL;
 	int ret;
+
+	if (en75_bmt_m.read_only)
+		return false;
+	if (en75_bmt_m.write_through) {
+		pr_err_ratelimited("%s: block %u failed in pass-through mode; dynamic remap disabled\n",
+				   log_pfx, user_block);
+		return false;
+	}
 
 	for (int i = 0; i < en75_bmt_m.can_remap_range_count; i++) {
 		if (user_block >= en75_bmt_m.can_remap_ranges[i].begin &&
@@ -1430,6 +2075,9 @@ in_range:
 static void pub_unmap_block(u16 user_block)
 {
 	int block;
+
+	if (en75_bmt_m.read_only || en75_bmt_m.write_through)
+		return;
 
 	block = get_mapping_block_bbt(&en75_bmt_m, user_block);
 	if (block < 0 || user_block >= en75_bmt_m.reserve_area_begin) {

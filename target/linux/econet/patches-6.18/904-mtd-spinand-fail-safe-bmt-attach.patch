@@ -1,0 +1,31 @@
+From: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+Subject: [PATCH] mtd: spinand: handle BMT attach failures safely
+
+Do not expose writable SPI-NAND when an explicitly requested BMT cannot be
+attached.  Keep the device registered for diagnosis, but clear its writable
+flag.  Also force read-only exposure when the EcoNet BMT diagnostic mode
+was requested successfully.
+
+Signed-off-by: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+---
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1751,7 +1751,17 @@ static int spinand_probe(struct spi_mem
+ 	if (ret)
+ 		return ret;
+ 
+-	mtk_bmt_attach(mtd);
++	ret = mtk_bmt_attach(mtd);
++	if (ret) {
++		dev_err(&mem->spi->dev,
++			"BMT attach failed (%d), forcing MTD read-only\n", ret);
++		mtd->flags &= ~MTD_WRITEABLE;
++	} else if (of_property_read_bool(mem->spi->dev.of_node,
++					 "econet,bmt-read-only")) {
++		dev_info(&mem->spi->dev,
++			 "BMT diagnostic mode, forcing MTD read-only\n");
++		mtd->flags &= ~MTD_WRITEABLE;
++	}
+ 	ret = mtd_device_register(mtd, NULL, 0);
+ 	if (ret)
+ 		goto err_spinand_cleanup;

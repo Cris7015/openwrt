@@ -1,0 +1,35 @@
+From: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+Subject: [PATCH] mtd: mtk_bmt: fail closed in write-through mode
+
+EcoNet write-through mode deliberately disables dynamic remapping and
+table updates.  Return bad-block detection as an I/O error instead of
+entering the generic skip/remap path, and reject explicit markbad requests
+so a caller cannot mutate the OEM metadata behind that policy.
+
+Signed-off-by: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+---
+--- a/drivers/mtd/nand/mtk_bmt.c
++++ b/drivers/mtd/nand/mtk_bmt.c
+@@ -270,5 +270,11 @@ retry:
+ 	block = bmtd.ops->get_mapping_block(orig_block);
+ 	ret = bmtd._block_isbad(mtd, (loff_t)block << bmtd.blk_shift);
++	if (ret && of_property_read_bool(mtd_get_of_node(mtd),
++					 "econet,bmt-write-through")) {
++		pr_err_ratelimited("mtk_bmt: bad-block result %d in write-through mode; aborting without skip/remap\n",
++				   ret);
++		return ret > 0 ? -EIO : ret;
++	}
+ 	if (ret) {
+ 		if (mtk_bmt_remap_block(orig_block, block, bmtd.blk_size) &&
+ 		    retry_count++ < 10)
+@@ -283,6 +289,10 @@ mtk_bmt_block_markbad(struct mtd_info *m
+ 	u16 orig_block = ofs >> bmtd.blk_shift;
+ 	int block;
+ 
++	if (of_property_read_bool(mtd_get_of_node(mtd),
++				  "econet,bmt-write-through"))
++		return -EOPNOTSUPP;
++
+ 	block = bmtd.ops->get_mapping_block(orig_block);
+ 	if (block < 0)
+ 		return -EIO;
