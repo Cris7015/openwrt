@@ -1,0 +1,91 @@
+From: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+Subject: [PATCH] MIPS: zboot: synchronize caches before entering the kernel
+
+The MIPS compressed boot wrapper writes the decompressed kernel and an
+optional appended device tree to cached memory, then branches directly to
+the kernel entry point.  This is unreliable on non-coherent MIPS cores and
+the source already carries a FIXME asking whether a cache flush is needed.
+
+Synchronize the complete decompressed image using the same SYNCI sequence
+used by the MIPS kernel relocation path.  Include the copied appended DTB
+in the synchronized range as well.
+
+Signed-off-by: Cristian Papa <76759272+Cris7015@users.noreply.github.com>
+---
+--- a/arch/mips/boot/compressed/decompress.c
++++ b/arch/mips/boot/compressed/decompress.c
+@@ -16,6 +16,8 @@
+ #include <linux/libfdt.h>
+ 
+ #include <asm/addrspace.h>
++#include <asm/barrier.h>
++#include <asm/hazards.h>
+ #include <linux/unaligned.h>
+ #include <asm-generic/vmlinux.lds.h>
+ 
+@@ -76,9 +78,32 @@ void __stack_chk_fail(void)
+ 	error("stack-protector: Kernel stack is corrupted\n");
+ }
+ 
++static inline u32 get_synci_step(void)
++{
++	u32 step;
++
++	__asm__("rdhwr %0, $1" : "=r" (step));
++
++	return step;
++}
++
++static void sync_icache(void *start, unsigned long length)
++{
++	void *end = start + length;
++	u32 step = get_synci_step();
++
++	do {
++		__asm__ __volatile__("synci 0(%0)" : : "r" (start) : "memory");
++		start += step;
++	} while (step && start < end);
++
++	__sync();
++	instruction_hazard();
++}
++
+ void decompress_kernel(unsigned long boot_heap_start)
+ {
+-	unsigned long zimage_start, zimage_size;
++	unsigned long image_size, zimage_start, zimage_size;
+ 
+ 	zimage_start = (unsigned long)(__image_begin);
+ 	zimage_size = (unsigned long)(__image_end) -
+@@ -103,15 +126,15 @@ void decompress_kernel(unsigned long boo
+ 	__decompress((char *)zimage_start, zimage_size, 0, 0,
+ 		   (void *)VMLINUX_LOAD_ADDRESS_ULL, 0, 0, error);
+ 
++	/* Last four bytes are always the decompressed image size. */
++	image_size = get_unaligned_le32((void *)__image_end - 4);
++
+ 	if (IS_ENABLED(CONFIG_MIPS_RAW_APPENDED_DTB) &&
+ 	    fdt_magic((void *)&__appended_dtb) == FDT_MAGIC) {
+-		unsigned int image_size, dtb_size;
++		unsigned int dtb_size;
+ 
+ 		dtb_size = fdt_totalsize((void *)&__appended_dtb);
+ 
+-		/* last four bytes is always image size in little endian */
+-		image_size = get_unaligned_le32((void *)__image_end - 4);
+-
+ 		/* The device tree's address must be properly aligned  */
+ 		image_size = ALIGN(image_size, STRUCT_ALIGNMENT);
+ 
+@@ -122,8 +145,10 @@ void decompress_kernel(unsigned long boo
+ 		/* copy dtb to where the booted kernel will expect it */
+ 		memcpy((void *)VMLINUX_LOAD_ADDRESS_ULL + image_size,
+ 		       __appended_dtb, dtb_size);
++		image_size += dtb_size;
+ 	}
+ 
+-	/* FIXME: should we flush cache here? */
++	sync_icache((void *)VMLINUX_LOAD_ADDRESS_ULL, image_size);
++
+ 	puts("Now, booting the kernel...\n");
+ }
