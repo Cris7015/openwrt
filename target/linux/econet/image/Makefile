@@ -21,6 +21,12 @@ define Build/kernel-trx
 	mv $@.new $@
 endef
 
+# Build and validate the non-standard 512-byte TrendChip wrapper consumed by
+# the TP-Link Archer XR500v BLDR.
+define Build/xr500v-trendchip-header
+	python3 ./xr500v-trendchip-header.py $@
+endef
+
 # If TCSUPPORT_FREE_BOOTBASE is enabled, bootloader will decompress the kernel
 # at 0x80002000 instead of 0x80020000.
 #
