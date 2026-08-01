@@ -21,6 +21,10 @@
 &nand {
 	status = "okay";
 	econet,bmt;
+	econet,esmt-f50l1g41a-oem-fdm;
+	econet,bmt-write-through;
+	/* Fail closed unless the OEM reserve geometry matches tested hardware. */
+	econet,assert-reserve-size = <94>;
 
 	partitions {
 		compatible = "fixed-partitions";
