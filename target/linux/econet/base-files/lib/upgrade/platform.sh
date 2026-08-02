@@ -47,6 +47,86 @@ xr500v_write_verify() {
 	fi
 }
 
+xr500v_ubi_make_devnode() {
+	local devname="$1"
+	local dm
+
+	[ -e "/dev/$devname" ] && return 0
+	[ -r "/sys/class/ubi/$devname/dev" ] || return 1
+	dm=$(cat "/sys/class/ubi/$devname/dev")
+	mknod "/dev/$devname" c "${dm%:*}" "${dm#*:}"
+}
+
+xr500v_ubi_rootfs_data() {
+	local candidate
+
+	for candidate in /sys/class/ubi/ubi0_*; do
+		[ -r "$candidate/name" ] || continue
+		[ "$(cat "$candidate/name")" = "rootfs_data" ] || continue
+		echo "${candidate##*/}"
+		return 0
+	done
+
+	return 1
+}
+
+xr500v_prepare_ubi_overlay() {
+	local mtdnum mounted_mtd volume
+
+	mtdnum=$(find_mtd_index openwrt_ubi)
+	[ -n "$mtdnum" ] ||
+		xr500v_upgrade_fail "openwrt_ubi is missing; install this release from its initramfs image"
+	[ "$(cat "/sys/class/mtd/mtd$mtdnum/size" 2>/dev/null)" = "67108864" ] ||
+		xr500v_upgrade_fail "openwrt_ubi is not exactly 64 MiB"
+
+	if [ -d /sys/class/ubi/ubi0 ]; then
+		mounted_mtd=$(cat /sys/class/ubi/ubi0/mtd_num 2>/dev/null)
+		[ "$mounted_mtd" = "$mtdnum" ] ||
+			xr500v_upgrade_fail "ubi0 belongs to mtd$mounted_mtd instead of openwrt_ubi"
+	fi
+
+	if [ -n "$UPGRADE_BACKUP" ]; then
+		if [ ! -d /sys/class/ubi/ubi0 ]; then
+			ubiattach -m "$mtdnum" -d 0 >/dev/console 2>&1 ||
+				xr500v_upgrade_fail "cannot attach openwrt_ubi while preserving configuration; retry with -n only if erasing it is intended"
+		fi
+		volume=$(xr500v_ubi_rootfs_data) ||
+			xr500v_upgrade_fail "rootfs_data is missing while configuration preservation was requested"
+		echo "Preserving the XR500v rootfs_data UBI volume" >&2
+		return 0
+	fi
+
+	# -n has an explicit no-preserve meaning.  Recreate only the dedicated
+	# OpenWrt partition; the OEM slot, active OpenWrt slot and BMT reserve are
+	# separate MTD regions and are never passed to these tools.
+	if [ -d /sys/class/ubi/ubi0 ]; then
+		ubidetach /dev/ubi_ctrl -d 0 >/dev/console 2>&1 ||
+			xr500v_upgrade_fail "cannot detach openwrt_ubi before reprovisioning"
+	fi
+	ubiformat "/dev/mtd$mtdnum" -y >/dev/console 2>&1 ||
+		xr500v_upgrade_fail "could not format openwrt_ubi"
+	ubiattach -m "$mtdnum" -d 0 >/dev/console 2>&1 ||
+		xr500v_upgrade_fail "could not attach the freshly formatted openwrt_ubi"
+	xr500v_ubi_make_devnode ubi0 ||
+		xr500v_upgrade_fail "cannot create the ubi0 device node"
+	ubimkvol /dev/ubi0 -N rootfs_data -m >/dev/console 2>&1 ||
+		xr500v_upgrade_fail "could not create rootfs_data"
+	volume=$(xr500v_ubi_rootfs_data) ||
+		xr500v_upgrade_fail "rootfs_data was not visible after creation"
+	xr500v_ubi_make_devnode "$volume" ||
+		xr500v_upgrade_fail "cannot create the $volume device node"
+
+	mkdir -p /tmp/.xr500v-ubifs-provision
+	mount -t ubifs ubi0:rootfs_data /tmp/.xr500v-ubifs-provision \
+		>/dev/console 2>&1 ||
+		xr500v_upgrade_fail "could not initialize rootfs_data as UBIFS"
+	sync
+	umount /tmp/.xr500v-ubifs-provision >/dev/console 2>&1 ||
+		xr500v_upgrade_fail "could not unmount the initialized rootfs_data"
+	rmdir /tmp/.xr500v-ubifs-provision
+	echo "Reprovisioned the XR500v rootfs_data UBI volume (-n)" >&2
+}
+
 platform_check_image() {
 	local board
 	local image="$1"
@@ -150,9 +230,6 @@ platform_do_upgrade() {
 		nand_do_upgrade "$1"
 		;;
 	tplink,archer-xr500v-v1)
-		[ -z "$UPGRADE_BACKUP" ] ||
-			xr500v_upgrade_fail "the first persistent installation requires sysupgrade -n"
-
 		# fwtool metadata is for sysupgrade validation only.  Strip it before
 		# slicing so the hardware receives the exact BLDR-validated container.
 		fwtool -q -t -i /dev/null "$1" ||
@@ -174,6 +251,8 @@ platform_do_upgrade() {
 			xr500v_upgrade_fail "could not extract rootfs1"
 		[ "$(wc -c < "$rootfs_image")" -eq $((0x1000000)) ] ||
 			xr500v_upgrade_fail "rootfs1 slice is not exactly 16 MiB"
+
+		xr500v_prepare_ubi_overlay
 
 		# Rootfs first, then the boot-critical kernel.  Every write is read back
 		# before continuing; xr500v_upgrade_fail exits stage2 on any mismatch.
