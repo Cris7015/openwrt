@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
 #include "en751221.dtsi"
 
 / {
@@ -15,6 +18,51 @@
 	chosen {
 		stdout-path = "/serial@1fbf0000:115200";
 		linux,usable-memory-range = <0x00020000 0x0ffe0000>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led-wps {
+			label = "green:wps";
+			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
+		};
+
+		led-usb {
+			label = "green:usb";
+			gpios = <&gpio0 11 GPIO_ACTIVE_LOW>;
+		};
+
+		led-internet {
+			label = "green:internet";
+			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		key-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		key-wifi {
+			label = "wifi";
+			linux,code = <KEY_RFKILL>;
+			gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		key-wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
 	};
 };
 
@@ -128,6 +176,11 @@
 		reg = <0x0000 0 0 0 0>;
 		nvmem-cells = <&eeprom_misc_e0000>, <&macaddr_misc_f100 2>;
 		nvmem-cell-names = "eeprom", "mac-address";
+
+		led {
+			led-sources = <2>;
+			led-active-low;
+		};
 	};
 };
 

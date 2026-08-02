@@ -92,7 +92,10 @@ define Device/tplink_archer-xr500v-v1
   KERNEL := kernel-bin | append-dtb | lzma
   KERNEL_INITRAMFS := kernel-bin | append-dtb
   BLOCKSIZE := 128k
-  DEVICE_PACKAGES := kmod-usb3 kmod-mt76x2
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+    kmod-usb3 kmod-usb-ledtrig-usbport kmod-usb-storage \
+    block-mount kmod-fs-vfat \
+    kmod-mt76x2 wpad-basic-mbedtls
   IMAGES := sysupgrade.bin
   IMAGE/sysupgrade.bin := append-kernel | check-size 0x2ffe00 | \
     pad-to $$$$(KERNEL_SIZE) | append-rootfs | check-size 0x1300000 | \
