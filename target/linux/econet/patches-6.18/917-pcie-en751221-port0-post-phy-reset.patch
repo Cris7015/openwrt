@@ -1,0 +1,103 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] PCI: mediatek: repeat EN751221 reset after PHY setup
+
+The EN751221 clock prepare callback runs the vendor PCIe reset before the
+port PHY is initialized.  The MT7603 on XR500v port 0 only answers config
+transactions when the same reset sequence is repeated after PHY power-on.
+
+Use the board opt-in quirk and a DT-provided SCU syscon.  Update only the
+PCIe clock/reset fields from the vendor sequence; do not touch board GPIOs
+or the PHY analog settings.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -117,6 +117,12 @@
+ #define PCIE_EN751221_IMSI_CFG	0x11c
+ #define PCIE_EN751221_IMSI_EN	BIT(5)
+ 
++#define EN751221_SCU_PCI_CONTROL		0x088
++#define EN751221_SCU_RESET_CONTROL1	0x834
++#define EN751221_SCU_REFCLK_ENABLE	BIT(22)
++#define EN751221_SCU_PCIE_RESET_MASK	(BIT(26) | BIT(27) | BIT(29))
++#define EN751221_SCU_PERST_MASK		(BIT(26) | BIT(29))
++
+ /* Vendor config TLPs use requester/tag bits 10:8 set to 0x7. */
+ #define EN751221_CFG_HEADER1_TAG	GENMASK(10, 8)
+ #define EN751221_PCIE_ERR_INT	GENMASK(1, 0)
+@@ -282,6 +288,62 @@
+ 				      "econet,en751221-port0-quirks");
+ }
+ 
++static int mtk_pcie_en751221_post_phy_reset(struct mtk_pcie_port *port)
++{
++	struct mtk_pcie *pcie = port->pcie;
++	struct regmap *scu;
++	int ret;
++
++	scu = syscon_regmap_lookup_by_phandle(pcie->dev->of_node,
++					       "econet,en751221-scu");
++	if (IS_ERR(scu))
++		return dev_err_probe(pcie->dev, PTR_ERR(scu),
++				     "EN751221 SCU regmap unavailable\n");
++
++	ret = regmap_update_bits(scu, EN751221_SCU_PCI_CONTROL,
++				 EN751221_SCU_REFCLK_ENABLE,
++				 EN751221_SCU_REFCLK_ENABLE);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++
++	ret = regmap_update_bits(scu, EN751221_SCU_RESET_CONTROL1,
++				 EN751221_SCU_PCIE_RESET_MASK, 0);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++
++	ret = regmap_update_bits(scu, EN751221_SCU_RESET_CONTROL1,
++				 EN751221_SCU_PCIE_RESET_MASK,
++				 EN751221_SCU_PCIE_RESET_MASK);
++	if (ret)
++		return ret;
++	msleep(100);
++
++	ret = regmap_update_bits(scu, EN751221_SCU_RESET_CONTROL1,
++				 EN751221_SCU_PCIE_RESET_MASK, 0);
++	if (ret)
++		return ret;
++	usleep_range(5000, 10000);
++
++	ret = regmap_update_bits(scu, EN751221_SCU_PCI_CONTROL,
++				 EN751221_SCU_PERST_MASK, 0);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++
++	ret = regmap_update_bits(scu, EN751221_SCU_PCI_CONTROL,
++				 EN751221_SCU_PERST_MASK,
++				 EN751221_SCU_PERST_MASK);
++	if (ret)
++		return ret;
++	msleep(250);
++
++	dev_info(pcie->dev, "EN751221 port0 post-PHY reset complete\n");
++
++	return 0;
++}
++
+ static int mtk_pcie_check_cfg_cpld(struct mtk_pcie_port *port)
+ {
+ 	u32 val;
+@@ -805,6 +867,12 @@
+ 		return -EINVAL;
+ 	}
+ 
++	if (quirk) {
++		ret = mtk_pcie_en751221_post_phy_reset(port);
++		if (ret)
++			return ret;
++	}
++
+ 	/* Assert all reset signals */
+ 	writel(0, port->base + PCIE_RST_CTRL);
+ 

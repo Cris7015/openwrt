@@ -318,6 +318,7 @@
 	status = "okay";
 	/* Opt in only this controller to the EN751221 config-TLP quirks. */
 	econet,en751221-port0-quirks;
+	econet,en751221-scu = <&scuclk>;
 };
 
 &slot0 {
