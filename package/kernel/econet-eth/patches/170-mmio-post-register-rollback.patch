@@ -1,0 +1,29 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] mt7530-mmio: unregister DSA when MDIO setup fails
+
+The MMIO frontend registers its DSA switch before creating the child MDIO bus.
+If child-bus setup fails, undo the DSA registration before returning the probe
+error instead of leaving a partially registered switch behind.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ gsw/mt7530-mmio.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/gsw/mt7530-mmio.c
++++ b/gsw/mt7530-mmio.c
+@@ -66,7 +66,13 @@ mt7988_probe(struct platform_device *pde
+ 	if (ret)
+ 		return ret;
+ 
+-	return mt7530_post_register(priv);
++	ret = mt7530_post_register(priv);
++	if (ret) {
++		dsa_unregister_switch(priv->ds);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ static void mt7988_remove(struct platform_device *pdev)

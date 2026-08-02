@@ -1,0 +1,143 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: serialize TX queue flow control with the QDMA ring
+
+Account bytes before ringing the QDMA doorbell, since completion can run on
+another CPU.  Stop all netdev queues while still holding the shared hardware
+ring lock, then wake them from completion after a descriptor is returned.
+This closes the stop/wake race and also handles a subqueue which encounters a
+full ring without having an skb of its own pending in that ring.
+
+Return NETDEV_TX_BUSY without consuming or freeing the skb when QDMA reports
+that no descriptor was available.  Normalize DMA mapping failures to a real
+negative errno as well.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ econet_port.c | 25 ++++++++++++++-----------
+ econet_qdma.c | 32 ++++++++++++++++++++++----------
+ 2 files changed, 36 insertions(+), 21 deletions(-)
+
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -204,15 +204,23 @@ static netdev_tx_t en75_dev_xmit(struct
+ 	if (skb_linearize(skb))
+ 		goto error;
+ 
+-	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
++	/* QDMA can complete on another CPU as soon as the doorbell is rung. */
++	netdev_tx_sent_queue(txq, len);
+ 
+-	if (ret < 0)
+-		goto error;
++	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
+ 
+-	netdev_tx_sent_queue(txq, len);
++	if (ret == -EBUSY) {
++		/* QDMA stopped the queue under its ring lock and did not consume
++		 * the skb. Undo the speculative BQL accounting and let the qdisc
++		 * retry after the completion path wakes the queues. */
++		netdev_tx_completed_queue(txq, 1, len);
++		return NETDEV_TX_BUSY;
++	}
+ 
+-	if (ret == EBUSY)
+-		netif_tx_stop_queue(txq);
++	if (ret < 0) {
++		netdev_tx_completed_queue(txq, 1, len);
++		goto error;
++	}
+ 
+ 	return NETDEV_TX_OK;
+ 
+@@ -220,11 +228,6 @@ error:
+ 	dev_kfree_skb_any(skb);
+ 	dev->stats.tx_dropped++;
+ 
+-	if (ret == -EBUSY) {
+-		netif_tx_stop_queue(txq);
+-		return NETDEV_TX_BUSY;
+-	}
+-
+ 	return NETDEV_TX_OK;
+ }
+ 
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -58,6 +58,7 @@ struct en75_q_tx {
+ 	/* FIFO of free entries because they complete out of order. */
+ 	u16				freelist_head;
+ 	u16				freelist_tail;
++	bool				queues_stopped;
+ 
+ 	/* Not modified after init */
+ 	struct en75_qdma		*qdma;
+@@ -493,8 +494,10 @@ static int en75_poll_tx_complete(struct
+ 		txq = netdev_get_tx_queue(skb->dev,
+ 					  skb_get_queue_mapping(skb));
+ 		netdev_tx_completed_queue(txq, 1, skb->len);
+-		if (netif_tx_queue_stopped(txq))
+-			netif_tx_wake_queue(txq);
++		if (q->queues_stopped) {
++			q->queues_stopped = false;
++			netif_tx_wake_all_queues(skb->dev);
++		}
+ 
+ 		dev_kfree_skb_any(skb);
+ 	}
+@@ -529,23 +532,28 @@ int en75_qdma_xmit(struct en75_qdma *qd
+ 	u16 index, next_index;
+ 	struct desc *desc;
+ 	dma_addr_t addr;
+-	int ret;
++	bool ring_full;
+ 
+ 	guard(spinlock_bh)(&q->lock_bh);
+ 
+ 	index = q->freelist_head;
+-	if (index == 0xffff)
++	if (index == 0xffff) {
++		netif_tx_stop_all_queues(skb->dev);
++		q->queues_stopped = true;
+ 		return -EBUSY;
++	}
+ 
+ 	e = &q->entry[index];
+ 	next_index = e->freelist_next;
+-	if (next_index == 0xffff)
++	if (next_index == 0xffff) {
++		netif_tx_stop_all_queues(skb->dev);
++		q->queues_stopped = true;
+ 		return -EBUSY;
++	}
+ 
+ 	addr = dma_map_single(qdma->dev, skb->data, len, DMA_TO_DEVICE);
+-	ret = dma_mapping_error(qdma->dev, addr);
+-	if (unlikely(ret))
+-		return ret;
++	if (unlikely(dma_mapping_error(qdma->dev, addr)))
++		return -ENOMEM;
+ 
+ 	desc = &q->desc[index];
+ 	WRITE_ONCE(desc->pkt_addr, addr);
+@@ -558,6 +566,11 @@ int en75_qdma_xmit(struct en75_qdma *qd
+ 	e->dma_addr = addr;
+ 	e->dma_len = len;
+ 	q->freelist_head = next_index;
++	ring_full = q->entry[next_index].freelist_next == 0xffff;
++	if (ring_full) {
++		netif_tx_stop_all_queues(skb->dev);
++		q->queues_stopped = true;
++	}
+ 
+ 	skb_tx_timestamp(skb);
+ 
+@@ -572,8 +585,7 @@ int en75_qdma_xmit(struct en75_qdma *qd
+ 		q->debug_tx_cnt[chq]++;
+ 	}
+ 
+-	return q->entry[next_index].freelist_next == 0xffff ?
+-		EBUSY : 0;
++	return ring_full ? EBUSY : 0;
+ }
+ 
+ /* Init functions, no locks, assumed non-concurrent */

@@ -1,0 +1,32 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 1 Aug 2026 00:00:00 +0000
+Subject: [PATCH] mt7530-mdio: register the MCM PHY bus before DSA
+
+The EN751221 MCM user PHYs are children of the switch's MDIO node.  Register
+that bus before DSA connects the user ports, otherwise each phy-handle lookup
+fails with -ENODEV.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ gsw/mt7530-mdio.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/gsw/mt7530-mdio.c
++++ b/gsw/mt7530-mdio.c
+@@ -212,11 +212,15 @@ mt7530_probe(struct mdio_device *mdiodev
+ 	if (priv->id == ID_MT7531)
+ 		priv->create_sgmii = mt7531_create_sgmii;
+ 
++	ret = mt7530_post_register(priv);
++	if (ret)
++		return ret;
++
+ 	ret = dsa_register_switch(priv->ds);
+ 	if (ret)
+ 		return ret;
+ 
+-	return mt7530_post_register(priv);
++	return 0;
+ }
+ 
+ static void

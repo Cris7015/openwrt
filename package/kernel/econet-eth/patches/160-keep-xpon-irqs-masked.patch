@@ -1,0 +1,26 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] qdma: keep unowned xPON interrupt causes masked
+
+The Ethernet driver has no GPON, EPON or aggregate xPON interrupt consumer.
+Do not enable those external causes only to acknowledge and discard them.
+This also keeps the Ethernet and optical bring-up paths independent.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ econet_qdma.c | 5 -----
+ 1 file changed, 5 deletions(-)
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -897,11 +897,6 @@ static int en75_init_final(struct en75_q
+ 				en |= (p.type == IPS_ERR_COHERENT);
+ 				en |= (p.type == IPS_OVERFLOW);
+ 
+-				/* External hardware */
+-				en |= (p.type == IPS_GPON_INT);
+-				en |= (p.type == IPS_EPON_INT);
+-				en |= (p.type == IPS_XPON_INT);
+-
+ 				mask |= en << k;
+ 			}
+ 

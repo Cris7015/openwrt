@@ -1,0 +1,27 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 1 Aug 2026 00:00:00 +0000
+Subject: [PATCH] mt7530-mdio: make the EN751221 MCM reset optional
+
+The external switch reset is not represented by the public EN751221 reset
+binding.  Let it probe without a reset line and retain the bootloader state;
+the user PHYs are still soft-reset when their ports are enabled.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ gsw/mt7530-mdio.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/gsw/mt7530-mdio.c
++++ b/gsw/mt7530-mdio.c
+@@ -170,9 +170,9 @@ mt7530_probe(struct mdio_device *mdiodev
+ 	if (priv->mcm) {
+ 		dev_info(&mdiodev->dev, "MT7530 adapts as multi-chip module\n");
+ 
+-		priv->rstc = devm_reset_control_get(&mdiodev->dev, "mcm");
++		priv->rstc = devm_reset_control_get_optional(&mdiodev->dev, "mcm");
+ 		if (IS_ERR(priv->rstc)) {
+-			dev_err(&mdiodev->dev, "Couldn't get our reset line\n");
++			dev_err(&mdiodev->dev, "Couldn't get mcm reset line\n");
+ 			return PTR_ERR(priv->rstc);
+ 		}
+ 	} else {

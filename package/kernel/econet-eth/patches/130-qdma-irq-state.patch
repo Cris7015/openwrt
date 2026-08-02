@@ -1,0 +1,25 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] qdma: keep the active IRQ mask cached
+
+When NAPI temporarily disables a completion cause, update the cached mask as
+well as the hardware register.  Otherwise a later mask update can accidentally
+re-enable a cause whose NAPI poll is still active.  This carries the fix from
+econet_eth commit 86b755c7a895.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ econet_qdma.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -409,7 +409,8 @@ static irqreturn_t en75_irq_handler(int
+					    p.chain);
+		}
+ 
+-		en75_wreg(~disable_int, irq->mask_reg[i]);
++		irq->irqmask[i] &= ~disable_int;
++		en75_wreg(irq->irqmask[i], irq->mask_reg[i]);
+ 	}
+ 
+ 	return IRQ_HANDLED;

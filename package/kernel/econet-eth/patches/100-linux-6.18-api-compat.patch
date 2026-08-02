@@ -1,0 +1,103 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 1 Aug 2026 00:00:00 +0000
+Subject: [PATCH] econet-gsw: adapt the hardware-tested switch fork to Linux
+ 6.18
+
+Linux 6.18 changed a handful of GPIO, phylink, DSA, PCS and platform-driver
+interfaces since this EN751221 switch fork was based on Linux 6.12. Update
+those call sites without changing the switch programming sequence.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ gsw/mt7530-mdio.c |  4 ++--
+ gsw/mt7530-mmio.c |  2 +-
+ gsw/mt7530.c      | 19 +++++--------------
+ 3 files changed, 8 insertions(+), 17 deletions(-)
+
+--- a/gsw/mt7530-mdio.c
++++ b/gsw/mt7530-mdio.c
+@@ -113,8 +113,8 @@ mt7531_create_sgmii(struct mt7530_priv *
+ 			ret = PTR_ERR(regmap);
+ 			break;
+ 		}
+-		pcs = mtk_pcs_lynxi_create(priv->dev, regmap,
+-					   MT7531_PHYA_CTRL_SIGNAL3, 0);
++		pcs = mtk_pcs_lynxi_create(priv->dev, NULL, regmap,
++					   MT7531_PHYA_CTRL_SIGNAL3);
+ 		if (!pcs) {
+ 			ret = -ENXIO;
+ 			break;
+--- a/gsw/mt7530-mmio.c
++++ b/gsw/mt7530-mmio.c
+@@ -91,7 +91,7 @@ static void mt7988_shutdown(struct platf
+ 
+ static struct platform_driver mt7988_platform_driver = {
+ 	.probe  = mt7988_probe,
+-	.remove_new = mt7988_remove,
++	.remove = mt7988_remove,
+ 	.shutdown = mt7988_shutdown,
+ 	.driver = {
+ 		.name = "mt7530-mmio",
+--- a/gsw/mt7530.c
++++ b/gsw/mt7530.c
+@@ -2059,7 +2059,7 @@ mt7530_gpio_get(struct gpio_chip *gc, un
+ 	return !!(mt7530_read(priv, MT7530_LED_GPIO_DATA) & bit);
+ }
+ 
+-static void
++static int
+ mt7530_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
+ {
+ 	struct mt7530_priv *priv = gpiochip_get_data(gc);
+@@ -2069,6 +2069,8 @@ mt7530_gpio_set(struct gpio_chip *gc, un
+ 		mt7530_set(priv, MT7530_LED_GPIO_DATA, bit);
+ 	else
+ 		mt7530_clear(priv, MT7530_LED_GPIO_DATA, bit);
++
++	return 0;
+ }
+ 
+ static int
+@@ -3156,6 +3158,7 @@ static int mt753x_pcs_validate(struct ph
+ }
+ 
+ static void mt7530_pcs_get_state(struct phylink_pcs *pcs,
++				 unsigned int neg_mode,
+ 				 struct phylink_link_state *state)
+ {
+ 	struct mt7530_priv *priv = pcs_to_mt753x_pcs(pcs)->priv;
+@@ -3232,7 +3235,6 @@ mt753x_setup(struct dsa_switch *ds)
+ 	/* Initialise the PCS devices */
+ 	for (i = 0; i < priv->ds->num_ports; i++) {
+ 		priv->pcs[i].pcs.ops = priv->info->pcs_ops;
+-		priv->pcs[i].pcs.neg_mode = true;
+ 		priv->pcs[i].priv = priv;
+ 		priv->pcs[i].port = i;
+ 	}
+@@ -3246,18 +3248,6 @@ mt753x_setup(struct dsa_switch *ds)
+ 	return ret;
+ }
+ 
+-static int mt753x_get_mac_eee(struct dsa_switch *ds, int port,
+-			      struct ethtool_keee *e)
+-{
+-	struct mt7530_priv *priv = ds->priv;
+-	u32 eeecr = mt7530_read(priv, MT753X_PMEEECR_P(port));
+-
+-	e->tx_lpi_enabled = !(eeecr & LPI_MODE_EN);
+-	e->tx_lpi_timer = LPI_THRESH_GET(eeecr);
+-
+-	return 0;
+-}
+-
+ static int mt753x_set_mac_eee(struct dsa_switch *ds, int port,
+ 			      struct ethtool_keee *e)
+ {
+@@ -3352,7 +3342,6 @@ const struct dsa_switch_ops mt7530_switc
+ 	.port_mirror_add	= mt753x_port_mirror_add,
+ 	.port_mirror_del	= mt753x_port_mirror_del,
+ 	.phylink_get_caps	= mt753x_phylink_get_caps,
+-	.get_mac_eee		= mt753x_get_mac_eee,
+ 	.set_mac_eee		= mt753x_set_mac_eee,
+ 	.conduit_state_change	= mt753x_conduit_state_change,
+ };

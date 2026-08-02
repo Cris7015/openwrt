@@ -1,0 +1,21 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] build: bundle the LynxI PCS without mainline MT7530
+
+Linux 6.18 makes PCS_MTK_LYNXI a hidden symbol selected by the mainline
+MT7530 MDIO frontend.  That switch driver cannot coexist with this EN751221
+fork because both export the same MT7530 symbols.  Build the unmodified PCS
+source as a private module in this bundle instead.  Include the hidden bool
+PHY_COMMON_PROPS in that same module, matching the dependency normally selected
+by PCS_MTK_LYNXI.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+
+--- a/Kbuild
++++ b/Kbuild
+@@ -1,4 +1,6 @@
+ obj-m := econet-eth.o econet-gsw.o econet-gsw-mdio.o econet-gsw-mmio.o mtk-tag.o
++obj-m += pcs-mtk-lynxi.o
++pcs-mtk-lynxi-y := pcs-mtk-lynxi-core.o phy-common-props.o
+ econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o
+ econet-gsw-y := gsw/mt7530.o
+ econet-gsw-mdio-y := gsw/mt7530-mdio.o

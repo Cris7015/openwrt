@@ -1,0 +1,26 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: keep a useful minimum BQL window on EN751221
+
+QDMA generates a completion for each packet.  With no floor, DQL converges to
+roughly one packet and repeatedly stops the software queue, severely
+underfilling the hardware pipe.  Retain the hardware-tested 256 KiB minimum
+window for every TX queue through the public netdev API.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+ econet_port.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -475,6 +475,10 @@ struct net_device *en75_alloc_gdm_port(s
+ // 	if (err)
+ // 		return err;
+ 
++	for (unsigned int i = 0; i < ndev->num_tx_queues; i++)
++		netdev_queue_set_dql_min_limit(netdev_get_tx_queue(ndev, i),
++					       262144U);
++
+ 	err = register_netdev(ndev);
+ 	if (err)
+ 		goto free_metadata_dst;

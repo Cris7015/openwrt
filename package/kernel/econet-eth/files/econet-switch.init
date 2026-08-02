@@ -1,0 +1,28 @@
+#!/bin/sh /etc/rc.common
+
+START=18
+
+start() {
+	local module
+
+	# Keep switch probing ordered and ahead of netifd.  In particular, the
+	# custom tagger must exist before either DSA switch registers, and the
+	# frame engine must own only its 0x8000-byte window before the MMIO
+	# frontend claims the adjacent on-die switch registers.
+	for module in \
+		mtk-phy-lib \
+		mtk-ge \
+		pcs-mtk-lynxi \
+		dsa_core \
+		econet-eth \
+		mtk-tag \
+		econet-gsw \
+		econet-gsw-mmio \
+		econet-gsw-mdio
+	do
+		modprobe "$module" || {
+			logger -t econet-switch "failed to load $module"
+			return 1
+		}
+	done
+}
