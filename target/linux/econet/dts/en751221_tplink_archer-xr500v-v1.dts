@@ -357,6 +357,7 @@
 			05 00 00 00 a4 00 00 88 00 00 00 00 00 00 00 00
 		];
 		mediatek,eeprom-merge-otp;
+		mediatek,gpio-led;
 		nvmem-cells = <&macaddr_misc_f100 1>;
 		nvmem-cell-names = "mac-address";
 	};
