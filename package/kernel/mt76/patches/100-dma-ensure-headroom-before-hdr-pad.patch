@@ -1,0 +1,23 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] mt76: dma: ensure headroom before inserting alignment pad
+
+mt76_insert_hdr_pad() pushes two bytes without checking headroom.  Forwarded
+frames can arrive with no spare headroom and trigger skb_under_panic.  Make
+the skb writable with the required headroom before inserting the pad.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+--- a/dma.c
++++ b/dma.c
+@@ -671,8 +671,11 @@ mt76_dma_tx_queue_skb(struct mt76_phy *
+ 	txwi = mt76_get_txwi_ptr(dev, t);
+ 
+ 	skb->prev = skb->next = NULL;
+-	if (dev->drv->drv_flags & MT_DRV_TX_ALIGNED4_SKBS)
++	if (dev->drv->drv_flags & MT_DRV_TX_ALIGNED4_SKBS) {
++		if (skb_cow_head(skb, 2))
++			goto free;
+ 		mt76_insert_hdr_pad(skb);
++	}
+ 
+ 	len = skb_headlen(skb);
+ 	addr = dma_map_single(dev->dma_dev, skb->data, len, DMA_TO_DEVICE);
