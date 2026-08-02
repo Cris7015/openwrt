@@ -1,0 +1,98 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] gpio: en7523: support board-specific IOMUX release
+
+Boot firmware can leave GPIO-capable pads assigned to alternate functions.
+Allow a board to opt into a masked syscon update before GPIO consumers are
+registered.  Keeping the register, offset and mask in DT avoids broad writes
+to adjacent PON and telephony mux fields.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+--- a/Documentation/devicetree/bindings/gpio/airoha,en7523-gpio.yaml
++++ b/Documentation/devicetree/bindings/gpio/airoha,en7523-gpio.yaml
+@@ -31,6 +31,17 @@ properties:
+   "#gpio-cells":
+     const: 2
+ 
++  airoha,iomux-clear:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    items:
++      - items:
++          - description: Phandle to the system controller.
++          - description: Register offset containing the IOMUX bits.
++          - description: Mask of bits to clear.
++    description: |
++      Optional system-controller register and mask used to release GPIO pads
++      from alternate functions before registering the GPIO controller.
++
+   gpio-controller: true
+ 
+ required:
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -294,6 +294,7 @@ config GPIO_EN7523
+ 	depends on ARCH_AIROHA || ECONET
+ 	default ARCH_AIROHA
+ 	select GPIO_GENERIC
++	select MFD_SYSCON
+ 	select GPIOLIB_IRQCHIP
+ 	help
+ 	  Say Y or M here to support the GPIO controller block on the
+--- a/drivers/gpio/gpio-en7523.c
++++ b/drivers/gpio/gpio-en7523.c
+@@ -5,10 +5,13 @@
+ #include <linux/bits.h>
+ #include <linux/gpio/driver.h>
+ #include <linux/gpio/generic.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/property.h>
++#include <linux/regmap.h>
+ 
+ #define AIROHA_GPIO_MAX		32
+ 
+@@ -67,6 +70,31 @@ static int airoha_get_dir(struct gpio_ch
+ 	return (dir & mask) ? GPIO_LINE_DIRECTION_OUT : GPIO_LINE_DIRECTION_IN;
+ }
+ 
++static int airoha_gpio_apply_iomux(struct device *dev)
++{
++	unsigned int args[2];
++	struct regmap *iomux;
++	int err;
++
++	/* No property means the board keeps the boot firmware's mux state. */
++	if (!device_property_present(dev, "airoha,iomux-clear"))
++		return 0;
++
++	iomux = syscon_regmap_lookup_by_phandle_args(dev->of_node,
++						    "airoha,iomux-clear",
++						    ARRAY_SIZE(args), args);
++	if (IS_ERR(iomux))
++		return dev_err_probe(dev, PTR_ERR(iomux),
++				     "IOMUX syscon unavailable\n");
++
++	err = regmap_update_bits(iomux, args[0], args[1], 0);
++	if (err)
++		return dev_err_probe(dev, err, "unable to release GPIO pads\n");
++
++	dev_info(dev, "released IOMUX bits %#x at %#x\n", args[1], args[0]);
++	return 0;
++}
++
+ static int airoha_gpio_probe(struct platform_device *pdev)
+ {
+ 	struct gpio_generic_chip_config config = { };
+@@ -96,6 +124,10 @@ static int airoha_gpio_probe(struct plat
+ 	if (IS_ERR(ctrl->output))
+ 		return PTR_ERR(ctrl->output);
+ 
++	err = airoha_gpio_apply_iomux(dev);
++	if (err)
++		return err;
++
+ 	config.dev = dev;
+ 	config.sz = 4;
+ 	config.dat = ctrl->data;
