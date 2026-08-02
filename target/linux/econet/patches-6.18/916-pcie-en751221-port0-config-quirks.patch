@@ -1,0 +1,142 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] PCI: mediatek: add opt-in EN751221 port0 config quirks
+
+The MT7603 endpoint on EN751221 PCIe port 0 needs the config-TLP and post-link
+MAC setup used by the vendor kernel.  Keep these changes opt-in so existing
+EN7528 users and the already working port 1 path are unchanged.
+
+The shared EN751221 PCIe clock prepare callback already performs the complete
+vendor global reset sequence before controller startup, so do not duplicate
+it here.  The quirk also deliberately does not touch any board GPIO: on the
+Archer XR500v, GPIO16 belongs to the PON transmitter and must remain outside
+PCIe control.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -115,6 +115,13 @@
+ #define PCIE_CFG_WDATA		0x470
+ #define PCIE_APP_TLP_REQ	0x488
+ #define PCIE_CFG_RDATA		0x48c
++#define PCIE_EN751221_IMSI_CFG	0x11c
++#define PCIE_EN751221_IMSI_EN	BIT(5)
++
++/* Vendor config TLPs use requester/tag bits 10:8 set to 0x7. */
++#define EN751221_CFG_HEADER1_TAG	GENMASK(10, 8)
++#define EN751221_PCIE_ERR_INT	GENMASK(1, 0)
++
+ #define APP_CFG_REQ		BIT(0)
+ #define APP_CPL_STATUS		GENMASK(7, 5)
+ 
+@@ -262,6 +275,13 @@ static void mtk_pcie_put_resources(stru
+ 	mtk_pcie_subsys_powerdown(pcie);
+ }
+ 
++static bool mtk_pcie_en751221_port0_quirk(struct mtk_pcie_port *port)
++{
++	return port->slot == 0 &&
++		of_property_read_bool(port->pcie->dev->of_node,
++				      "econet,en751221-port0-quirks");
++}
++
+ static int mtk_pcie_check_cfg_cpld(struct mtk_pcie_port *port)
+ {
+ 	u32 val;
+@@ -288,18 +308,24 @@ static int mtk_pcie_hw_rd_cfg(struct mt
+ static int mtk_pcie_hw_rd_cfg(struct mtk_pcie_port *port, u32 bus, u32 devfn,
+ 			      int where, int size, u32 *val)
+ {
+-	u32 tmp;
++	u32 header1, tmp;
++	bool quirk = mtk_pcie_en751221_port0_quirk(port);
+ 
+ 	/* Write PCIe configuration transaction header for Cfgrd */
++	if (quirk)
++		writel(0xffffffff, port->base + PCIE_CFG_RDATA);
+ 	writel(CFG_HEADER_DW0(CFG_WRRD_TYPE_0, CFG_RD_FMT),
+ 	       port->base + PCIE_CFG_HEADER0);
+-	writel(CFG_HEADER_DW1(where, size), port->base + PCIE_CFG_HEADER1);
++	header1 = CFG_HEADER_DW1(where, size);
++	if (quirk)
++		header1 |= EN751221_CFG_HEADER1_TAG;
++	writel(header1, port->base + PCIE_CFG_HEADER1);
+ 	writel(CFG_HEADER_DW2(where, PCI_FUNC(devfn), PCI_SLOT(devfn), bus),
+ 	       port->base + PCIE_CFG_HEADER2);
+ 
+ 	/* Trigger h/w to transmit Cfgrd TLP */
+-	tmp = readl(port->base + PCIE_APP_TLP_REQ);
+-	tmp |= APP_CFG_REQ;
++	tmp = quirk ? APP_CFG_REQ :
++		readl(port->base + PCIE_APP_TLP_REQ) | APP_CFG_REQ;
+ 	writel(tmp, port->base + PCIE_APP_TLP_REQ);
+ 
+ 	/* Check completion status */
+@@ -320,10 +346,16 @@ static int mtk_pcie_hw_wr_cfg(struct mt
+ static int mtk_pcie_hw_wr_cfg(struct mtk_pcie_port *port, u32 bus, u32 devfn,
+ 			      int where, int size, u32 val)
+ {
++	u32 header1;
++	bool quirk = mtk_pcie_en751221_port0_quirk(port);
++
+ 	/* Write PCIe configuration transaction header for Cfgwr */
+ 	writel(CFG_HEADER_DW0(CFG_WRRD_TYPE_0, CFG_WR_FMT),
+ 	       port->base + PCIE_CFG_HEADER0);
+-	writel(CFG_HEADER_DW1(where, size), port->base + PCIE_CFG_HEADER1);
++	header1 = CFG_HEADER_DW1(where, size);
++	if (quirk)
++		header1 |= EN751221_CFG_HEADER1_TAG;
++	writel(header1, port->base + PCIE_CFG_HEADER1);
+ 	writel(CFG_HEADER_DW2(where, PCI_FUNC(devfn), PCI_SLOT(devfn), bus),
+ 	       port->base + PCIE_CFG_HEADER2);
+ 
+@@ -333,9 +363,11 @@ static int mtk_pcie_hw_wr_cfg(struct mt
+ 	writel(val, port->base + PCIE_CFG_WDATA);
+ 
+ 	/* Trigger h/w to transmit Cfgwr TLP */
+-	val = readl(port->base + PCIE_APP_TLP_REQ);
+-	val |= APP_CFG_REQ;
+-	writel(val, port->base + PCIE_APP_TLP_REQ);
++	if (quirk)
++		writel(APP_CFG_REQ, port->base + PCIE_APP_TLP_REQ);
++	else
++		writel(readl(port->base + PCIE_APP_TLP_REQ) | APP_CFG_REQ,
++		       port->base + PCIE_APP_TLP_REQ);
+ 
+ 	/* Check completion status */
+ 	return mtk_pcie_check_cfg_cpld(port);
+@@ -763,7 +794,8 @@ static int mtk_pcie_startup_port_en7528
+ 	struct resource *mem = NULL;
+ 	struct resource_entry *entry;
++	bool quirk = mtk_pcie_en751221_port0_quirk(port);
+ 	u32 val, link_mask;
+-	int err;
++	int err, ret;
+ 
+ 	entry = resource_list_first_type(&host->windows, IORESOURCE_MEM);
+ 	if (entry)
+@@ -810,6 +881,25 @@ static int mtk_pcie_startup_port_en7528
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	if (quirk) {
++		val = readl(port->base + PCIE_RST_CTRL);
++		writel(val & ~PCIE_LINKDOWN_RST_EN,
++		       port->base + PCIE_RST_CTRL);
++		val = readl(port->base + PCIE_EN751221_IMSI_CFG);
++		writel(val & ~PCIE_EN751221_IMSI_EN,
++		       port->base + PCIE_EN751221_IMSI_CFG);
++		usleep_range(1000, 2000);
++		val = readl(port->base + PCIE_INT_MASK);
++		writel(val & ~BIT(16), port->base + PCIE_INT_MASK);
++		usleep_range(1000, 2000);
++		ret = regmap_update_bits(pcie->cfg, 0x40,
++					 EN751221_PCIE_ERR_INT,
++					 EN751221_PCIE_ERR_INT);
++		if (ret)
++			return ret;
++		usleep_range(1000, 2000);
++	}
++
+ 	/* Set INTx mask */
+ 	val = readl(port->base + PCIE_INT_MASK);
+ 	val &= ~INTX_MASK;

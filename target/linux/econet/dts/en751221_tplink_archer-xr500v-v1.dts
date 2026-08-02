@@ -314,6 +314,48 @@
 	nvmem-cell-names = "mac-address";
 };
 
+&pcie0 {
+	status = "okay";
+	/* Opt in only this controller to the EN751221 config-TLP quirks. */
+	econet,en751221-port0-quirks;
+};
+
+&slot0 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+
+		/*
+		 * MT7603 expects a 1 KiB EEPROM. mt76 zero-initializes that
+		 * buffer before copying this compact 256-byte non-zero prefix;
+		 * the resulting image is byte-identical to the reconstructed
+		 * 1 KiB lab EEPROM. Runtime eFuse calibration is merged where
+		 * the chip reports valid calibration-free fields.
+		 */
+		mediatek,eeprom-data = [
+			03 76 00 00 02 76 03 50 00 01 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 22 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 b8 40 c8 20 00 00 00 40 c8 20 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			05 00 00 00 a4 00 00 88 00 00 00 00 00 00 00 00
+		];
+		mediatek,eeprom-merge-otp;
+		nvmem-cells = <&macaddr_misc_f100 1>;
+		nvmem-cell-names = "mac-address";
+	};
+};
+
 &pcie1 {
 	status = "okay";
 };
