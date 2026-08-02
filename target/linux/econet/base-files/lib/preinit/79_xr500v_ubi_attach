@@ -1,0 +1,67 @@
+#!/bin/sh
+
+# Attach the XR500v's dedicated OpenWrt UBI area before mount_root looks for
+# rootfs_data.  Provisioning is deliberately not done here: an attach or mount
+# failure must fall back to a RAM overlay instead of erasing recoverable data.
+xr500v_attach_ubi_overlay() {
+	local candidate devname dm mtdnum mounted_mtd volume_sysfs
+
+	mtdnum=$(sed -n 's/^mtd\([0-9][0-9]*\):.*"openwrt_ubi"$/\1/p' /proc/mtd)
+	[ -n "$mtdnum" ] || return 0
+
+	echo "[xr500v-ubi] openwrt_ubi is mtd$mtdnum" >/dev/console
+
+	if [ -d /sys/class/ubi/ubi0 ]; then
+		mounted_mtd=$(cat /sys/class/ubi/ubi0/mtd_num 2>/dev/null)
+		if [ "$mounted_mtd" != "$mtdnum" ]; then
+			echo "[xr500v-ubi] ubi0 is already attached to mtd$mounted_mtd; refusing to reuse it" >/dev/console
+			return 0
+		fi
+	else
+		if ! ubiattach -m "$mtdnum" -d 0 >/dev/console 2>&1; then
+			echo "[xr500v-ubi] attach failed; leaving openwrt_ubi unchanged" >/dev/console
+			return 0
+		fi
+	fi
+
+	for candidate in /sys/class/ubi/ubi0_*; do
+		[ -r "$candidate/name" ] || continue
+		[ "$(cat "$candidate/name")" = "rootfs_data" ] || continue
+		volume_sysfs="$candidate"
+		break
+	done
+
+	if [ -z "$volume_sysfs" ]; then
+		echo "[xr500v-ubi] rootfs_data is missing; refusing to create or format it in preinit" >/dev/console
+		return 0
+	fi
+
+	for candidate in /sys/class/ubi/ubi0 "$volume_sysfs"; do
+		devname=${candidate##*/}
+		[ -e "/dev/$devname" ] && continue
+		[ -r "$candidate/dev" ] || continue
+		dm=$(cat "$candidate/dev")
+		mknod "/dev/$devname" c "${dm%:*}" "${dm#*:}" 2>/dev/null
+	done
+
+	devname=${volume_sysfs##*/}
+	if [ ! -e "/dev/$devname" ]; then
+		echo "[xr500v-ubi] /dev/$devname is missing; leaving the volume attached but untouched" >/dev/console
+		return 0
+	fi
+
+	# A short read/write mount completes a pending UBIFS journal replay before
+	# fstools performs the real overlay mount.  It also initializes a deliberately
+	# provisioned empty UBI volume, but this hook never creates that volume itself.
+	mkdir -p /tmp/.xr500v-ubifs-warmup
+	if mount -t ubifs ubi0:rootfs_data /tmp/.xr500v-ubifs-warmup >/dev/console 2>&1; then
+		sync
+		umount /tmp/.xr500v-ubifs-warmup >/dev/console 2>&1
+		echo "[xr500v-ubi] rootfs_data is ready for mount_root" >/dev/console
+	else
+		echo "[xr500v-ubi] UBIFS warmup failed; leaving rootfs_data unchanged" >/dev/console
+	fi
+	rmdir /tmp/.xr500v-ubifs-warmup 2>/dev/null
+}
+
+boot_hook_add preinit_main xr500v_attach_ubi_overlay
