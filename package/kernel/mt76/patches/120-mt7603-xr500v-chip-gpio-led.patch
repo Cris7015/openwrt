@@ -6,6 +6,15 @@ and GPIO13 rather than a MAC LED pad.  Add a DT-gated path that selects those
 pads as active-low GPIO outputs and uses software blinking.
 
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+--- a/mt7603/Makefile
++++ b/mt7603/Makefile
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+-EXTRA_CFLAGS += -Werror -DCONFIG_MT76_LEDS
++ccflags-y += -Werror -DCONFIG_MT76_LEDS
+ obj-m += mt7603e.o
+ 
+ mt7603e-y := \
 --- a/mt7603/mt7603.h
 +++ b/mt7603/mt7603.h
 @@ -137,6 +137,7 @@ struct mt7603_dev {
