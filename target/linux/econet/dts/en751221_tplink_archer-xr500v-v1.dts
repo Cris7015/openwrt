@@ -99,6 +99,16 @@
 			reg = <0x2fe0000 0x20000>;
 			read-only;
 		};
+
+		/*
+		 * Dedicated OpenWrt overlay area in the OEM-unallocated NAND range.
+		 * Keep this separate from the 16 MiB firmware slots and from the
+		 * EN75 BMT reserve at the end of the device.
+		 */
+		partition@3000000 {
+			label = "openwrt_ubi";
+			reg = <0x3000000 0x4000000>;
+		};
 	};
 };
 
