@@ -64,6 +64,154 @@
 			debounce-interval = <60>;
 		};
 	};
+
+	/*
+	 * The EN751221 contains an on-die MT7530-class switch.  Its port 5
+	 * cascades into the MCM switch, whose ports 1 through 4 are the four
+	 * physical LAN jacks.  Port 6 of the on-die switch is the CPU conduit.
+	 */
+	switch_ondie: switch@1fb58000 {
+		compatible = "econet,en751221-switch";
+		reg = <0x1fb58000 0x8000>;
+		resets = <&scuclk EN751221_GSW_RST>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		dsa,member = <0 0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ondie_port5: port@5 {
+				reg = <5>;
+				phy-mode = "trgmii";
+				link = <&mcm_port6>;
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+
+			port@6 {
+				reg = <6>;
+				label = "cpu";
+				ethernet = <&gmac0>;
+				phy-mode = "trgmii";
+
+				fixed-link {
+					speed = <1000>;
+					full-duplex;
+				};
+			};
+		};
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			switch_mcm: switch@1f {
+				compatible = "econet,en751221-switch";
+				reg = <0x1f>;
+				mediatek,mcm;
+				#address-cells = <1>;
+				#size-cells = <0>;
+				dsa,member = <0 1>;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						phy-mode = "gmii";
+						phy-handle = <&mcmphy0>;
+						status = "disabled";
+					};
+
+					port@1 {
+						reg = <1>;
+						label = "lan4";
+						phy-mode = "gmii";
+						phy-handle = <&mcmphy1>;
+					};
+
+					port@2 {
+						reg = <2>;
+						label = "lan3";
+						phy-mode = "gmii";
+						phy-handle = <&mcmphy2>;
+					};
+
+					port@3 {
+						reg = <3>;
+						label = "lan2";
+						phy-mode = "gmii";
+						phy-handle = <&mcmphy3>;
+					};
+
+					port@4 {
+						reg = <4>;
+						label = "lan1";
+						phy-mode = "gmii";
+						phy-handle = <&mcmphy4>;
+					};
+
+					mcm_port6: port@6 {
+						reg = <6>;
+						phy-mode = "trgmii";
+						link = <&ondie_port5>;
+
+						fixed-link {
+							speed = <1000>;
+							full-duplex;
+						};
+					};
+				};
+
+				mdio {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					mcmphy0: ethernet-phy@0 {
+						compatible = "ethernet-phy-ieee802.3-c22";
+						reg = <0>;
+					};
+
+					mcmphy1: ethernet-phy@1 {
+						compatible = "ethernet-phy-ieee802.3-c22";
+						reg = <1>;
+					};
+
+					mcmphy2: ethernet-phy@2 {
+						compatible = "ethernet-phy-ieee802.3-c22";
+						reg = <2>;
+					};
+
+					mcmphy3: ethernet-phy@3 {
+						compatible = "ethernet-phy-ieee802.3-c22";
+						reg = <3>;
+					};
+
+					mcmphy4: ethernet-phy@4 {
+						compatible = "ethernet-phy-ieee802.3-c22";
+						reg = <4>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&ethernet {
+	/* The adjacent 0x1fb58000 window belongs exclusively to switch_ondie. */
+	reg = <0x1fb50000 0x8000>;
+	resets = <&scuclk EN751221_FE_RST>,
+		 <&scuclk EN751221_FE_QDMA1_RST>,
+		 <&scuclk EN751221_FE_QDMA2_RST>;
+	reset-names = "fe", "qdma0", "qdma1";
+
+	/delete-node/ mdio-bus;
 };
 
 &nand {
