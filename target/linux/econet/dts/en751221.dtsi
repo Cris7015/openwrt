@@ -50,8 +50,12 @@
 	};
 
 	chip_scu: syscon@1fa20000 {
-		compatible = "econet,en751221-chip-scu", "syscon";
+		compatible = "econet,en751221-chip-scu", "syscon", "simple-mfd";
 		reg = <0x1fa20000 0x388>;
+
+		pinctrl: pinctrl {
+			compatible = "econet,en751221-pinctrl";
+		};
 	};
 
 	pcie_phy1: pcie-phy@1fac0000 {
