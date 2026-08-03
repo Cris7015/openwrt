@@ -1,0 +1,67 @@
+mt76: mt76x02: WHNAT 5 GHz AP vif register hook (F1, 5 GHz)
+
+Mirror of the 2.4 GHz (mt7603) WHNAT register hook, for the 5 GHz (mt76x2) path:
+register each AP vif's netdev with econet-eth's WHNAT table so the PPE
+force-to-CPU downstream demux can mux NAT'd frames back to the right BSS. Hooked
+in the shared mt76x02_add_interface / mt76x02_remove_interface. The 5 GHz idx is
+shifted +8 so it cannot collide with the 2.4 GHz idx (mt7603 0-3) in the shared
+en75_wifi_vif[16] table (mt76x02 AP idx 0-7 -> 8-15). Lazy symbol_get(), same
+rationale as the mt7603 hook.
+
+--- a/mt76x02_util.c
++++ b/mt76x02_util.c
+@@ -294,6 +294,15 @@
+ 	mtxq->wcid = MT_VIF_WCID(idx);
+ }
+ 
++/* WHNAT (WiFi HW-NAT half-offload): register each 5 GHz AP vif's netdev with
++ * econet-eth so the PPE downstream demux can mux force-to-CPU frames back to
++ * this BSS. Lazy symbol_get() (same rationale as mt7603/main.c: econet-eth may
++ * still be settling at module load, but is up by vif bring-up). The 5 GHz idx
++ * is shifted +8 so it can't collide with the 2.4 GHz (mt7603) idx in the shared
++ * en75_wifi_vif[16] table (mt76x02 AP idx 0-7 -> 8-15; mt7603 stays 0-3). */
++extern void en75_whnat_register_vif(struct net_device *dev, int idx);
++extern void en75_whnat_unregister_vif(int idx);
++
+ int
+ mt76x02_add_interface(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+ {
+@@ -333,6 +342,21 @@
+ 	dev->mt76.vif_mask |= BIT_ULL(idx);
+ 
+ 	mt76x02_vif_init(dev, vif, idx);
++
++	/* WHNAT: register this 5 GHz vif (idx+8, disjoint from the 2.4 GHz range). */
++	{
++		void (*reg)(struct net_device *, int) =
++			symbol_get(en75_whnat_register_vif);
++
++		if (reg) {
++			struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++
++			if (wdev && wdev->netdev)
++				reg(wdev->netdev, idx + 8);
++			symbol_put(en75_whnat_register_vif);
++		}
++	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_add_interface);
+@@ -343,6 +367,16 @@
+ 	struct mt76x02_dev *dev = hw->priv;
+ 	struct mt76x02_vif *mvif = (struct mt76x02_vif *)vif->drv_priv;
+ 
++	/* WHNAT: drop this 5 GHz vif from econet-eth's registry (idx+8). */
++	{
++		void (*unreg)(int) = symbol_get(en75_whnat_unregister_vif);
++
++		if (unreg) {
++			unreg(mvif->idx + 8);
++			symbol_put(en75_whnat_unregister_vif);
++		}
++	}
++
+ 	dev->mt76.vif_mask &= ~BIT_ULL(mvif->idx);
+ 	rcu_assign_pointer(dev->mt76.wcid[mvif->group_wcid.idx], NULL);
+ 	mt76_wcid_cleanup(&dev->mt76, &mvif->group_wcid);

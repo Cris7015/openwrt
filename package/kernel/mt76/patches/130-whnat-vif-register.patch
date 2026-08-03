@@ -1,0 +1,77 @@
+mt76: mt7603: WHNAT vif register hook (F1)
+
+WiFi HW-NAT half-offload, phase 1 (mt76 side). Register each 2.4GHz AP vif's
+netdev with econet-eth's WHNAT vif table, keyed by mvif->idx (== OEM VirIfIdx),
+so the PPE force-to-CPU downstream demux can mux NAT'd frames back to the right
+BSS. Mirrors the OEM ppe_dev_register_hook() call in the proprietary driver.
+
+econet-eth's en75_whnat_register_vif()/_unregister_vif() are resolved LAZILY via
+symbol_get() at vif bring-up (mt7603_add_interface), not as a link-time ref.
+Rationale: on this device econet-eth's probe defers and re-runs during boot, so
+when mt7603e loads a link-time ref (even a weak one) races that and ends up
+unresolved (observed: register never fires, econet_eth refcount stays 0). By the
+time a vif is brought up ("wifi up") econet-eth is always settled, so the
+runtime name lookup succeeds. This also keeps mt7603e free of any load-order or
+package dependency on econet-eth: it loads standalone, and if econet-eth is
+absent symbol_get() returns NULL and WiFi simply runs without NAT offload. The
+AP netdev is resolved via ieee80211_vif_to_wdev(), the idiom mt7996 already uses.
+
+--- a/mt7603/main.c
++++ b/mt7603/main.c
+@@ -8,6 +8,17 @@
+ #include "mac.h"
+ #include "eeprom.h"
+ 
++/* WHNAT (WiFi HW-NAT half-offload): econet-eth maps each AP vif's netdev to a
++ * WHNAT index so the PPE force-to-CPU downstream frames are muxed back to the
++ * right BSS. We bind to econet-eth's registry LAZILY via symbol_get() at vif
++ * bring-up rather than a link-time (even weak) ref: at boot econet-eth can
++ * still be settling when mt7603e loads (its probe defers + re-runs), which
++ * leaves a weak ref unresolved; by wifi-up time econet-eth is always up.
++ * symbol_get() resolves by name at runtime -> no link/load-order dependency,
++ * mt7603e loads standalone, NULL if econet-eth is absent (WiFi works w/o NAT). */
++extern void en75_whnat_register_vif(struct net_device *dev, int idx);
++extern void en75_whnat_unregister_vif(int idx);
++
+ static int
+ mt7603_start(struct ieee80211_hw *hw)
+ {
+@@ -77,6 +88,21 @@
+ 	mtxq->wcid = idx;
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &mvif->sta.wcid);
+ 
++	/* WHNAT: register this AP vif's netdev <-> mvif->idx with econet-eth so the
++	 * PPE downstream demux can mux frames back to this BSS (lazy symbol_get). */
++	{
++		void (*reg)(struct net_device *, int) =
++			symbol_get(en75_whnat_register_vif);
++
++		if (reg) {
++			struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++
++			if (wdev && wdev->netdev)
++				reg(wdev->netdev, mvif->idx);
++			symbol_put(en75_whnat_register_vif);
++		}
++	}
++
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -91,6 +117,16 @@
+ 	struct mt7603_dev *dev = hw->priv;
+ 	int idx = msta->wcid.idx;
+ 
++	/* WHNAT: drop this vif from econet-eth's registry (lazy symbol_get). */
++	{
++		void (*unreg)(int) = symbol_get(en75_whnat_unregister_vif);
++
++		if (unreg) {
++			unreg(mvif->idx);
++			symbol_put(en75_whnat_unregister_vif);
++		}
++	}
++
+ 	mt76_wr(dev, MT_MAC_ADDR0(mvif->idx), 0);
+ 	mt76_wr(dev, MT_MAC_ADDR1(mvif->idx), 0);
+ 	mt76_wr(dev, MT_BSSID0(mvif->idx), 0);
