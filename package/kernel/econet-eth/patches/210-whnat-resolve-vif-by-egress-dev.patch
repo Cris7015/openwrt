@@ -1,0 +1,47 @@
+econet-eth: WHNAT: resolve the destination vif from the egress netdev
+
+The flow bind picked the WHNAT vif index with a source-MAC lookup.  A routed
+frame carries the MAC of the interface it leaves by, so when several AP vifs
+share a bridge that is the bridge's MAC -- which Linux inherits from the
+lowest-addressed port -- and every WiFi flow was force-to-CPU'd to whichever
+radio sorted first.
+
+Seen on an Archer XR500v with the 2.4 and 5 GHz APs in one bridge: the client
+was associated to the 5 GHz vif, the bridge wore the 2.4 GHz MAC, and the
+downstream was delivered to the 2.4 GHz BSS, which had no clients at all.  The
+frames were lost on the air and TCP spent its time retransmitting; throughput
+collapsed and connections stalled.  It is invisible without hardware offload,
+because the bridge consults its FDB and gets the port right -- the engine
+consults nothing and trusts the index encoded in the entry.
+
+Use odev, the egress netdev already collected from FLOW_ACTION_REDIRECT and
+already trusted by the ethernet path for its DSA port lookup.  The source-MAC
+lookup stays as a fallback for flows that carry no redirect action.
+
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -597,8 +597,22 @@
+ 	 * a registered mt76 AP vif): HALF-OFFLOAD -- force-to-CPU (dp=fcpu) so the
+ 	 * engine does the NAT then bounces the frame to the CPU, where the F3 demux
+ 	 * dev_queue_xmit's it to the mt76 vif (the OEM WHNAT model, cont32r/s).
+-	 * PPPoE sid from FLOW_ACTION_PPPOE_PUSH (WiFi downstream has none). */
+-	wifi_idx = en75_whnat_idx_by_mac(eth.h_source);
++	 * PPPoE sid from FLOW_ACTION_PPPOE_PUSH (WiFi downstream has none).
++	 *
++	 * Resolve the vif from the egress netdev, not from the source MAC. When
++	 * several AP vifs share a bridge, the routed frame carries the bridge's
++	 * MAC -- which Linux takes from the lowest-addressed port -- so a source
++	 * MAC lookup returns whichever radio happens to sort first, and the
++	 * engine then force-to-CPUs every frame to that BSS. Observed with the
++	 * 2.4 and 5 GHz APs bridged together: the client was on the 5 GHz vif,
++	 * the bridge wore the 2.4 GHz MAC, and the whole download was delivered
++	 * to the empty 2.4 GHz BSS. odev is the physical egress port (the same
++	 * value the ethernet path feeds to dsa_user_dev_check() below), so it
++	 * names the BSS directly. Keep the MAC lookup as a fallback for the
++	 * unbridged case, where the flow may carry no redirect action. */
++	wifi_idx = en75_whnat_idx_by_dev(odev);
++	if (wifi_idx < 0)
++		wifi_idx = en75_whnat_idx_by_mac(eth.h_source);
+ 	en75_foe_entry_prepare(&e, MTK_PPE_PKT_TYPE_IPV4_HNAPT, l4proto,
+ 			       wifi_idx >= 0 ? READ_ONCE(en75_ppe_fcpu_dp) : 1,
+ 			       eth.h_source, eth.h_dest);
