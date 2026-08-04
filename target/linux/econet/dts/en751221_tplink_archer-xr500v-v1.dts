@@ -20,6 +20,43 @@
 		linux,usable-memory-range = <0x00020000 0x0ffe0000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * The packet engine writes its flow table here by DMA, at the
+		 * address the OEM firmware uses. Without this the kernel hands
+		 * those pages out like any other memory and the engine corrupts
+		 * whatever lands there, which shows up much later as a lockup
+		 * with nothing in the log to explain it.
+		 */
+		ppe_foe_rsv: ppe-foe@dc00000 {
+			reg = <0x0dc00000 0x00180000>;
+			no-map;
+		};
+
+		/*
+		 * Crash log in the top MiB, so an oops survives the reboot and
+		 * can be read from /sys/fs/pstore afterwards. Best effort: the
+		 * DDR init ROM is closed, so how much of RAM survives a warm
+		 * reset is not something we can promise -- the ECC bytes are
+		 * there to recover from the sparse decay of that gap.
+		 */
+		ramoops@ff00000 {
+			compatible = "ramoops";
+			reg = <0x0ff00000 0x00100000>;
+			record-size  = <0x00020000>;
+			console-size = <0x00040000>;
+			pmsg-size    = <0x00020000>;
+			ftrace-size  = <0x00000000>;
+			ecc-size     = <16>;
+			max-reason   = <5>;	/* KMSG_DUMP_OOPS and worse */
+			no-map;
+		};
+	};
+
 	leds {
 		compatible = "gpio-leds";
 		pinctrl-names = "default";
