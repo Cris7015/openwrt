@@ -1,0 +1,15 @@
+mips: econet: enable MT SMP on the EN751221
+
+The EN751221 is a single-core 34Kc with the MT ASE, so its two VPEs can be
+brought up as SMP CPUs once SYS_SUPPORTS_MULTITHREADING is selected.
+
+--- a/arch/mips/econet/Kconfig
++++ b/arch/mips/econet/Kconfig
+@@ -20,6 +20,7 @@
+ 		select SMP
+ 		select SMP_UP
+ 		select SYS_SUPPORTS_SMP
++		select SYS_SUPPORTS_MULTITHREADING
+ 		help
+ 		  The EN751221 family includes EN7512, RN7513, EN7521, EN7526.
+ 		  They are based on single core MIPS 34Kc processors. To boot

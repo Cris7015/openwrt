@@ -78,7 +78,13 @@
 
 		interrupt-controller;
 		#interrupt-cells = <1>;
-		econet,shadow-interrupts = <7 2>, <8 3>, <13 12>, <30 29>;
+		/* <13 12> is NOT a per-cpu primary/shadow pair: 13 and 12 are two
+		 * distinct PCM interrupts in the vendor's enum (SI_PC_INT and
+		 * SI_PC1_INT), and the PCM this board wires is hwirq 11. Declaring
+		 * it marks 12 as a shadow, which the driver then refuses to let any
+		 * device claim.
+		 */
+		econet,shadow-interrupts = <7 2>, <8 3>, <30 29>;
 	};
 
 	scuclk: clock-controller@1fb00000 {
