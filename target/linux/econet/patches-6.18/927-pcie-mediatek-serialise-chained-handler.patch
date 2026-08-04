@@ -1,0 +1,97 @@
+PCI: mediatek: serialise the demultiplexing handler against itself
+
+mtk_pcie_intr_handler() is installed as a chained handler, so it runs without
+the serialisation genirq applies to an ordinary one: no descriptor lock, no
+in-progress flag.  That is safe only while the parent interrupt is delivered
+to a single CPU, and not every controller can promise it.
+
+On the EcoNet EN751221 the parent is a cascade line shared by both hardware
+threads of the core, and its controller keeps no per-thread state, so both
+threads enter this handler at the same time.  They race on the read then
+write-one-to-clear of PCIE_INT_STATUS, and because the INTx latch is edge
+triggered the loser clears a status bit whose device interrupt is never
+delivered: handle_simple_irq() finds the descriptor already in progress and
+dummy_irq_chip provides no resend, so the event is simply dropped.  Once that
+happens to a card that is waiting on it, the driver blocks -- an mt76 radio on
+this board loses its firmware reply and reports "MCU message timed out",
+followed by a hardware restart it cannot complete.
+
+Take a per-port raw spinlock across the handler so the two dispatches are
+ordered rather than overlapping.  It costs nothing where the parent already
+lands on one CPU: the lock is then uncontended.
+
+While here, bound the MSI drain loop.  A status bit that cannot be cleared
+would otherwise spin there forever with interrupts disabled.
+
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -202,6 +202,7 @@
+  * @inner_domain: inner IRQ domain
+  * @lock: protect the msi_irq_in_use bitmap
+  * @msi_irq_in_use: bit map for assigned MSI IRQ
++ * @hw_irq_lock: serialise the demultiplexing handler against itself
+  */
+ struct mtk_pcie_port {
+ 	void __iomem *base;
+@@ -220,6 +221,7 @@
+ 	struct irq_domain *irq_domain;
+ 	struct irq_domain *inner_domain;
+ 	struct mutex lock;
++	raw_spinlock_t hw_irq_lock;
+ 	DECLARE_BITMAP(msi_irq_in_use, MTK_MSI_IRQS_NUM);
+ };
+ 
+@@ -693,6 +695,21 @@
+ 
+ 	chained_irq_enter(irqchip, desc);
+ 
++	/*
++	 * A chained handler carries none of the serialisation genirq gives a
++	 * normal one: no descriptor lock, no in-progress flag. That is fine
++	 * while the parent interrupt reaches a single CPU, but not every
++	 * controller can promise it -- on the EN751221 the parent is a shared
++	 * cascade line and both hardware threads enter here at once. They then
++	 * race on the read-then-write-one-to-clear below, and since the INTx
++	 * latch is edge triggered, the loser clears a status bit whose device
++	 * interrupt is never delivered: handle_simple_irq() finds the descriptor
++	 * already in progress and dummy_irq_chip offers no resend, so the event
++	 * is dropped for good. Take a lock of our own so the two dispatches are
++	 * ordered instead of overlapping.
++	 */
++	raw_spin_lock(&port->hw_irq_lock);
++
+ 	status = readl(port->base + PCIE_INT_STATUS);
+ 	if (status & INTX_MASK) {
+ 		for_each_set_bit_from(bit, &status, PCI_NUM_INTX + INTX_SHIFT) {
+@@ -714,14 +731,21 @@
+ 			 * be cleared before being dispatched to the
+ 			 * handler of the underlying device.
+ 			 */
++			int loops = MTK_MSI_IRQS_NUM * 2;
++
+ 			writel(MSI_STATUS, port->base + PCIE_INT_STATUS);
+-			while ((imsi_status = readl(port->base + PCIE_IMSI_STATUS))) {
++			/* Bounded: a status bit we cannot clear would otherwise
++			 * spin here forever with interrupts off. */
++			while ((imsi_status = readl(port->base + PCIE_IMSI_STATUS)) &&
++			       loops--) {
+ 				for_each_set_bit(bit, &imsi_status, MTK_MSI_IRQS_NUM)
+ 					generic_handle_domain_irq(port->inner_domain, bit);
+ 			}
+ 		}
+ 	}
+ 
++	raw_spin_unlock(&port->hw_irq_lock);
++
+ 	chained_irq_exit(irqchip, desc);
+ }
+ 
+@@ -733,6 +757,8 @@
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	int err;
+ 
++	raw_spin_lock_init(&port->hw_irq_lock);
++
+ 	err = mtk_pcie_init_irq_domain(port, node);
+ 	if (err) {
+ 		dev_err(dev, "failed to init PCIe IRQ domain\n");
