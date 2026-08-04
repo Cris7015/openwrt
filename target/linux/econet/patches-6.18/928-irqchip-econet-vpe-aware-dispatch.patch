@@ -1,0 +1,160 @@
+irqchip/econet-en751221: dispatch the cascade per VPE
+
+The pending registers are shared by the whole core: every VPE with the
+cascade unmasked reads the same bits.  The handler dispatches all of them
+regardless of where it runs, which was fine while only one VPE took the
+cascade -- the comment on econet_chmask() still says "This is single
+processor only".  Once both take it, every interrupt is dispatched twice,
+concurrently, and that is the steady state rather than a rare race.
+
+Interrupts that genirq serialises survive it: handle_level_irq() holds the
+descriptor lock and marks the descriptor in progress, so the second dispatch
+is dropped.  A chained handler further down has no such protection, and one
+of those sits behind the PCIe port on this SoC: both VPEs run it at once,
+race on its write-one-to-clear status register, and lose edge-triggered
+device interrupts outright.
+
+A shadow is also dispatched as itself, and shadows have no descriptor --
+econet_intc_map() refuses to map them.  generic_handle_domain_irq() then
+returns an error nobody looks at, and since the line is level triggered it
+stays asserted with the cascade asserted behind it.
+
+Split the work along the only boundary the hardware provides: the shadow
+bits belong to the second VPE, everything else to the boot VPE.  Each VPE
+masks off the other's bits before dispatching, and the second VPE translates
+a shadow into the interrupt it stands for, whose per-cpu handler then acts on
+the VPE it is running on.  Seeing only the other VPE's bits is not a spurious
+interrupt, so decide that on the unfiltered value.
+
+Finally, stop discarding the dispatch result: an interrupt with no handler
+now gets masked and reported.  A degraded device is easier to diagnose than a
+machine that stops without a word.
+
+Also cross the pending registers with the mask before dispatching.  Pending
+is the raw state of the inputs: masking stops an interrupt from reaching the
+CPU but leaves its bit set here, so the handler was dispatching lines nobody
+had asked for.  The software interrupt lines make that fatal -- the IPIs this
+platform sends between VPEs light them up, no descriptor exists for them, and
+being level triggered they stay asserted with the cascade firing on them.
+
+--- a/drivers/irqchip/irq-econet-en751221.c
++++ b/drivers/irqchip/irq-econet-en751221.c
+@@ -54,6 +54,12 @@
+ static struct {
+ 	void __iomem	*membase;
+ 	u8		interrupt_shadows[IRQ_COUNT];
++	/* Which pending bits belong to the second VPE, and, for each of
++	 * those, the interrupt it stands for. Derived from the shadow table
++	 * once at probe so the dispatch path can stay a couple of masks.
++	 */
++	u32		shadow_bits[2];
++	u8		shadow_owner[IRQ_COUNT];
+ } econet_intc __ro_after_init;
+ 
+ static DEFINE_RAW_SPINLOCK(irq_lock);
+@@ -121,14 +127,34 @@
+ 	econet_wreg(REG_MASK1, 0, ~0);
+ }
+ 
+-static void econet_intc_handle_pending(struct irq_domain *d, u32 pending, u32 offset)
++static void econet_intc_handle_pending(struct irq_domain *d, u32 pending, u32 offset,
++				       bool vpe1)
+ {
+ 	int hwirq;
+ 
+ 	while (pending) {
+ 		hwirq = fls(pending) - 1;
+-		generic_handle_domain_irq(d, hwirq + offset);
+ 		pending &= ~BIT(hwirq);
++		hwirq += offset;
++
++		/* A shadow is the second VPE's view of another interrupt; it
++		 * has no descriptor of its own, so hand over the one it
++		 * stands for. The handler is per-cpu and will act on the VPE
++		 * it runs on, which is this one.
++		 */
++		if (vpe1)
++			hwirq = econet_intc.shadow_owner[hwirq];
++
++		if (generic_handle_domain_irq(d, hwirq)) {
++			/* Nothing claims it, and the line is level triggered:
++			 * left alone it would keep the cascade asserted and
++			 * spin here forever. Mask it and say so -- a degraded
++			 * device beats a machine that stops without a word.
++			 */
++			econet_chmask(hwirq, false);
++			pr_err_ratelimited("%s: masking undispatchable hwirq %d\n",
++					   __func__, hwirq);
++		}
+ 	}
+ }
+ 
+@@ -136,19 +162,54 @@
+ {
+ 	struct irq_chip *chip = irq_desc_get_chip(desc);
+ 	struct irq_domain *domain;
+-	u32 pending0, pending1;
++	u32 pending0, pending1, raw;
++	bool vpe1 = smp_processor_id() != 0;
+ 
+ 	chained_irq_enter(chip, desc);
+ 
+ 	pending0 = ioread32(econet_intc.membase + REG_PENDING0);
+ 	pending1 = ioread32(econet_intc.membase + REG_PENDING1);
+ 
+-	if (unlikely(!(pending0 | pending1))) {
+-		spurious_interrupt();
++	/*
++	 * Pending is the raw state of the inputs; masking an interrupt stops
++	 * it from reaching the CPU but does not clear its bit here. Dispatch
++	 * only what is actually enabled, or a line nobody asked for is handed
++	 * to a domain that has no descriptor for it -- and since these lines
++	 * are level triggered, it stays asserted and the cascade keeps firing
++	 * on it. The software interrupt lines are exactly that case: the IPIs
++	 * this platform sends between VPEs light them up even though nothing
++	 * claims them here.
++	 */
++	pending0 &= ioread32(econet_intc.membase + REG_MASK0);
++	pending1 &= ioread32(econet_intc.membase + REG_MASK1);
++
++	/*
++	 * The pending registers are shared: every VPE that has the cascade
++	 * unmasked sees the same bits. Dispatching them all from whichever
++	 * VPE got here means each interrupt is handled twice, concurrently --
++	 * harmless for the ones genirq serialises, fatal for a chained
++	 * handler that has no lock of its own.
++	 *
++	 * Split the work instead, along the only boundary the hardware gives
++	 * us: the shadow bits are the second VPE's, everything else is the
++	 * boot VPE's. Seeing only the other VPE's bits is not spurious, so
++	 * decide that on the raw value.
++	 */
++	raw = pending0 | pending1;
++	if (vpe1) {
++		pending0 &= econet_intc.shadow_bits[0];
++		pending1 &= econet_intc.shadow_bits[1];
+ 	} else {
++		pending0 &= ~econet_intc.shadow_bits[0];
++		pending1 &= ~econet_intc.shadow_bits[1];
++	}
++
++	if (unlikely(!raw)) {
++		spurious_interrupt();
++	} else if (pending0 | pending1) {
+ 		domain = irq_desc_get_handler_data(desc);
+-		econet_intc_handle_pending(domain, pending0, 0);
+-		econet_intc_handle_pending(domain, pending1, 32);
++		econet_intc_handle_pending(domain, pending0, 0, vpe1);
++		econet_intc_handle_pending(domain, pending1, 32, vpe1);
+ 	}
+ 
+ 	chained_irq_exit(chip, desc);
+@@ -315,6 +376,8 @@
+ 
+ 		econet_intc.interrupt_shadows[target] = shadow;
+ 		econet_intc.interrupt_shadows[shadow] = IS_SHADOW;
++		econet_intc.shadow_bits[shadow / 32] |= BIT(shadow % 32);
++		econet_intc.shadow_owner[shadow] = target;
+ 	}
+ 
+ 	return 0;
