@@ -1,0 +1,73 @@
+#!/bin/sh /etc/rc.common
+# Conservative EN75xx xPON lab loader.
+#
+# Deliberately does not create /etc/modules.d state: every boot starts disabled,
+# and every load explicitly retains the optical TX hold.  Releasing that hold is
+# a separate, manual lab operation and is outside this service.
+START=91
+STOP=10
+
+legacy_autoload=/etc/modules.d/91-econet-xpon
+
+valid_sn() {
+	[ "${#1}" -eq 12 ] || return 1
+	local suffix="${1#????}"
+	case "$suffix" in
+		''|*[!0-9A-Fa-f]*) return 1 ;;
+	esac
+	return 0
+}
+
+start() {
+	local enabled sn pw mac
+
+	# Remove state written by the original PR loader.  It contained both module
+	# arguments and potentially private identity data in a world-readable file.
+	rm -f "$legacy_autoload"
+
+	config_load econet-xpon
+	config_get_bool enabled identity enabled 0
+	config_get sn identity gpon_sn
+	config_get pw identity gpon_pw
+	config_get mac identity wan_mac
+
+	[ "$enabled" -eq 1 ] || {
+		logger -t econet-xpon "lab loader disabled; driver not loaded"
+		return 0
+	}
+
+	valid_sn "$sn" || {
+		logger -t econet-xpon "invalid or missing GPON serial; driver not loaded"
+		return 1
+	}
+
+	grep -q '^econet_xpon ' /proc/modules && {
+		logger -t econet-xpon "driver already loaded; no parameters changed"
+		return 0
+	}
+
+	set -- econet-xpon "gpon_sn=$sn" tx_laser_off=1
+	[ -n "$pw" ] && set -- "$@" "gpon_pw=$pw"
+	[ -n "$mac" ] && set -- "$@" "wan_mac=$mac"
+
+	if insmod "$@"; then
+		logger -t econet-xpon "driver loaded in RX-only lab mode (TX hold retained)"
+	else
+		logger -t econet-xpon "driver load failed"
+		return 1
+	fi
+}
+
+boot() {
+	start
+}
+
+reload() {
+	logger -t econet-xpon "reload does not replace a live optical driver; reboot or unload manually"
+	return 1
+}
+
+stop() {
+	# Do not unload a live optical/network driver from an init script.
+	return 0
+}

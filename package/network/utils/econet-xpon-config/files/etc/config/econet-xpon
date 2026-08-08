@@ -1,0 +1,5 @@
+config econet-xpon 'identity'
+	option enabled '0'
+	option gpon_sn ''
+	option gpon_pw ''
+	option wan_mac ''
