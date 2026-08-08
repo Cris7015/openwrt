@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=econet-xpon-config
 PKG_VERSION:=1
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_MAINTAINER:=AK Sharma <maskachoska@yahoo.com>
 PKG_LICENSE:=GPL-2.0-only
 PKG_LICENSE_FILES:=COPYING
@@ -21,6 +21,7 @@ endef
 define Package/econet-xpon-config/description
   Disabled-by-default UCI configuration and manual lab loader for econet-xpon.
   It never creates a persistent modules.d entry, always keeps tx_laser_off=1,
+  extracts and validates the per-unit EN7570 matrix from read-only factory MTD,
   and does not log subscriber identity or credentials.
 endef
 

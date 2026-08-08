@@ -1,5 +1,7 @@
 config econet-xpon 'identity'
 	option enabled '0'
+	option calibration_partition 'misc'
+	option calibration_offset '0x20000'
 	option gpon_sn ''
 	option gpon_pw ''
 	option wan_mac ''

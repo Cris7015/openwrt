@@ -8,6 +8,7 @@ START=91
 STOP=10
 
 legacy_autoload=/etc/modules.d/91-econet-xpon
+calibration_file=/tmp/7570_bob.conf
 
 valid_sn() {
 	[ "${#1}" -eq 12 ] || return 1
@@ -18,8 +19,85 @@ valid_sn() {
 	return 0
 }
 
+parse_offset() {
+	local value="$1" digits
+
+	case "$value" in
+		0x*)
+			digits="${value#0x}"
+			[ -n "$digits" ] || return 1
+			case "$digits" in *[!0-9A-Fa-f]*) return 1 ;; esac
+			;;
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	CAL_OFFSET_DEC=$((value))
+	[ "$CAL_OFFSET_DEC" -ge 0 ] 2>/dev/null
+}
+
+prepare_calibration() {
+	local partition="$1" offset="$2" mtd tmp size magic word
+	rm -f "$calibration_file"
+
+	case "$partition" in
+		''|*[!A-Za-z0-9_.-]*)
+			logger -t econet-xpon "invalid calibration partition name"
+			return 1
+			;;
+	esac
+	parse_offset "$offset" || {
+		logger -t econet-xpon "invalid calibration offset"
+		return 1
+	}
+
+	mtd="$(find_mtd_part "$partition")"
+	[ -n "$mtd" ] && [ -r "$mtd" ] || {
+		logger -t econet-xpon "calibration partition is missing or unreadable"
+		return 1
+	}
+
+	umask 077
+	tmp="${calibration_file}.$$"
+	rm -f "$tmp"
+	dd if="$mtd" of="$tmp" bs=1 skip="$CAL_OFFSET_DEC" count=400 2>/dev/null || {
+		rm -f "$tmp"
+		logger -t econet-xpon "failed to read EN7570 calibration"
+		return 1
+	}
+
+	size="$(wc -c < "$tmp")"
+	[ "$size" -eq 400 ] || {
+		rm -f "$tmp"
+		logger -t econet-xpon "EN7570 calibration has an invalid size"
+		return 1
+	}
+
+	# The OEM EN7570 matrix is native big-endian.  This GPON port accepts only
+	# schema/magic 0x07050700; EN7571/H660 uses 0x07050701 and a different layout.
+	magic="$(hexdump -v -n 4 -s 148 -e '1/1 "%02x"' "$tmp")"
+	[ "$magic" = 07050700 ] || {
+		rm -f "$tmp"
+		logger -t econet-xpon "EN7570 calibration magic/schema mismatch"
+		return 1
+	}
+
+	# Bias, modulation, P0 and P1 are mandatory.  Reject erased factory data.
+	for offset in 0 4 8 12; do
+		word="$(hexdump -v -n 4 -s "$offset" -e '1/1 "%02x"' "$tmp")"
+		[ "$word" != ffffffff ] || {
+			rm -f "$tmp"
+			logger -t econet-xpon "required EN7570 calibration field is erased"
+			return 1
+		}
+	done
+
+	mv -f "$tmp" "$calibration_file"
+	chmod 600 "$calibration_file"
+	logger -t econet-xpon "validated per-unit EN7570 calibration loaded from read-only MTD"
+}
+
 start() {
-	local enabled sn pw mac
+	local enabled sn pw mac cal_partition cal_offset
 
 	# Remove state written by the original PR loader.  It contained both module
 	# arguments and potentially private identity data in a world-readable file.
@@ -27,6 +105,8 @@ start() {
 
 	config_load econet-xpon
 	config_get_bool enabled identity enabled 0
+	config_get cal_partition identity calibration_partition misc
+	config_get cal_offset identity calibration_offset 0x20000
 	config_get sn identity gpon_sn
 	config_get pw identity gpon_pw
 	config_get mac identity wan_mac
@@ -44,6 +124,11 @@ start() {
 	grep -q '^econet_xpon ' /proc/modules && {
 		logger -t econet-xpon "driver already loaded; no parameters changed"
 		return 0
+	}
+
+	prepare_calibration "$cal_partition" "$cal_offset" || {
+		logger -t econet-xpon "driver not loaded because calibration validation failed"
+		return 1
 	}
 
 	set -- econet-xpon "gpon_sn=$sn" tx_laser_off=1
