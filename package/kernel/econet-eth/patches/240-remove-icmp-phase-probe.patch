@@ -1,0 +1,342 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: remove completed ICMP phase probe
+
+The temporary ICMP phase tracer parsed every RX/TX packet and printed a
+long diagnostic line before ringing the QDMA TX doorbell. At 115200 baud,
+that printk held each forwarded echo reply for about 15 ms. Hardware A/B
+testing measured 45.79 ms average with logging enabled and 30.91 ms with it
+disabled.
+
+The probe has completed its purpose. Remove its parsers, state, parameters,
+RX/TX hooks and the per-RX metadata used only by it. Keep the lightweight
+generic IRQ-to-NAPI latency counters.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -4,8 +4,6 @@
+ #include <linux/sched.h>
+ #include <linux/moduleparam.h>
+ #include <linux/ktime.h>
+-#include <linux/ip.h>
+-#include <linux/icmp.h>
+ #include <linux/smp.h>
+ #include <linux/atomic.h>
+ #include <net/page_pool/helpers.h>
+@@ -49,14 +47,6 @@
+ 	struct napi_struct		napi;
+ 	struct page_pool		*page_pool;
+ 	ktime_t				irq_time;	/* dbg: RX irq->poll latency */
+-	ktime_t				last_irq_time;
+-	ktime_t				last_poll_time;
+-	u32				last_irq_status;
+-	u32				last_irq_mask;
+-	u32				last_rx_hwi;
+-	u32				last_rx_cpui;
+-	int				last_irq_cpu;
+-	int				last_poll_cpu;
+ };
+ 
+ #define EN75_FCPU_BATCH_MAX	(EN75_WHNAT_MAX_VIFS + 1)
+@@ -208,164 +198,6 @@
+ 	atomic64_inc(bucket);
+ }
+ 
+-#define EN75_ICMP_PHASE_SLOTS	64
+-#define EN75_ICMP_IP_MF		0x2000
+-#define EN75_ICMP_IP_OFFSET	0x1fff
+-#define EN75_ICMP_VLAN_HLEN	4
+-
+-struct en75_icmp_phase_sample {
+-	bool				used;
+-	u16				id;
+-	u16				seq;
+-	u16				rx_desc;
+-	u16				tx_desc;
+-	u8				qrx;
+-	u8				qtx;
+-	u8				sport;
+-	int				irq_cpu;
+-	int				poll_cpu;
+-	int				rx_cpu;
+-	int				tx_cpu;
+-	u32				irq_status;
+-	u32				irq_mask;
+-	u32				rx_hwi;
+-	u32				rx_cpui;
+-	ktime_t				irq_time;
+-	ktime_t				poll_time;
+-	ktime_t				rx_time;
+-	ktime_t				tx_time;
+-};
+-
+-static struct en75_icmp_phase_sample en75_icmp_phase[EN75_ICMP_PHASE_SLOTS];
+-static DEFINE_SPINLOCK(en75_icmp_phase_lock);
+-static unsigned int en75_icmp_phase_next;
+-static bool en75_icmp_phase_probe = true;
+-static int en75_icmp_phase_log_us = 1000;
+-int en75_icmp_phase_rx_seen, en75_icmp_phase_tx_seen;
+-int en75_icmp_phase_tx_match, en75_icmp_phase_tx_miss;
+-module_param_named(icmp_phase_probe, en75_icmp_phase_probe, bool, 0644);
+-module_param_named(icmp_phase_log_us, en75_icmp_phase_log_us, int, 0644);
+-module_param_named(icmp_phase_rx_seen, en75_icmp_phase_rx_seen, int, 0444);
+-module_param_named(icmp_phase_tx_seen, en75_icmp_phase_tx_seen, int, 0444);
+-module_param_named(icmp_phase_tx_match, en75_icmp_phase_tx_match, int, 0444);
+-module_param_named(icmp_phase_tx_miss, en75_icmp_phase_tx_miss, int, 0444);
+-
+-static bool en75_icmp_phase_parse_ip(const u8 *data, unsigned int len,
+-				     u8 *type, u16 *id, u16 *seq)
+-{
+-	unsigned int ihl;
+-	u16 frag;
+-
+-	if (len < 20)
+-		return false;
+-
+-	if ((data[0] >> 4) != 4)
+-		return false;
+-
+-	ihl = (data[0] & 0x0f) * 4;
+-	if (ihl < 20 || len < ihl + 8)
+-		return false;
+-
+-	if (data[9] != IPPROTO_ICMP)
+-		return false;
+-
+-	frag = get_unaligned_be16(data + 6);
+-	if (frag & (EN75_ICMP_IP_MF | EN75_ICMP_IP_OFFSET))
+-		return false;
+-
+-	if (data[ihl] != ICMP_ECHO && data[ihl] != ICMP_ECHOREPLY)
+-		return false;
+-
+-	*type = data[ihl];
+-	*id = get_unaligned_be16(data + ihl + 4);
+-	*seq = get_unaligned_be16(data + ihl + 6);
+-
+-	return true;
+-}
+-
+-static bool en75_icmp_phase_parse_l2(const u8 *data, unsigned int len,
+-				     unsigned int proto_off,
+-				     u8 *type, u16 *id, u16 *seq)
+-{
+-	unsigned int off = proto_off + 2;
+-	u16 proto;
+-
+-	if (len < proto_off + 2)
+-		return false;
+-
+-	proto = get_unaligned_be16(data + proto_off);
+-	while ((proto == ETH_P_8021Q || proto == ETH_P_8021AD ||
+-		proto == 0x5678) &&
+-	       len >= off + EN75_ICMP_VLAN_HLEN) {
+-		proto = get_unaligned_be16(data + off + 2);
+-		off += EN75_ICMP_VLAN_HLEN;
+-	}
+-
+-	return proto == ETH_P_IP &&
+-	       en75_icmp_phase_parse_ip(data + off, len - off,
+-					type, id, seq);
+-}
+-
+-static bool en75_icmp_phase_parse_skb(const struct sk_buff *skb,
+-				      u8 *type, u16 *id, u16 *seq)
+-{
+-	const u8 *data = skb->data;
+-	unsigned int len = skb_headlen(skb);
+-
+-	if (en75_icmp_phase_parse_l2(data, len, 12, type, id, seq))
+-		return true;
+-
+-	if (en75_icmp_phase_parse_l2(data, len, 16, type, id, seq))
+-		return true;
+-
+-	if (skb->protocol == htons(ETH_P_IP) &&
+-	    en75_icmp_phase_parse_ip(data, len, type, id, seq))
+-		return true;
+-
+-	return false;
+-}
+-
+-static void en75_icmp_phase_rx(struct en75_q_rx *q, struct sk_buff *skb,
+-			       u32 desc_i, u8 sport, u8 qid)
+-{
+-	struct en75_icmp_phase_sample *s;
+-	unsigned long flags;
+-	u16 id, seq;
+-	u8 type;
+-
+-	if (!READ_ONCE(en75_icmp_phase_probe))
+-		return;
+-
+-	if (!en75_icmp_phase_parse_skb(skb, &type, &id, &seq) ||
+-	    type != ICMP_ECHO)
+-		return;
+-
+-	en75_icmp_phase_rx_seen++;
+-
+-	spin_lock_irqsave(&en75_icmp_phase_lock, flags);
+-	s = &en75_icmp_phase[en75_icmp_phase_next++ &
+-			     (EN75_ICMP_PHASE_SLOTS - 1)];
+-	*s = (struct en75_icmp_phase_sample) {
+-		.used = true,
+-		.id = id,
+-		.seq = seq,
+-		.rx_desc = desc_i,
+-		.qrx = qid,
+-		.sport = sport,
+-		.irq_cpu = q->last_irq_cpu,
+-		.poll_cpu = q->last_poll_cpu,
+-		.rx_cpu = raw_smp_processor_id(),
+-		.irq_status = q->last_irq_status,
+-		.irq_mask = q->last_irq_mask,
+-		.rx_hwi = q->last_rx_hwi,
+-		.rx_cpui = q->last_rx_cpui,
+-		.irq_time = q->last_irq_time,
+-		.poll_time = q->last_poll_time,
+-		.rx_time = ktime_get(),
+-	};
+-	spin_unlock_irqrestore(&en75_icmp_phase_lock, flags);
+-}
+-
+ struct en75_q_tx {
+ 	/* protect concurrent queue accesses
+ 	 * use _bh unless in napi poll */
+@@ -826,9 +658,6 @@
+ 		}
+ 	}
+ 
+-	en75_icmp_phase_rx(q, skb, cpu_i, sport,
+-			   q - &q->qdma->q_rx[0]);
+-
+ 	/* PON RX: hand the frame to the xPON sub-driver, which owns it from
+ 	 * here on. The GEM port id rides in word0 bits 23:12 of the descriptor. */
+ 	if (READ_ONCE(q->qdma->pon_rx_cb)) {
+@@ -1058,9 +887,6 @@
+ 	if (READ_ONCE(en75_ppe_fcpu_xmit))
+ 		fcpu_out = dev_get_by_name(&init_net, en75_ppe_fcpu_odev);
+ 
+-	q->last_poll_time = poll_time;
+-	q->last_poll_cpu = raw_smp_processor_id();
+-
+ 	if (q->irq_time) {	/* dbg: RX irq->poll latency (us) */
+ 		int lat = (int)ktime_us_delta(poll_time, q->irq_time);
+ 
+@@ -1138,15 +964,8 @@
+ 
+ 			if (p.type == IPS_DONE && p.source == IPSC_RX) {
+ 				struct en75_q_rx *rxq = &qdma->q_rx[p.chain];
+-				ktime_t irq_time = ktime_get();
+ 
+-				rxq->irq_time = irq_time; /* dbg */
+-				rxq->last_irq_time = irq_time;
+-				rxq->last_irq_status = raw_status;
+-				rxq->last_irq_mask = irq->irqmask[i];
+-				rxq->last_rx_hwi = en75_rreg(&rxq->qchain_regs->rx_hwi);
+-				rxq->last_rx_cpui = rxq->cpu_i;
+-				rxq->last_irq_cpu = raw_smp_processor_id();
++				rxq->irq_time = ktime_get(); /* dbg */
+ 				napi_schedule_irqoff(&qdma->q_rx[p.chain].napi);
+ 				disable_int |= BIT(bit);
+ 				continue;
+@@ -1316,89 +1135,6 @@
+ 	return done;
+ }
+ 
+-static void en75_icmp_phase_tx(struct sk_buff *skb, int qid, u16 desc_i)
+-{
+-	struct en75_icmp_phase_sample found = { 0 };
+-	bool matched = false;
+-	unsigned long flags;
+-	ktime_t tx_time;
+-	u16 id, seq;
+-	u8 type;
+-	int i;
+-
+-	if (!READ_ONCE(en75_icmp_phase_probe))
+-		return;
+-
+-	if (!en75_icmp_phase_parse_skb(skb, &type, &id, &seq) ||
+-	    type != ICMP_ECHOREPLY)
+-		return;
+-
+-	en75_icmp_phase_tx_seen++;
+-	tx_time = ktime_get();
+-
+-	spin_lock_irqsave(&en75_icmp_phase_lock, flags);
+-	for (i = 0; i < EN75_ICMP_PHASE_SLOTS; i++) {
+-		struct en75_icmp_phase_sample *s;
+-		unsigned int slot;
+-
+-		slot = (en75_icmp_phase_next - 1 - i) &
+-		       (EN75_ICMP_PHASE_SLOTS - 1);
+-		s = &en75_icmp_phase[slot];
+-
+-		if (!s->used || s->id != id || s->seq != seq)
+-			continue;
+-
+-		s->used = false;
+-		s->tx_time = tx_time;
+-		s->tx_cpu = raw_smp_processor_id();
+-		s->qtx = qid;
+-		s->tx_desc = desc_i;
+-		found = *s;
+-		matched = true;
+-		break;
+-	}
+-	spin_unlock_irqrestore(&en75_icmp_phase_lock, flags);
+-
+-	if (matched) {
+-		int irq_poll_us = -1;
+-		int poll_rx_us = -1;
+-		int rx_tx_us = -1;
+-		int irq_tx_us = -1;
+-		int log_us;
+-
+-		en75_icmp_phase_tx_match++;
+-
+-		if (found.irq_time && found.poll_time)
+-			irq_poll_us = (int)ktime_us_delta(found.poll_time,
+-							  found.irq_time);
+-		if (found.poll_time && found.rx_time)
+-			poll_rx_us = (int)ktime_us_delta(found.rx_time,
+-							 found.poll_time);
+-		if (found.rx_time && found.tx_time)
+-			rx_tx_us = (int)ktime_us_delta(found.tx_time,
+-						       found.rx_time);
+-		if (found.irq_time && found.tx_time)
+-			irq_tx_us = (int)ktime_us_delta(found.tx_time,
+-							found.irq_time);
+-
+-		log_us = READ_ONCE(en75_icmp_phase_log_us);
+-		if (log_us >= 0 &&
+-		    (log_us == 0 ||
+-		     irq_poll_us >= log_us || poll_rx_us >= log_us ||
+-		     rx_tx_us >= log_us || irq_tx_us >= log_us))
+-			pr_info("XR500v ICMPPHASE id=%u seq=%u qrx=%u qtx=%u sport=%u desc=%u/%u cpu=%d/%d/%d/%d us=%d/%d/%d/%d hwi=%u cpui=%u irq_status=%08x irq_mask=%08x\n",
+-				found.id, found.seq, found.qrx, found.qtx,
+-				found.sport, found.rx_desc, found.tx_desc,
+-				found.irq_cpu, found.poll_cpu, found.rx_cpu,
+-				found.tx_cpu, irq_poll_us, poll_rx_us,
+-				rx_tx_us, irq_tx_us, found.rx_hwi,
+-				found.rx_cpui, found.irq_status,
+-				found.irq_mask);
+-	} else {
+-		en75_icmp_phase_tx_miss++;
+-	}
+-}
+-
+ /* ===================================================================== */
+ /* PON integration seam: what the econet-xpon module links against.       */
+ /* Modelled on the seam from openwrt PR #24577 (100-xpon-bench-spike),    */
+@@ -1544,7 +1280,6 @@
+ 
+ 	skb_tx_timestamp(skb);
+ 
+-	en75_icmp_phase_tx(skb, qid, index);
+ 	en75_wreg((u32)next_index, &q->qchain_regs->tx_cpui);
+ 
+ 	if (q->debug_tx_cnt) {
