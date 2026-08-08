@@ -95,7 +95,9 @@ define Device/tplink_archer-xr500v-v1
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
     kmod-usb3 kmod-usb-ledtrig-usbport kmod-usb-storage \
     block-mount kmod-fs-vfat \
-    kmod-mt7603 kmod-mt76x2 wpad-basic-mbedtls
+    kmod-mt7603 kmod-mt76x2 wpad-basic-mbedtls luci \
+    kmod-econet-pcm baresip baresip-mod-g711 baresip-mod-l16 \
+    baresip-mod-ctrl_tcp xr500v-voip
   IMAGES := sysupgrade.bin
   IMAGE/sysupgrade.bin := append-kernel | check-size 0x2ffe00 | \
     pad-to $$$$(KERNEL_SIZE) | append-rootfs | check-size 0x1300000 | \

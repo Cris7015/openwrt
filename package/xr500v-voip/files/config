@@ -1,0 +1,33 @@
+module_path		/usr/lib/baresip/modules
+
+# audio codecs (G.711 mu-law/A-law + 16-bit linear)
+module			g711.so
+module			l16.so
+
+# XR500v FXS audio driver: the Le9642 SLIC over /dev/xr500v-voice
+module			xr500v.so
+
+# core
+module			account.so
+module			contact.so
+module			menu.so
+
+audio_source		xr500v,/dev/xr500v-voice
+audio_player		xr500v,/dev/xr500v-voice
+ausrc_srate		8000
+auplay_srate		8000
+ausrc_channels		1
+auplay_channels		1
+
+sip_listen		0.0.0.0:5060
+
+# control interface the call-manager speaks (ring / answer / hang-up)
+module			ctrl_tcp.so
+ctrl_tcp_listen		127.0.0.1:4444
+
+# audio buffering widened from the 20-160 default to absorb the SLIC kfifo
+# burst drain (the PCM engine drains in bursts, not a steady trickle)
+audio_buffer			60-240
+audio_buffer_mode		adaptive
+audio_jitter_buffer_type	adaptive
+audio_jitter_buffer_delay	8-40

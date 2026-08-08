@@ -1,0 +1,65 @@
+#!/bin/sh /etc/rc.common
+# Turnkey FXS VoIP for the TP-Link Archer XR500v: bring up the Le9642 SLIC line,
+# baresip and the call-manager (SLIC hook <-> baresip ctrl_tcp: ring/answer/hangup).
+USE_PROCD=1
+START=99
+STOP=10
+
+CFGDIR=/etc/xr500v-voip
+SLIC_EC=2
+ZSI_GAP_US=1000
+
+prepare_slic() {
+	# debugfs carries the SLIC provisioning + hook nodes the call-manager polls
+	[ -d /sys/kernel/debug/econet-slic ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+	# The FXS channel + ZSI timing are load-time module params. The kmod
+	# autoloads with defaults, so (re)load econet-slic with the right params
+	# once. The guard skips the reload when it is already correct, so an
+	# init restart during a call does not tear the module down.
+	local cur
+	cur=$(cat /sys/module/econet_slic/parameters/slic_ec 2>/dev/null)
+	if [ "$cur" != "$SLIC_EC" ]; then
+		local kver
+		kver=$(uname -r)
+		rmmod econet_slic 2>/dev/null
+		insmod "/lib/modules/$kver/econet-slic.ko" \
+			slic_ec=$SLIC_EC zsi_gap_us=$ZSI_GAP_US 2>/dev/null
+		sleep 2
+	fi
+
+	# line-up + codec warm-up (idempotent)
+	if [ -e /dev/xr500v-voice ]; then
+		cat /sys/kernel/debug/econet-slic/slic_init   >/dev/null 2>&1
+		cat /sys/kernel/debug/econet-slic/audio_setup >/dev/null 2>&1
+	fi
+
+	# render the SIP identity with the device's own LAN IP (regint=0, no secret)
+	local ip
+	ip=$(uci -q get network.lan.ipaddr)
+	[ -n "$ip" ] || ip=127.0.0.1
+	# OpenWrt also accepts CIDR notation (for example 192.168.1.1/24) in
+	# network.lan.ipaddr.  A SIP URI needs the plain address, and the slash
+	# would also break the old sed expression which used it as a delimiter.
+	ip=${ip%%/*}
+	sed "s|@LANIP@|$ip|g" "$CFGDIR/accounts.template" > "$CFGDIR/accounts" 2>/dev/null
+	[ -f "$CFGDIR/contacts" ] || : > "$CFGDIR/contacts"
+}
+
+start_service() {
+	prepare_slic
+
+	procd_open_instance baresip
+	procd_set_param command /usr/bin/baresip -f "$CFGDIR"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance callmgr
+	procd_set_param command /usr/sbin/xr500v-callmgr
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}

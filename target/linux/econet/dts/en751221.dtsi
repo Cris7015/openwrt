@@ -94,6 +94,14 @@
 		#reset-cells = <1>;
 	};
 
+	pcm0: pcm@1fbd0000 {
+		compatible = "econet,en751221-pcm";
+		reg = <0x1fbd0000 0x1000>;
+		interrupt-parent = <&intc>;
+		interrupts = <11>;
+		status = "disabled";
+	};
+
 	ethernet: ethernet@1fb50000 {
 		compatible = "econet,en751221-eth";
 		reg = <0x1fb50000 0x10000>;

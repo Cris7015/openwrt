@@ -76,6 +76,20 @@
 			label = "green:internet";
 			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
 		};
+
+		/* The call manager drives these from the two Le9642 hook/call
+		 * states.  The case labels are inverted relative to the silicon:
+		 * phone1 is EC_2 and phone2 is EC_1.
+		 */
+		led-phone1 {
+			label = "green:phone1";
+			gpios = <&gpio0 25 GPIO_ACTIVE_LOW>;
+		};
+
+		led-phone2 {
+			label = "green:phone2";
+			gpios = <&gpio0 26 GPIO_ACTIVE_LOW>;
+		};
 	};
 
 	keys {
@@ -433,6 +447,10 @@
 };
 
 &pcie1 {
+	status = "okay";
+};
+
+&pcm0 {
 	status = "okay";
 };
 
