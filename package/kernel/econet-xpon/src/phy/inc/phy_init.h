@@ -10,6 +10,8 @@ int phy_unregister_cb_handler(PHY_CbType_t type) ;
 int xpon_phy_start(void) ;
 int pon_phy_init(void) ;
 void pon_phy_deinit(void) ;
+int xpon_phy_runtime_init(void);
+void xpon_phy_runtime_deinit(void);
 void phy_los_handler(void) ;
 void phy_ready_handler(void) ;
 
@@ -24,8 +26,7 @@ static inline int get_phy_mode(void)
 }
 
 extern struct workqueue_struct * i2c_access_queue;
+extern int tx_laser_off;
 #endif /* _PHY_INIT_H_ */
-
-
 
 

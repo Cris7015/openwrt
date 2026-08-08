@@ -2172,6 +2172,7 @@ struct ecnt_hook_ops xpondrv_hook_dispatch_ops = {
 /*****************************************************************************
 ******************************************************************************/
 static void xpon_qdma_seam_teardown(void);
+static bool xpon_phy_runtime_started;
 
 void xpondrv_cleanup(void)
 {
@@ -2196,6 +2197,11 @@ void xpondrv_cleanup(void)
 #ifdef TCSUPPORT_WAN_GPON
     gpon_deinit() ;
 #endif /* TCSUPPORT_WAN_GPON */
+
+	if (xpon_phy_runtime_started) {
+		xpon_phy_runtime_deinit();
+		xpon_phy_runtime_started = false;
+	}
 
 #ifdef TCSUPPORT_WAN_EPON
     eponExit(); 
@@ -2972,6 +2978,11 @@ int xpondrv_init(void)
 			pr_err("econet-xpon: refusing hardware bring-up without asserted physical TX_DISABLE\n");
 			goto ret;
 		}
+		if (xpon_phy_runtime_init() != 0) {
+			pr_err("econet-xpon: EN7570 runtime PHY initialization failed\n");
+			goto ret;
+		}
+		xpon_phy_runtime_started = true;
 		if(gpon_init() != 0) {
 			printk("GPON initialization failed\n") ;
 			goto ret ;

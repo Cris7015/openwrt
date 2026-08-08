@@ -782,8 +782,20 @@ void phy_tx_ctl(unchar val)
 {
 	int ret;
 
-	if (val == PHY_ENABLE)
-		ret = xpon_board_set_tx_disable(false);
+	if (val == PHY_ENABLE) {
+		/*
+		 * Keep the physical kill authoritative while RX-only mode is
+		 * requested.  Vendor initialization contains several indirect
+		 * PHY_ENABLE calls (notably phy_mode_config()) before its final
+		 * laser-hold check; none of them may release GPIO TX_DISABLE.
+		 */
+		if (tx_laser_off) {
+			ret = xpon_board_set_tx_disable(true);
+			pr_warn_ratelimited("econet-xpon: physical TX enable blocked by tx_laser_off=1\n");
+		} else {
+			ret = xpon_board_set_tx_disable(false);
+		}
+	}
 	else if (val == PHY_DISABLE)
 		ret = xpon_board_set_tx_disable(true);
 	else {
@@ -868,4 +880,3 @@ int phy_trans_power_switch(unchar trans_switch)
 
 #endif
 }
-

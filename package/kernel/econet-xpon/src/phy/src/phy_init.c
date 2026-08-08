@@ -1202,9 +1202,10 @@ int pon_phy_init(void)
 		gpio_BOSA_Tx_power_on();				// by YMC 20150731
 					
 		gpPhyPriv->LDDLA_task_wait = kthread_run(LDDLA_task_wait, NULL, "mt7570_task_wait");
-		/* ★ auto-lock keeper: runs the proven gpon_do_lock() sequence whenever the CDR isn't locked,
-		 * so the GPON RX locks automatically on real bring-up (no manual 'echo R' needed). */
-		gpon_keeper_task = kthread_run(gpon_lock_keeper, NULL, "gpon_lock_keeper");
+		/*
+		 * xpondrv's gpon_fastpoll owns CDR recovery in the integrated module.
+		 * Do not start the legacy second keeper against the same PHY/I2C state.
+		 */
 	}
 	else
 		printk("EN7570 not found!\n");
@@ -1344,13 +1345,13 @@ void pon_phy_reset_init(void)
 }
 #endif
 
-/* PORT: the optical PHY is built INTO econet-xpon.ko (not a separate module),
+/*
+ * PORT: the optical PHY is built INTO econet-xpon.ko (not a separate module),
  * so it must not provide its own init_module/cleanup_module/MODULE_LICENSE --
- * the single module entry point lives in xpondrv.c.  pon_phy_init() /
- * pon_phy_deinit() remain callable.
- * TODO (functional bring-up): call pon_phy_init()/pon_phy_deinit() from
- * xpondrv_init()/xpondrv_cleanup() once the ECNT hook dispatch (currently a
- * no-op stub) is replaced by direct PON_PHY calls. */
+ * the single module entry point lives in xpondrv.c.  The wrappers below join
+ * pon_phy_init()/pon_phy_deinit() to that lifecycle after the SIF clock and RX
+ * foundation have been established.
+ */
 /* module_init(pon_phy_init) */
 /* module_exit(pon_phy_deinit) */
 
@@ -1432,6 +1433,8 @@ static const struct proc_ops xpon_recon_ops = {
  * `echo 1 > /proc/econet_xpon_los` forces a fresh PHY RX bring-up. */
 static int xpon_phy_rx_up;
 static int xpon_sif_inited;
+static int xpon_phy_runtime_started;
+static int en7571_optical_up;
 static void xpon_phy_rx_bringup(void)
 {
 	if (!xpon_sif_inited) {
@@ -1466,6 +1469,53 @@ static void xpon_phy_rx_bringup(void)
 	phy_dev_init();				/* MT7520 path: GPIO-XPON + sigdet + RX cfg; laser OFF */
 	udelay(100);
 	xpon_phy_rx_up = 1;
+}
+
+int xpon_phy_runtime_init(void)
+{
+	int ret;
+
+	if (xpon_phy_runtime_started)
+		return 0;
+	if (!xpon_board_tx_disable_ready() ||
+	    xpon_board_set_tx_disable(true))
+		return -ENODEV;
+
+	/*
+	 * The vendor phy_dev_init() omitted the cold-boot SIF clock/controller
+	 * setup.  Establish that RX-only foundation before its full lifecycle.
+	 */
+	xpon_phy_rx_bringup();
+	if (!xpon_phy_rx_up)
+		return -ENOMEM;
+
+	ret = pon_phy_init();
+	if (ret) {
+		xpon_board_set_tx_disable(true);
+		return ret;
+	}
+	if (mt7570_select != 1) {
+		pr_err("econet-xpon: runtime PHY init refused: EN7570 was not detected\n");
+		pon_phy_deinit();
+		xpon_board_set_tx_disable(true);
+		return -ENODEV;
+	}
+
+	xpon_laser_hold_check("phy_runtime_init");
+	xpon_phy_runtime_started = 1;
+	pr_info("econet-xpon: EN7570 runtime PHY initialized from validated per-unit calibration\n");
+	return 0;
+}
+
+void xpon_phy_runtime_deinit(void)
+{
+	xpon_board_set_tx_disable(true);
+	if (xpon_phy_runtime_started) {
+		pon_phy_deinit();
+		xpon_phy_runtime_started = 0;
+	}
+	xpon_phy_rx_up = 0;
+	en7571_optical_up = 0;
 }
 
 /* Read a 16-bit big-endian SFF-8472 DDM value from the optical transceiver
@@ -1615,8 +1665,6 @@ static u32 en7571_PWRADC_offset;
 
 /* set once en7571_optical_bringup() has powered the front-end + biased the APD;
  * cleared by en7571_apd_off() so the next optical read re-brings-up. */
-static int en7571_optical_up;
-
 /* en7571_PWRADC_calibration (phy.ko @0x316b0): sample the PWRADC dark offset with the
  * mux to internal ref (0x3B bit4) + channel enabled, 20ms settle, store 16-bit offset. */
 static void en7571_PWRADC_calibration(void)
@@ -1816,6 +1864,9 @@ static void en7571_front_end_init(void)
  * fiber-in -> LOS 0, fiber-out -> LOS 1 (30/30 each). No per-unit cal needed. */
 void en7571_optical_bringup(void)
 {
+	/* EN7570 has already run its own calibrated APD/LOS/front-end sequence. */
+	if (mt7570_select == 1)
+		return;
 	if (en7571_optical_up)
 		return;
 	/* Ensure the SIF/optical-RX functional clock (0xbfa2015c bit21|bit0) + SIF I2C
