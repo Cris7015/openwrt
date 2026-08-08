@@ -18,6 +18,7 @@
 #include "phy_api.h"		/* TODO port: mt7570_safe_circuit_reset() decl */
 #include "phy_debug.h"
 #include "phy_tx.h"
+#include "../../inc/common/xpon_board.h"
 #include "phy_init.h"
 
 extern PHY_GlbPriv_T *gpPhyPriv;
@@ -779,12 +780,20 @@ int phy_tx_fec_manual(unchar tx_fec_en)
 
 void phy_tx_ctl(unchar val)
 {
-	if(PHY_ENABLE == val) /* enable tx power should turn off tx disable */
-		ledTurnOff(LED_PHY_TX_POWER_DISABLE);
-	else if (PHY_DISABLE == val) /* disbale tx power should turn on tx disable */
-		ledTurnOn(LED_PHY_TX_POWER_DISABLE);
-	else
+	int ret;
+
+	if (val == PHY_ENABLE)
+		ret = xpon_board_set_tx_disable(false);
+	else if (val == PHY_DISABLE)
+		ret = xpon_board_set_tx_disable(true);
+	else {
 		PON_PHY_MSG(PHY_MSG_ERR, "PHY Tx ctl type error. \n");
+		return;
+	}
+
+	if (ret)
+		PON_PHY_MSG(PHY_MSG_ERR,
+			    "physical TX_DISABLE control unavailable (%d).\n", ret);
 }
 
 
@@ -859,6 +868,4 @@ int phy_trans_power_switch(unchar trans_switch)
 
 #endif
 }
-
-
 

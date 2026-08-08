@@ -131,7 +131,10 @@ start() {
 		return 1
 	}
 
-	set -- econet-xpon "gpon_sn=$sn" tx_laser_off=1
+	# xpon_hw defaults to zero in the module.  An enabled, fully validated lab
+	# configuration opts into RX/MAC/PHY initialization explicitly while both
+	# the physical GPIO and digital TX holds are retained.
+	set -- econet-xpon "gpon_sn=$sn" xpon_hw=1 tx_laser_off=1
 	[ -n "$pw" ] && set -- "$@" "gpon_pw=$pw"
 	[ -n "$mac" ] && set -- "$@" "wan_mac=$mac"
 

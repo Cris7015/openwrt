@@ -106,6 +106,17 @@
 		};
 	};
 
+	xpon-board {
+		compatible = "tplink,archer-xr500v-v1-xpon";
+		pinctrl-names = "default";
+		pinctrl-0 = <&xpon_pins>;
+
+		/* GPIO16 is the active-high physical TX_DISABLE measured by the
+		 * guarded RX-only lab.  Claim it asserted before any PHY work.
+		 */
+		tx-disable-gpios = <&gpio0 16 GPIO_ACTIVE_HIGH>;
+	};
+
 	/*
 	 * The EN751221 contains an on-die MT7530-class switch.  Its port 5
 	 * cascades into the MCM switch, whose ports 1 through 4 are the four
@@ -369,6 +380,11 @@
 	wps_key_pins: wps-key-pins {
 		groups = "gpio9";
 		function = "gpio";
+	};
+
+	xpon_pins: xpon-pins {
+		groups = "xpon";
+		function = "xpon";
 	};
 };
 

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=econet-xpon
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=AK Sharma <maskachoska@yahoo.com>
 PKG_LICENSE:=GPL-2.0-only
@@ -13,7 +13,7 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/econet-xpon
   SUBMENU:=Network Devices
   TITLE:=EcoNet EN75xx xPON (GPON) driver
-  DEPENDS:=@TARGET_econet +kmod-econet-eth
+  DEPENDS:=@TARGET_econet +kmod-econet-eth +kmod-pinctrl-en751221
   FILES:=$(PKG_BUILD_DIR)/econet-xpon.ko
   # No AutoLoad: the driver must not be loaded without an ONU identity. A bare
   # kmodloader autoload comes up with the MediaTek default serial

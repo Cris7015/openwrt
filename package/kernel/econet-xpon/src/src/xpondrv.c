@@ -32,6 +32,7 @@
 #endif
 #include "../inc/common/xpon_daemon.h"
 #include "../inc/common/xpon_led.h"
+#include "../inc/common/xpon_board.h"
 
 #include <ecnt_hook/ecnt_hook_qdma_7510_20.h>
 
@@ -2174,6 +2175,9 @@ static void xpon_qdma_seam_teardown(void);
 
 void xpondrv_cleanup(void)
 {
+	/* Assert the physical kill before any timer, PHY or MAC teardown. */
+	xpon_board_set_tx_disable(true);
+
     /* Stop econet-eth from dispatching PON IRQ/RX into us before we unload. */
     xpon_qdma_seam_teardown();
 
@@ -2249,6 +2253,9 @@ void xpondrv_cleanup(void)
         xpon_proc_tc3162 = NULL;
     }
 
+	/* The board remove callback reasserts the physical TX kill. */
+	xpon_board_unregister();
+
 }
 
 /*****************************************************************************
@@ -2268,8 +2275,7 @@ int xpon_check_emergence_state(void)
 /* When 0 (default) the module loads WITHOUT touching GPON MAC/PHY hardware
  * (safe; the EN7528 register bring-up needs recon-probe data + a lab OLT).
  * Set xpon_hw=1 only on a bench with an OLT. */
-static int xpon_hw = 1;   /* default 1: a deployed ONT does the GPON MAC/PHY bring-up on load
-			   * (auto-lock via xpon_los_poll_fn). Pass xpon_hw=0 for a safe bench load. */
+static int xpon_hw;       /* fail closed: explicit xpon_hw=1 is required for hardware bring-up */
 module_param(xpon_hw, int, 0444);
 MODULE_PARM_DESC(xpon_hw, "1=bring up GPON MAC/PHY hardware (needs OLT); 0=safe load (default)");
 
@@ -2902,13 +2908,19 @@ static void xpon_qdma_seam_teardown(void)
 
 int xpondrv_init(void)
 {
+	int ret_board;
+
 	printk("xPON driver initialization\n") ;
+	ret_board = xpon_board_register();
+	if (ret_board)
+		return ret_board;
 
 	/* initial the global data memory */
 	gpPonSysData = (PON_SysData_T *)kmalloc(sizeof(PON_SysData_T), GFP_KERNEL) ;
 	if(gpPonSysData == NULL) {
 		printk("Alloc data struct memory failed\n") ;
-		goto ret ;
+		xpon_board_unregister();
+		return -ENOMEM;
 	} else {
 		memset(gpPonSysData, 0, sizeof(PON_SysData_T));
 		printk("Alloc data struct memory successful, %d\n", sizeof(PON_SysData_T)) ;
@@ -2948,6 +2960,11 @@ int xpondrv_init(void)
 	 * recon-probe register data, no OLT) can hang the bus. Keep the module
 	 * loadable without touching PON hardware. ---- */
 	if (xpon_hw) {
+		if (!xpon_board_tx_disable_ready() ||
+		    xpon_board_set_tx_disable(true)) {
+			pr_err("econet-xpon: refusing hardware bring-up without asserted physical TX_DISABLE\n");
+			goto ret;
+		}
 		if(gpon_init() != 0) {
 			printk("GPON initialization failed\n") ;
 			goto ret ;
@@ -3060,5 +3077,5 @@ void xpon_disable_cpu_protection(void)
 
 module_init(xpondrv_init)
 module_exit(xpondrv_cleanup)
+MODULE_DESCRIPTION("EcoNet EN75xx xPON MAC and optical PHY driver");
 MODULE_LICENSE("GPL");
-

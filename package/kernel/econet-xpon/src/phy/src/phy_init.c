@@ -30,6 +30,7 @@
 #include "phy_debug.h"
 #include "phy_init.h"
 #include "phy_tx.h"
+#include "../../inc/common/xpon_board.h"
 
 
 extern atomic_t eponMacRestart_flag;
@@ -106,6 +107,10 @@ void xpon_laser_hold_check(const char *who)
 	uint v;
 	if (!tx_laser_off)
 		return;
+	/* GPIO16 is the primary physical kill.  The XPON_SETTING bit below is a
+	 * second, digital hold; neither substitutes for the other.
+	 */
+	xpon_board_set_tx_disable(true);
 	v = IO_GREG(0xbfaf0138u);
 	if (!(v & 0x80u)) {
 		IO_SREG(0xbfaf0138u, v | 0x80u);
@@ -266,10 +271,8 @@ void phy_tx_ctl(unchar val);
 //		N/A
 ******************************************************************************/
 void gpio_tx_dis_reset(void){
-#ifdef CONFIG_USE_MT7520_ASIC
     phy_tx_ctl(PHY_DISABLE);
 	phy_tx_fault_reset();
-#endif
 }
 
 
@@ -1978,12 +1981,14 @@ int en7571_tx_ramp_bias(void)
 static void en7571_gpon_burst_timing(void)
 {
 	u8 b[4];
-	/* FIX 2026-07-04 (stock RE): stock en7571_TGEN derives the burst-envelope timers
-	 * from flash slot 0x0c ([7:0]=delay [23:16]=T0C-on [31:24]=T1C-off), NOT fixed 0x7F.
-	 * H660 slot 0x0c = 0x444800AA -> delay 0xAA, T0C 0x48, T1C 0x44. The 0x7F/0x7F guesses
-	 * mistimed the laser on/off envelope vs the grant window -> OLT burst-CDR couldn't lock
-	 * our SN burst -> no Assign_ONU_ID -> O3 stall. Use the cal value to match stock. */
-	u32 tg = 0x444800AAu;                   /* h660_flash_cal slot 0x0c (defined below) */
+	/* EN7571 schema 0x07050701 stores its burst-envelope word at 0x0c.
+	 * Never substitute another unit's value: missing data leaves TX disabled.
+	 */
+	u32 tg = get_flash_register(0x0c);
+
+	if (get_flash_register(flash_magic_number) != 0x07050701u ||
+	    tg == 0xffffffffu)
+		return;
 	if (e7_rd(0x08, b, 4)) return;
 	b[0] = (u8)(tg & 0xff);                 /* 0xAA  T0/T1 delay   */
 	b[1] = (u8)((tg >> 24) & 0xff);         /* 0x44  T1C turn-off  */
@@ -1995,26 +2000,6 @@ static void en7571_gpon_burst_timing(void)
 	if (!e7_rd(0x08, b, 4)) { b[3] = (u8)((b[3] & 0xF7) | 0x08); e7_wr(0x08, b, 4); } /* ERC_enable */
 }
 
-/* ★★ FACTORY OPTICAL CAL for the DASAN H660GM-A (device 24), extracted from its NAND
- * (the 400B /tmp/7570_bob.conf blob @0xde10600, GPON magic 0x07050701 @slot 0x94). flash_matrix
- * = 100 LE u32; h660_get_flash_reg(byte_off) = matrix[off>>2]. Per-unit crux: slot 0x00/0x04 =
- * the DCL MPD power targets the HW servo regulates the laser to; slot 0x0c = burst timing. This
- * is PER-UNIT (this specific H660GM-A) — a real port would read /tmp/7570_bob.conf at runtime. */
-static const u32 h660_flash_cal[100] = {
-	0x054407ce,0x05230157,0xffffffff,0x444800aa,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0x00260019,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0x00ae5226,0xffffffff,0xffffffff,0xffffffff,0x27100d00,0x03e80148,0x00640020,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0x07050701,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,
-	0xffffffff,0xffffffff,0xffffffff,0xffffffff };
-static u32 h660_get_flash_reg(u32 off) { return (off < 400) ? h660_flash_cal[off >> 2] : 0xffffffffu; }
 static void pack12(u8 *b, u32 hi, u32 lo){ b[0]=hi&0xff; b[1]=(hi>>8)&0xff; b[2]=lo&0xff; b[3]=(lo>>8)&0xff; }
 
 /* en7571_load_Tx_cal_data @0x2f8ac: load the per-unit DCL MPD power targets from flash 0/4 into
@@ -2023,12 +2008,13 @@ static void pack12(u8 *b, u32 hi, u32 lo){ b[0]=hi&0xff; b[1]=(hi>>8)&0xff; b[2]
 static void en7571_load_tx_cal_data(void)
 {
 	u32 v; u8 b[4], t0, t1;
-	if (h660_get_flash_reg(0) != 0xffffffffu) {
-		v = h660_get_flash_reg(0);
+	if (get_flash_register(0) != 0xffffffffu) {
+		v = get_flash_register(0);
 		pack12(b, (v >> 16) & 0xfff, v & 0xfff); e7_wr(0x24C, b, 4); e7_wr(0x27C, b, 4);
 	}
-	if (h660_get_flash_reg(4) == 0xffffffffu) return;
-	v = h660_get_flash_reg(4);
+	if (get_flash_register(4) == 0xffffffffu)
+		return;
+	v = get_flash_register(4);
 	pack12(b, (v >> 16) & 0xfff, v & 0x3ff); e7_wr(0x25C, b, 4);
 	t0 = b[0]; t1 = b[1]; b[0] = b[2]; b[1] = b[3]; b[2] = t0; b[3] = t1; e7_wr(0x280, b, 4);
 }
@@ -2075,7 +2061,7 @@ static void en7571_T1delay_setting(int mode)
 	u8 b[4];
 	if (e7_rd(0x08, b, 4)) return;
 	if (mode == 1) {
-		u32 t = h660_get_flash_reg(0x94);
+		u32 t = get_flash_register(0x94);
 		if      (t == 0x07050701u) b[0] = 0xAA;
 		else if (t == 0xE7050701u || t == 0xA7050701u) b[0] = 0x77;
 	} else {
@@ -2112,9 +2098,9 @@ static void en7571_txsd_level_set(void)
 static void en7571_tx_apc_bringup(void)
 {
 	u8 b[4]; u32 tv;
-	if (h660_get_flash_reg(148) != 0x07050701u) {
+	if (get_flash_register(148) != 0x07050701u) {
 		printk(KERN_DEBUG "en7571_apc: no GPON cal (slot148=0x%x) -> open-loop fixed timing\n",
-			h660_get_flash_reg(148));
+			get_flash_register(148));
 		en7571_gpon_burst_timing();
 		return;
 	}
@@ -2124,9 +2110,13 @@ static void en7571_tx_apc_bringup(void)
 	 * frozen. The port ran it unconditionally (gated on the wrong slot 0x94) -> froze the servo +
 	 * hw_reset -> DAC collapse. Match stock: run only if flash[0x90]==1. DCL_start for RX still
 	 * comes from en7571_reg_init_full (dcl_mode), so skipping this does NOT break O2->O3. */
-	{ extern int run_scl;
-	  int do_scl = (run_scl < 0) ? (h660_get_flash_reg(0x90) == 1u) : (run_scl != 0);
-	  if (do_scl) en7571_single_closed_loop_mode(); }
+	{
+		int do_scl = (run_scl < 0) ?
+			(get_flash_register(0x90) == 1u) : (run_scl != 0);
+
+		if (do_scl)
+			en7571_single_closed_loop_mode();
+	}
 	/* ★★ FIX A/γ (2026-07-04): write the CALIBRATED Ibias/Imod DACs from the flash cal. The port was
 	 * seeding the RAW generic LUT (Ibias 0x1FB / Imod 0x44D) — Imod 0x44D(1101) is ~3.2x this unit's
 	 * calibrated 0x157(343) -> gross OVER-MODULATION -> asymmetric/rail-clipped eye -> the OLT's burst
@@ -2137,10 +2127,10 @@ static void en7571_tx_apc_bringup(void)
 	 * ERC counter phase reference seats against a lit laser -> a few-ns edge offset -> marginal ranging.
 	 * tgen_dark=1 -> hold Ibias=0 (dark) across the TGEN latch (PRBS23 still drives the serializer per FIX 3),
 	 * restore the calibrated bias AFTER the latch = stock order. tgen_dark=0 = old behavior. */
-	{ extern int tgen_dark; u16 _im = (u16)(h660_get_flash_reg(4) & 0xfff);   /* Imod 0x157 */
+	{ extern int tgen_dark; u16 _im = (u16)(get_flash_register(4) & 0xfff);
 	  en7571_set_imod(_im);
-	  en7571_set_ibias(tgen_dark ? 0 : (u16)(h660_get_flash_reg(0) & 0xfff)); }   /* Ibias 0x7CE, or 0=dark for H3 */
-	tv = h660_get_flash_reg(12);             /* slot 0x0c burst timing: [15:0]delay [23:16]T0C [31:24]T1C = 0x444800AA */
+	  en7571_set_ibias(tgen_dark ? 0 : (u16)(get_flash_register(0) & 0xfff)); }
+	tv = get_flash_register(12);             /* EN7571 schema: calibrated burst timing */
 	/* ★ FIX 3 (2026-07-05, stock en7571_TGEN RE): stock LATCHES the burst envelope (TGEN_reset pulse)
 	 * WHILE PRBS23 drives the TX serializer and the CDR is forced to REF clock (PHYSET1 bit24=1). The
 	 * port latched it with the serializer IDLE -> TGEN_reset counters init against no signal -> laser
@@ -2163,7 +2153,10 @@ static void en7571_tx_apc_bringup(void)
 		e7_rd(0x08, b, 4); b[3] &= 0xDF;    e7_wr(0x08, b, 4); mdelay(10);   /* TGEN_reset lo */
 		e7_rd(0x08, b, 4); b[3] |= 0x08;    e7_wr(0x08, b, 4);               /* ERC_enable */
 	}
-	{ extern int tgen_dark; if (tgen_dark) en7571_set_ibias((u16)(h660_get_flash_reg(0) & 0xfff)); }  /* ★ H3: apply laser DC bias 0x7CE AFTER the dark TGEN latch (stock order) */
+	{
+		if (tgen_dark)
+			en7571_set_ibias((u16)(get_flash_register(0) & 0xfff));
+	}
 	en7571_T1delay_setting(0);                  /* ★ FIX 4: laser T1 delay byte0 0xAA->0xA0 (stock link_reg(1)->T1delay_setting(0), AFTER timers latch) */
 	{ extern void phy_tx_test_pattern(uint);
 	  uint _p = IO_GREG(0xbfaf0100u); IO_SREG(0xbfaf0100u, _p & ~(1u << 24));  /* en7571_CDR(1): back to recovered-data clk */
@@ -2254,7 +2247,7 @@ done:
 	phy_tx_test_pattern(PHY_BIST_IDLE);
 }
 
-void en7571_tx_laser_bringup(void)
+static void en7571_tx_laser_bringup(void)
 {
 	u8 ib[4] = {0}, im[4] = {0};
 	en7571_set_ibias((u16)(tx_ibias & 0xFFF));     /* seed the DACs (servo start point) */
@@ -2275,6 +2268,52 @@ void en7571_tx_laser_bringup(void)
 		((ib[1] & 0x0F) << 8) | ib[0], ((im[1] & 0x0F) << 8) | im[0], IO_GREG(0xbfaf0138u), IO_GREG(0xbfaf01a0u));
 }
 
+/* External EN7570 (schema 0x07050700) TX arm.  Its 0x00/0x04/0x08/0x0c
+ * words are Ibias, Imod, P0 and P1 -- not the packed EN7571/H660 fields.
+ * Re-run the vendor EN7570 timing/current/MPD sequence while the physical
+ * GPIO kill is asserted, then release GPIO16 only as the final operation.
+ */
+static int en7570_tx_laser_bringup(void)
+{
+	if (!xpon_board_tx_disable_ready())
+		return -ENODEV;
+	if (!mt7570_calibration_valid()) {
+		pr_err("econet-xpon: EN7570 TX refused: calibration schema 0x07050700 is missing or incomplete\n");
+		return -EINVAL;
+	}
+
+	phy_tx_ctl(PHY_DISABLE);
+	mt7570_TGEN(PHY_GPON_CONFIG);
+	mt7570_load_init_current();
+	mt7570_load_MPDL_MPDH();
+	mt7570_TxSD_level_set();
+
+	/* Digital burst configuration first; physical TX_DISABLE is released last. */
+	IO_SREG(0xbfaf0138u, (uint)tx_xpon);
+	phy_tx_ctl(PHY_ENABLE);
+	pr_info("econet-xpon: EN7570 calibrated TX path armed\n");
+	return 0;
+}
+
+static int xpon_tx_laser_bringup(void)
+{
+	if (!xpon_board_tx_disable_ready())
+		return -ENODEV;
+	phy_tx_ctl(PHY_DISABLE);
+
+	if (mt7570_select == 1)
+		return en7570_tx_laser_bringup();
+
+	/* No per-unit EN7571 calibration is embedded in the module. */
+	if (get_flash_register(flash_magic_number) != 0x07050701u) {
+		pr_err("econet-xpon: EN7571 TX refused: validated schema 0x07050701 calibration is unavailable\n");
+		return -EINVAL;
+	}
+	en7571_tx_laser_bringup();
+	phy_tx_ctl(PHY_ENABLE);
+	return 0;
+}
+
 int gpon_do_lock(int quiet)
 {
 	extern int phy_mode_config(Xpon_Phy_Mode_t, int);
@@ -2289,8 +2328,13 @@ int gpon_do_lock(int quiet)
 	IO_SREG(0xbfaf0138u, 0x0000010Fu | (tx_laser_off ? 0x80u : 0u)); /* XPON_SETTING (clear RX_SD_INV) */
 	phy_fw_ready(PHY_ENABLE);
 	xpon_phy_start();
-	en7571_optical_bringup();
-	en7571_reg_init_full();
+	/* The external EN7570 was initialized from its own 0x07050700 matrix by
+	 * mt7570_init().  EN7571 register programming uses a different schema.
+	 */
+	if (mt7570_select != 1) {
+		en7571_optical_bringup();
+		en7571_reg_init_full();
+	}
 	/* NCPO seed + arm (stock phy_los_handler preamble + GPON arm) */
 	IO_SREG(0xbfaf05f4u, IO_GREG(0xbfaf05f8u));                     /* clear XPON int */
 	phy_bit_delay(0);
@@ -2321,18 +2365,31 @@ int gpon_do_lock(int quiet)
 	 * bring-up above cleared it via 0x10F), so it sticks across the poll's re-lock attempts. */
 	if (tx_laser_off) {
 		p = IO_GREG(0xbfaf0138u); IO_SREG(0xbfaf0138u, p | 0x80u);   /* laser held OFF (bit7=1) */
+		phy_tx_ctl(PHY_DISABLE);
 	} else {
 		uint atx;
-		en7571_tx_laser_bringup();   /* ★ bias the laser open-loop + un-hold (bit7=0) so O3 SN TX emits */
+		int txret = xpon_tx_laser_bringup();
+
+		if (txret) {
+			p = IO_GREG(0xbfaf0138u);
+			IO_SREG(0xbfaf0138u, p | 0x80u);
+			phy_tx_ctl(PHY_DISABLE);
+			pr_err("econet-xpon: optical TX bring-up failed (%d); holds retained\n",
+			       txret);
+			goto tx_done;
+		}
 		/* ★★★ ROOT-CAUSE FIX (2026-07-04, v2): set SerDes TX drive swing ANATXREG1[19:16]=0x9 via MMIO.
 		 * v1 used phy_tx_amp_setting()/IO_SPHYREG which routes the WRITE through phy_I2C_write_translet
 		 * -> SIF I2C dev 0x70 (optical transceiver), NOT MMIO 0xbfaf01a0 where the read lives -> the
 		 * amp never actually changed (proven: readback stayed 0x00900006 after every write). Write MMIO
 		 * directly here, on the O1->O5 path, AFTER the CDR relock's phy reset. Without swing the laser
 		 * emits CW DC (no data eye) so the OLT decodes nothing. DZS drives level 9. */
-		atx = IO_GREG(0xbfaf01a0u);
-		IO_SREG(0xbfaf01a0u, (atx & 0xfff0ffffu) | 0x00090000u);
+		if (mt7570_select != 1) {
+			atx = IO_GREG(0xbfaf01a0u);
+			IO_SREG(0xbfaf01a0u, (atx & 0xfff0ffffu) | 0x00090000u);
+		}
 	}
+tx_done:
 	ps = IO_GREG(0xbfaf0130u);
 	if (!quiet)
 		printk(KERN_DEBUG "gpon_do_lock: PHYSTA1=%08x rdy=%u RXSTAT=%08x\n",
@@ -2814,16 +2871,19 @@ static ssize_t xpon_los_write(struct file *f, const char __user *b, size_t l, lo
 		printk(KERN_DEBUG "o: regdump ready %d bytes -> cat /proc/econet_xpon_regdump\n", p);  /* ONE line only */
 		return l;
 	}
-	if (c == 'l') {			/* ★ manual TX laser bring-up: seed DACs + apc_bringup (calibrated 0x7ce/0x157
-					 * + burst timing) + FORCE/KT (if tx_force/tx_kt) + DCL close (if tx_closeloop).
+	if (c == 'l') {			/* Manual schema-selected TX laser bring-up with per-unit
+					 * calibration and burst timing.
 					 * The automatic path (gpon_do_lock finalize) doesn't run it once already CDR-locked. */
-		extern void en7571_tx_laser_bringup(void);
+		int ret;
 		if (tx_laser_off) {   /* refuse: this biases the DIODE. Clear tx_laser_off first, deliberately. */
 			printk(KERN_WARNING "l: REFUSED - tx_laser_off=1 (laser held). echo 0 > /sys/module/econet_xpon/parameters/tx_laser_off first if you REALLY mean to emit.\n");
 			return l;
 		}
-		printk(KERN_DEBUG "l: manual en7571_tx_laser_bringup()\n");
-		en7571_tx_laser_bringup();
+		pr_debug("l: manual schema-selected TX laser bring-up\n");
+		ret = xpon_tx_laser_bringup();
+		if (ret)
+			pr_warn("l: TX bring-up failed (%d); physical and digital holds retained\n",
+				ret);
 		return l;
 	}
 	if (c == 'u') {			/* READ-ONLY en7571 TX-loop state dump (force/KT experiment). Modifies nothing. */
@@ -3886,4 +3946,3 @@ void xpon_phy_recon_cleanup(void)
 	remove_proc_entry("econet_xpon_optical", NULL);
 	remove_proc_entry("econet_xpon_ddmi", NULL);
 }
-

@@ -230,6 +230,7 @@ int get_flash_matrix(void)
 	//file open
 	struct file 			*srcf = NULL;
 	char *src = NULL;
+	ssize_t count;
 	/* TODO port 2.6.36->6.18: get_fs()/set_fs(KERNEL_DS) removed; use kernel_read() */
 
 	// by Iron Zhang 20151216
@@ -247,13 +248,19 @@ int get_flash_matrix(void)
 			}
 			else
 			{
-				kernel_read(srcf, flash_matrix, sizeof(flash_matrix), &srcf->f_pos);
+				count = kernel_read(srcf, flash_matrix,
+						    sizeof(flash_matrix), &srcf->f_pos);
 				filp_close(srcf,NULL);
+				if (count != sizeof(flash_matrix)) {
+					pr_err("EN7570 calibration has invalid size\n");
+					goto error;
+				}
 			}
 		}
 		return 0;
 
 error:
+		set_flash_register_default();
 		return -1;
 
 }
@@ -288,9 +295,19 @@ void set_flash_register(uint reg, uint offset)
 void set_flash_register_default(void)
 {
 	int index = 0;
-	for(index = 0; index < 40; index++)
-			flash_matrix[index] = 0xffffffff;
 
+	for (index = 0; index < ARRAY_SIZE(flash_matrix); index++)
+		flash_matrix[index] = 0xffffffff;
+
+}
+
+int mt7570_calibration_valid(void)
+{
+	return get_flash_register(flash_magic_number) == 0x07050700 &&
+	       get_flash_register(flash_Ibias_init) != 0xffffffff &&
+	       get_flash_register(flash_Imod_init) != 0xffffffff &&
+	       get_flash_register(flash_P0_target) != 0xffffffff &&
+	       get_flash_register(flash_P1_target) != 0xffffffff;
 }
 /*****************************************************************************
 //Function :

@@ -102,6 +102,7 @@ void set_flash_register(uint reg, uint offset);
 void set_flash_register_default(void);
 int get_flash_matrix(void);
 int get_flash_register(int address_offset);
+int mt7570_calibration_valid(void);
 int mt7570_information_output(uint select);
 int mt7570_ADC_temperature_get(void);	// by HC 20150527
 int mt7570_ADC_voltage_get(void);			// by HC 20150527
@@ -155,4 +156,3 @@ void mt7570_OpenLoopControl(void);										// by HC 20160410
 void mt7570_LOS_init(void);												// by HC 20160427
 
 #endif /* _PHY_API_H_ */
-

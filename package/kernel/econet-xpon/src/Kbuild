@@ -8,6 +8,7 @@ econet-xpon-objs := \
 	compat/sdk_stubs.o \
 	compat/sif_port.o \
 	compat/epon_stubs.o \
+	src/xpon_board.o \
 	src/xpondrv.o \
 	src/phy_if_wrapper.o \
 	src/xpon_daemon.o \

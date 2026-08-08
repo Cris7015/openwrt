@@ -53,6 +53,7 @@ static const unsigned int grp_gpio8[]  = { 8 };
 static const unsigned int grp_gpio9[]  = { 9 };
 static const unsigned int grp_gpio10[] = { 10 };
 static const unsigned int grp_gpio31[] = { 31 };
+static const unsigned int grp_xpon[] = { 16 };
 static const unsigned int grp_pcm_reset[] = { 2 };
 static const unsigned int grp_zsi2[] = { 4, 5, 6, 7 };
 
@@ -96,6 +97,15 @@ static const struct en751221_mux muxes_gpio31[] = {
 	{ "led",  BIT(21), 0 },
 };
 
+/* The EN7512 xPON PHY setup calls bit 15 RG_GPIO_PON_MODE.  On the XR500v
+ * this routes the PON-side pad cluster containing GPIO16/TX_DISABLE.  Keep it
+ * separate from RG_PON_I2C_MODE (bit 0), which the PHY owns while talking to
+ * the external EN7570.
+ */
+static const struct en751221_mux muxes_xpon[] = {
+	{ "xpon", BIT(15), BIT(15) },
+};
+
 /* Voice cluster. GPIO_PCM_RESET puts GPIO2 in PCM-reset mode, and
  * GPIO_ZSI_ISI_2nd claims GPIO4..7 for the second SLIC's ZSI/ISI transport.
  */
@@ -120,6 +130,7 @@ static const struct en751221_group en751221_groups[] = {
 	GROUP("gpio9",     grp_gpio9,     muxes_pad4),
 	GROUP("gpio10",    grp_gpio10,    muxes_pad3),
 	GROUP("gpio31",    grp_gpio31,    muxes_gpio31),
+	GROUP("xpon",      grp_xpon,      muxes_xpon),
 	GROUP("pcm_reset", grp_pcm_reset, muxes_pcm_reset),
 	GROUP("zsi2",      grp_zsi2,      muxes_zsi2),
 };
@@ -134,6 +145,7 @@ static const char * const fn_led_groups[] = {
 };
 static const char * const fn_pcm_groups[] = { "pcm_reset" };
 static const char * const fn_zsi_groups[] = { "zsi2" };
+static const char * const fn_xpon_groups[] = { "xpon" };
 
 struct en751221_function {
 	const char *name;
@@ -149,6 +161,7 @@ static const struct en751221_function en751221_functions[] = {
 	FUNCTION("led",  fn_led_groups),
 	FUNCTION("pcm",  fn_pcm_groups),
 	FUNCTION("zsi",  fn_zsi_groups),
+	FUNCTION("xpon", fn_xpon_groups),
 };
 #undef FUNCTION
 
