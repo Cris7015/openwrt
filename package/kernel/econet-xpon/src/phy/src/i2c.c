@@ -30,16 +30,26 @@ static ssize_t i2c_proc_compat_read(struct file *f, char __user *ubuf,
 				    size_t cnt, loff_t *pos)
 {
 	struct i2c_proc_compat *pc = pde_data(file_inode(f));
-	char *page; int eof = 0, len; ssize_t ret;
+	char *page, *start; int eof = 0, len; ssize_t ret;
 	if (!pc || !pc->rp || *pos > 0)
 		return 0;
 	page = (char *)__get_free_page(GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
-	len = pc->rp(page, NULL, 0, PAGE_SIZE - 1, &eof, pc->data);
+	start = page;
+	len = pc->rp(page, &start, 0, PAGE_SIZE - 1, &eof, pc->data);
 	if (len < 0) { ret = len; goto out; }
+	if (!start || start < page || start > page + PAGE_SIZE) {
+		ret = -EIO;
+		goto out;
+	}
+	if (len > page + PAGE_SIZE - start)
+		len = page + PAGE_SIZE - start;
 	if ((size_t)len > cnt) len = cnt;
-	if (copy_to_user(ubuf, page, len)) { ret = -EFAULT; goto out; }
+	if (copy_to_user(ubuf, start, len)) {
+		ret = -EFAULT;
+		goto out;
+	}
 	*pos += len; ret = len;
 out:
 	free_page((unsigned long)page);
@@ -293,4 +303,3 @@ void i2c_exit(void)
 	remove_proc_entry("i2c", NULL) ;
 	iounmap((uint *)i2cMasterBaseAddr) ;
 }
-
