@@ -2604,9 +2604,16 @@ static void xpon_wan_netdev_create(void)
 	netif_carrier_off(xpon_wan_dev);
 	INIT_WORK(&gpon_isr_work, gpon_isr_work_fn);
 	INIT_DELAYED_WORK(&xpon_los_poll_work, xpon_los_poll_fn);
-	xpon_los_poll_active = 1;
-	schedule_delayed_work(&xpon_los_poll_work, msecs_to_jiffies(1500));
-	gpon_fastpoll_task = kthread_run(gpon_fastpoll_fn, NULL, "gpon_fastpoll");  /* ★ ms-scale PLOAM drain */
+	xpon_los_poll_active = 0;
+	if (xpon_hw) {
+		xpon_los_poll_active = 1;
+		schedule_delayed_work(&xpon_los_poll_work,
+				      msecs_to_jiffies(1500));
+		gpon_fastpoll_task = kthread_run(gpon_fastpoll_fn, NULL,
+						 "gpon_fastpoll");
+	} else {
+		pr_info("econet-xpon: optical LOS and PLOAM workers disabled (xpon_hw=0)\n");
+	}
 }
 
 /* `echo <gem> > /proc/econet_xpon_wantx` sends a dummy frame THROUGH ponwan0

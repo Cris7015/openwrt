@@ -3944,5 +3944,6 @@ void xpon_phy_recon_cleanup(void)
 	remove_proc_entry("econet_xpon_phy_recon", NULL);
 	remove_proc_entry("econet_xpon_los", NULL);
 	remove_proc_entry("econet_xpon_optical", NULL);
+	remove_proc_entry("econet_xpon_regdump", NULL);
 	remove_proc_entry("econet_xpon_ddmi", NULL);
 }
