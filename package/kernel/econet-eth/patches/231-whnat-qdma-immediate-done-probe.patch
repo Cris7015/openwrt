@@ -1,0 +1,828 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: normalize WHNAT immediate-done and lab seams
+
+Carry the exact hardware-tested build_dir state into a cleanly reproducible
+package patch, including the BQL-safe devless injectors and the PON seam that
+had previously existed only as loose build_dir edits.
+
+The OEM LAN QDMA enables TX_IMMEDIATE_DONE for QDMA->PPE->QDMA because that
+internal route never crosses GDM and therefore has no normal pkt_done. Keep the
+bit disabled by default, expose a readback-verified runtime switch, and count
+marked probe completions independently.
+
+---
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -348,6 +348,15 @@
+  * ring the OEM wifi_fast uses). Set in en75_probe once the QDMA is created. */
+ struct en75_qdma *en75_whnat_probe_qdma;
+ 
++/* The PON engine, handed to the econet-xpon module. */
++static struct en75_qdma *en75_pon_qdma;
++
++struct en75_qdma *en75_xpon_pon_qdma(void)
++{
++	return en75_pon_qdma;
++}
++EXPORT_SYMBOL_GPL(en75_xpon_pon_qdma);
++
+ static int en75_ppe_engine_set(bool on)
+ {
+ 	void __iomem *g;
+@@ -478,14 +487,50 @@
+  * counters afterwards to see what happened. */
+ module_param_named(whnat_up_probe, en75_whnat_up_probe, bool, 0644);
+ module_param_named(whnat_up_max, en75_whnat_up_max, uint, 0644);
++module_param_named(pon_rx_dropped, en75_pon_rx_dropped, uint, 0444);
+ module_param_named(whnat_up_raw, en75_whnat_up_raw, uint, 0444);
+ module_param_named(whnat_up_seen, en75_whnat_up_seen, uint, 0444);
+ module_param_named(whnat_up_inj, en75_whnat_up_inj, uint, 0444);
++module_param_named(whnat_up_done, en75_whnat_up_done, uint, 0444);
+ module_param_named(whnat_up_err, en75_whnat_up_err, uint, 0444);
+ module_param_named(whnat_up_fraglist, en75_whnat_up_fraglist, uint, 0444);
+ module_param_named(whnat_up_dup, en75_whnat_up_dup, uint, 0644);
+ module_param_string(whnat_up_txif, en75_whnat_up_txif,
+ 		    sizeof(en75_whnat_up_txif), 0644);
++module_param_named(whnat_up_nodev, en75_whnat_up_nodev, bool, 0644);
++module_param_named(whnat_up_chan, en75_whnat_up_chan, uint, 0644);
++module_param_named(whnat_up_fport, en75_whnat_up_fport, uint, 0644);
++module_param_named(whnat_up_tag, en75_whnat_up_tag, uint, 0644);
++module_param_named(whnat_up_vid, en75_whnat_up_vid, uint, 0644);
++
++static int whnat_up_imm_set(const char *val, const struct kernel_param *kp)
++{
++	bool enable;
++	u32 old_cfg, new_cfg;
++	int ret;
++
++	ret = kstrtobool(val, &enable);
++	if (ret)
++		return ret;
++	if (!en75_whnat_probe_qdma)
++		return -ENODEV;
++
++	ret = en75_qdma_set_tx_immediate_done(en75_whnat_probe_qdma, enable,
++					      &old_cfg, &new_cfg);
++	if (ret)
++		return ret;
++
++	WRITE_ONCE(*(bool *)kp->arg, enable);
++	pr_info("econet-eth: WHNAT TX_IMMEDIATE_DONE %s: qdma_cfg %08x -> %08x\n",
++		enable ? "enabled" : "disabled", old_cfg, new_cfg);
++	return 0;
++}
++
++static const struct kernel_param_ops whnat_up_imm_ops = {
++	.set = whnat_up_imm_set,
++	.get = param_get_bool,
++};
++module_param_cb(whnat_up_imm, &whnat_up_imm_ops, &en75_whnat_up_imm, 0644);
+ 
+ module_param_named(ppe_rxdump, en75_ppe_rxdump, bool, 0644);
+ module_param_named(ppe_fpdump, en75_ppe_fpdump, bool, 0644);
+@@ -668,6 +713,53 @@
+ 	en75_ppe_fe_rw(en75_the_ppe, off, eq != NULL, v);
+ 	return 0;
+ }
++/* Generic SoC register peek/poke by PHYSICAL address, for blocks this driver
++ * does not map. ppe_fe only reaches fe_base+0..0xfffc, and the OEM hw_nat.ko
++ * touches a whole region we never mapped (it reads 0x1fb00064 and branches on
++ * the top 16 bits being 7 or 8 -- a silicon revision check).
++ *   echo 0x1fb00064 > phys_rw            (read)
++ *   echo 0x1fb00064=0x1234 > phys_rw     (write)
++ * Address is physical and must be 4-byte aligned. */
++static int en75_phys_rw_set(const char *val, const struct kernel_param *kp)
++{
++	char buf[48], *eq;
++	void __iomem *m;
++	u32 addr, v = 0;
++	bool write;
++
++	strscpy(buf, val, sizeof(buf));
++	eq = strchr(buf, '=');
++	write = (eq != NULL);
++	if (eq) {
++		*eq = '\0';
++		if (kstrtou32(eq + 1, 0, &v))
++			return -EINVAL;
++	}
++	if (kstrtou32(buf, 0, &addr))
++		return -EINVAL;
++	addr &= ~3u;
++
++	m = ioremap(addr, 4);
++	if (!m)
++		return -ENOMEM;
++	if (write) {
++		u32 old = readl(m);
++
++		writel(v, m);
++		pr_info("XR500v phys[%08x]: %08x -> %08x (rb=%08x)\n",
++			addr, old, v, readl(m));
++	} else {
++		pr_info("XR500v phys[%08x] = %08x\n", addr, readl(m));
++	}
++	iounmap(m);
++	return 0;
++}
++static const struct kernel_param_ops en75_phys_rw_ops = {
++	.set = en75_phys_rw_set, .get = param_get_int,
++};
++static int phys_rw_v;
++module_param_cb(phys_rw, &en75_phys_rw_ops, &phys_rw_v, 0644);
++
+ static const struct kernel_param_ops en75_ppe_fe_ops = {
+ 	.set = en75_ppe_fe_set, .get = param_get_int,
+ };
+@@ -992,6 +1084,10 @@
+ 		}
+ 	}
+ 	en75_whnat_probe_qdma = eth->qdma[0];	/* patch 383: WHNAT probe target */
++	/* qdma[1] is the PON engine: no GDM netdev hangs off it, which is why
++	 * its RX needs the pon_rx_cb seam instead of the sport->netdev path. */
++	en75_pon_qdma = eth->qdma[1];
++	en75_qdma_mark_pon(en75_pon_qdma);
+ 
+ 	for_each_child_of_node(pdev->dev.of_node, np) {
+ 		if (!of_device_is_compatible(np, "econet,eth-mac"))
+@@ -1041,4 +1137,4 @@
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Caleb James DeLisle <cjd@cjdns.fr>");
+-MODULE_DESCRIPTION("Ethernet driver for EcoNet SoC");
+\ No newline at end of file
++MODULE_DESCRIPTION("Ethernet driver for EcoNet SoC");
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -204,6 +204,25 @@
+ int en75_qdma_destroy(struct en75_qdma *qdma);
+ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+ 		   union desc_msg *msg, int qid);
++int en75_qdma_set_tx_immediate_done(struct en75_qdma *qdma, bool enable,
++				    u32 *old_cfg, u32 *new_cfg);
++
++/* Injected frames pass skb->dev == NULL so they take no part in BQL; both
++ * en75_qdma_xmit() and the completion path guard for it. See econet_qdma.c for
++ * why the NAPI dummy netdev is not an option. */
++#define EN75_WHNAT_UP_MARK	0x57555050U /* "WUPP": probe completion cookie */
++
++/* PON seam -- see econet_qdma.c. Used by the econet-xpon module. */
++int en75_qdma_register_pon_rx(struct en75_qdma *qdma,
++			      void (*cb)(void *, struct sk_buff *, u8, u16),
++			      void *arg);
++int en75_qdma_set_loopback(struct en75_qdma *qdma, bool on);
++int en75_qdma_register_pon(struct en75_qdma *qdma,
++			   void (*cb)(void *, enum en75_irq_purpose_type),
++			   void *arg);
++struct en75_qdma *en75_xpon_pon_qdma(void);
++void en75_qdma_mark_pon(struct en75_qdma *qdma);
++extern unsigned int en75_pon_rx_dropped;
+ 
+ 
+ /* patch 383: WHNAT TX probe (Phase 0 fail-fast) -- fire a synthetic frame at
+@@ -238,4 +257,4 @@
+ 		BUILD_BUG_ON(sizeof(__r) != sizeof(u32)); \
+ 		__r.w; \
+ 	})
+-#endif
+\ No newline at end of file
++#endif
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -5,6 +5,7 @@
+  * phase-1a already allocated (16384 * 80B coherent); this just builds + commits
+  * entries into it. Indexing uses the 80B stride, NOT an array of (oversized)
+  * structs. */
++#include <linux/if_vlan.h>	/* VLAN_HLEN: OEM-style tag on injected copies */
+ #include "econet_ppe.h"
+ #include "econet_eth.h"		/* en75_qdma_xmit() for the upstream probe */
+ #include "qdma_desc.h"		/* desc_msg / set_etx_* / ETX_FPORT_PPE */
+@@ -1315,10 +1316,38 @@
+ unsigned int en75_whnat_up_raw;		/* every frame the hook saw, unfiltered */
+ unsigned int en75_whnat_up_seen;	/* candidate frames the hook saw */
+ unsigned int en75_whnat_up_inj;		/* copies handed to the PPE */
++unsigned int en75_whnat_up_done;	/* marked copies recycled by QDMA */
+ unsigned int en75_whnat_up_err;		/* copies we could not hand over */
+ unsigned int en75_whnat_up_fraglist;	/* aggregated frames skipped (see below) */
+ unsigned int en75_whnat_up_dup = 1;	/* injections per frame, to beat the noise */
+ char en75_whnat_up_txif[IFNAMSIZ] = "lan3";
++/* Inject with skb->dev == NULL and no BQL accounting at all. Default on:
++ * pointing the injections at a real port desynchronises that port's dql and
++ * stops its queues for good (32 injections on lan3 dropped the PPPoE session,
++ * 127 killed the network until a reboot). Clear it to go back to
++ * whnat_up_txif + BQL for an A/B. */
++bool en75_whnat_up_nodev = true;
++/* VLAN tag stamped on the injected copy, mirroring whnat_tx_tag on the TX probe:
++ * 0 = none, 1 = 0x5678/vid (the WiFi mux TPID), 2 = 0x8100/vid (real 802.1Q).
++ *
++ * The OEM path (RA_HWNAT PpeExtIfRxHandler) always uses a real 802.1Q tag whose
++ * VID is the VirIfIdx of the source interface, and everything configured on this
++ * board only knows TPID 0x8100 (FE 0xF18=0x8100, VLAN_CTRL=0x81000001, GDM1
++ * VLAN_CHECK=1). An untagged frame -- what we injected until now -- is a prime
++ * candidate for one the PPE path cannot classify, which would leave it parked
++ * exactly as observed. VID comes from the hook's vif index unless overridden. */
++/* TX channel for the injected copy. Default 7 = the OEM's WIFI_OFFLOAD_CHANNEL
++ * (eth_generic.h:428), which is what eth_lan.c puts on a CPU->PPE frame. Set 0
++ * to go back to the old behaviour for an A/B. */
++unsigned int en75_whnat_up_chan = 7;
++/* Destination fport for the injected copy. Default 4 = PPE (the OEM recipe).
++ * Made settable to map WHICH PSE ports accept a CPU-injected frame: fport 3
++ * (QDMA0_HWF) is known to complete from this same ring while 4 never does, so
++ * sweeping 0..7 says whether the rejection is specific to port 4 or a class. */
++unsigned int en75_whnat_up_fport = ETX_FPORT_PPE;
++unsigned int en75_whnat_up_tag;
++unsigned int en75_whnat_up_vid = 0xffff;	/* 0xffff = use the vif index */
++bool en75_whnat_up_imm;			/* OEM QDMA self-completion; default off */
+ 
+ static struct nf_hook_ops *en75_whnat_ing_ops[EN75_WHNAT_MAX_VIFS];
+ 
+@@ -1331,6 +1360,13 @@
+ 	struct sk_buff *inj;
+ 	int mac_len, ret;
+ 	unsigned int dup, i;
++	bool txdev_held;
++	unsigned int tag = READ_ONCE(en75_whnat_up_tag);
++	u16 vid;
++
++	/* priv carries the vif index this hook was attached for = OEM VirIfIdx */
++	vid = (en75_whnat_up_vid == 0xffff) ? (u16)(uintptr_t)priv
++					    : (u16)en75_whnat_up_vid;
+ 
+ 	if (!READ_ONCE(en75_whnat_up_probe))
+ 		return NF_ACCEPT;
+@@ -1376,16 +1412,36 @@
+ 		return NF_ACCEPT;
+ 
+ 	/* en75_qdma_xmit() calls netif_tx_stop_all_queues(skb->dev) when the ring
+-	 * fills, and the completion wakes skb->dev. Handing it the AP netdev would
+-	 * stop the WiFi queues with nothing to ever wake them -- the same shape as
+-	 * the stall patch 396 fixed -- so the copies go out pointing at an
+-	 * ethernet port. */
+-	txdev = dev_get_by_name(&init_net, en75_whnat_up_txif);
+-	if (!txdev) {
+-		en75_whnat_up_err++;
+-		return NF_ACCEPT;
++	 * fills, and the completion wakes skb->dev, so the copies cannot go out
++	 * pointing at the AP netdev -- that would stop the WiFi queues with nothing
++	 * to wake them, the shape patch 396 fixed.
++	 *
++	 * A real ethernet port is no good either: with hardware offload its own
++	 * traffic bypasses the netdev, so its dql sees almost no legitimate
++	 * activity and the injections' sent/completed pair desynchronises it. That
++	 * is what took lan3 down -- 32 injections was enough to drop the PPPoE
++	 * session, 127 killed the network until a reboot.
++	 *
++	 * So by default the copies hang off the QDMA's NAPI dummy netdev, which
++	 * carries no traffic of its own and whose queues nobody else depends on.
++	 * The dummy is owned by the qdma and outlives us, so no reference is
++	 * taken. */
++	if (en75_whnat_up_nodev) {
++		/* No netdev at all: the frame is ours, not a port's, so it has no
++		 * business in anyone's BQL. Both en75_qdma_xmit() and the completion
++		 * path guard for skb->dev == NULL. */
++		txdev = NULL;
++		txdev_held = false;
++		txq = NULL;
++	} else {
++		txdev = dev_get_by_name(&init_net, en75_whnat_up_txif);
++		if (!txdev) {
++			en75_whnat_up_err++;
++			return NF_ACCEPT;
++		}
++		txdev_held = true;
++		txq = netdev_get_tx_queue(txdev, 0);
+ 	}
+-	txq = netdev_get_tx_queue(txdev, 0);
+ 
+ 	/* Send the same frame whnat_up_dup times. One packet of real traffic then
+ 	 * produces enough injections to show up against the background noise --
+@@ -1404,21 +1460,51 @@
+ 			break;
+ 		}
+ 
+-		if (mac_len > skb_headroom(inj)) {
++		if (mac_len + (tag ? VLAN_HLEN : 0) > skb_headroom(inj)) {
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
+ 			break;
+ 		}
+ 		skb_push(inj, mac_len);
+ 
++		/* Insert the tag the OEM way: shift DA+SA back over the 4 new bytes
++		 * and write TPID/VID into the gap, so the frame becomes
++		 * DA|SA|TPID|VID|ethertype|payload. */
++		if (tag) {
++			skb_push(inj, VLAN_HLEN);
++			memmove(inj->data, inj->data + VLAN_HLEN, 2 * ETH_ALEN);
++			put_unaligned(htons(tag == 1 ? 0x5678 : ETH_P_8021Q),
++				      (__be16 *)(inj->data + 2 * ETH_ALEN));
++			put_unaligned(htons(vid),
++				      (__be16 *)(inj->data + 2 * ETH_ALEN + 2));
++		}
++
+ 		inj->dev = txdev;
++		/* Software-only cookie. It is not encoded in the descriptor and cannot
++		 * affect PPE parsing; the TX done path uses it to distinguish recycling
++		 * of these copies from ordinary Ethernet/xPON completions. */
++		inj->mark = EN75_WHNAT_UP_MARK;
+ 		skb_set_queue_mapping(inj, 0);
+ 
+-		/* Channel 0 / queue 0 on purpose: normal traffic uses other queues,
+-		 * so chan_ctrs0 gives these injections a near-exclusive counter. */
+-		set_etx_channel(&msg.etx, 0);
++		/* The OEM hands a CPU frame to the PPE with exactly two fields set --
++		 * eth_lan.c:762-764, the FOE_MAGIC_PPE path:
++		 *	memset(&ethTxMsg, 0, sizeof(ethTxMsg_t));
++		 *	ethTxMsg.raw.fPort   = DPORT_PPE;              // 4
++		 *	ethTxMsg.raw.channel = WIFI_OFFLOAD_CHANNEL;   // 7
++		 * and nothing else: no special tag, no vlan_en, no pmap. The FOE_MAGIC
++		 * lives in the skb headroom, so it is software-only -- the hardware
++		 * never sees it. That leaves the channel as the one hardware-visible
++		 * difference we had never tried: this hook pinned channel 0 to get an
++		 * exclusive chan_ctrs0 counter, while the OEM reserves channel 7 for
++		 * offload and gives it its own rate-limit config. Channel gating is
++		 * real on this fabric (gdm_chan_en refuses traffic from a masked
++		 * channel), so a wrong channel is a plausible reason for frames that
++		 * are accepted and then go nowhere.
++		 * Note when reading counters: on channel 7 the injections no longer
++		 * land in the chan_ctrs0 row 0 we had been watching. */
++		set_etx_channel(&msg.etx, READ_ONCE(en75_whnat_up_chan));
+ 		set_etx_queue(&msg.etx, 0);
+-		set_etx_fport(&msg.etx, ETX_FPORT_PPE);
++		set_etx_fport(&msg.etx, (enum etx_fport)READ_ONCE(en75_whnat_up_fport));
+ 
+ 		/* BQL has to balance. The completion path calls
+ 		 *	netdev_tx_completed_queue(txq, 1, skb->len)
+@@ -1426,12 +1512,19 @@
+ 		 * complete bytes that were never queued -- on MIPS that is a trap,
+ 		 * so it panics in interrupt context and reboots the board.
+ 		 * Injecting without the matching sent_queue() does exactly that;
+-		 * same accounting bug patch 397 fixed from the other side. */
+-		netdev_tx_sent_queue(txq, inj->len);
++		 * same accounting bug patch 397 fixed from the other side.
++		 *
++		 * With txq == NULL (the default) the frame stays out of BQL on both
++		 * sides instead, which is the only arrangement that survives volume:
++		 * see the comment in econet_qdma.c on why the NAPI dummy is not a
++		 * usable third option. */
++		if (txq)
++			netdev_tx_sent_queue(txq, inj->len);
+ 
+ 		ret = en75_qdma_xmit(en75_whnat_probe_qdma, inj, &msg, 0);
+ 		if (ret < 0) {
+-			netdev_tx_completed_queue(txq, 1, inj->len);	/* undo */
++			if (txq)
++				netdev_tx_completed_queue(txq, 1, inj->len); /* undo */
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
+ 			break;		/* ring is full; stop pushing */
+@@ -1441,10 +1534,12 @@
+ 		if (en75_whnat_up_inj == 1)
+ 			pr_info("econet-eth: WHNAT upstream probe: first frame handed to the PPE (dev=%s -> %s, %d bytes)\n",
+ 				skb->dev ? skb->dev->name : "?",
+-				en75_whnat_up_txif, inj->len);
++				txdev ? txdev->name : "no netdev (BQL bypassed)",
++				inj->len);
+ 	}
+ 
+-	dev_put(txdev);	/* skb->dev stays a weak pointer, as everywhere */
++	if (txdev_held)
++		dev_put(txdev);	/* skb->dev stays a weak pointer, as everywhere */
+ 
+ 	return NF_ACCEPT;	/* the original keeps going through the slow path */
+ }
+@@ -1469,6 +1564,10 @@
+ 	ops->hooknum = NF_NETDEV_INGRESS;
+ 	ops->priority = INT_MIN;	/* before the flowtable */
+ 	ops->dev = dev;
++	/* Carry the vif index into the hook: it is the OEM's VirIfIdx, the value
++	 * RA_HWNAT stamps as the VLAN VID so the PPE (and the ping-pong handler on
++	 * the way back) can tell which external interface the frame came from. */
++	ops->priv = (void *)(uintptr_t)idx;
+ 
+ 	if (nf_register_net_hook(dev_net(dev), ops)) {
+ 		kfree(ops);
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -336,10 +336,17 @@
+ extern unsigned int en75_whnat_up_raw;
+ extern unsigned int en75_whnat_up_seen;
+ extern unsigned int en75_whnat_up_inj;
++extern unsigned int en75_whnat_up_done;
+ extern unsigned int en75_whnat_up_err;
+ extern unsigned int en75_whnat_up_fraglist;
+ extern unsigned int en75_whnat_up_dup;
+ extern char en75_whnat_up_txif[IFNAMSIZ];
++extern bool en75_whnat_up_nodev;
++extern unsigned int en75_whnat_up_chan;
++extern unsigned int en75_whnat_up_fport;
++extern unsigned int en75_whnat_up_tag;
++extern unsigned int en75_whnat_up_vid;
++extern bool en75_whnat_up_imm;
+ 
+ /* EXPORT_SYMBOL'd -- mt76 (separate module) calls these from add/remove_interface */
+ void en75_whnat_register_vif(struct net_device *dev, int idx);
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -430,6 +430,24 @@
+ 	struct fwdesc 			*hwf_desc;
+ 	struct net_device 		*napi_dev;
+ 	struct en75_qdma_cfg 		cfg;
++
++	/* PON (xPON/GPON) seam. The PON engine is qdma[1] and has NO GDM netdev,
++	 * so its RX frames cannot go down the sport->netdev path -- that would
++	 * NULL-deref in eth_type_trans(). When the xPON driver registers here,
++	 * frames are handed to it instead and it takes ownership of the skb.
++	 * Left unconditional (not behind a CONFIG): the cost on the normal path
++	 * is one NULL check per frame, and an ifdef would need Kbuild surgery. */
++	void (*pon_rx_cb)(void *arg, struct sk_buff *skb, u8 sport, u16 gem);
++	void				*pon_rx_arg;
++	/* PON interrupt causes (GPON/EPON/XPON) forwarded to the sub-driver */
++	void (*pon_cb)(void *arg, enum en75_irq_purpose_type type);
++	void				*pon_arg;
++	bool				is_pon;		/* engine has no GDM netdev */
++};
++
++unsigned int en75_pon_rx_dropped;	/* frames the PON engine got with no claimer */
++
++struct en75_qdma_unused_marker {
+ };
+ 
+ /* WHNAT zero-copy: reserve headroom in every RX buffer so a force-to-CPU frame
+@@ -782,6 +800,31 @@
+ 	sport = get_erx_sport(&desc.msg.erx);
+ 	en75_icmp_phase_rx(q, skb, cpu_i, sport,
+ 			   q - &q->qdma->q_rx[0]);
++
++	/* PON RX: hand the frame to the xPON sub-driver, which owns it from
++	 * here on. The GEM port id rides in word0 bits 23:12 of the descriptor. */
++	if (READ_ONCE(q->qdma->pon_rx_cb)) {
++		u16 gem = (desc.msg.raw[0] >> 12) & 0xfff;
++
++		q->qdma->pon_rx_cb(q->qdma->pon_rx_arg, skb, sport, gem);
++		return;
++	}
++
++	/* Nothing claimed it, and this engine has NO GDM netdev: the normal
++	 * sport->netdev path below would hand NULL to eth_type_trans() and
++	 * panic in interrupt context. Frames only reach here in the window
++	 * before xPON registers, or with the QDMA in loopback -- drop them.
++	 * (Learned the hard way: enabling loopback with no callback yet
++	 *  paniced at virtual address 0x10 in napi/qdma1_eth.) */
++	if (q->qdma->is_pon) {
++		/* Counted so "the PON engine received nothing" and "it received
++		 * frames and we dropped them here" are distinguishable -- e.g. the
++		 * GTC sniffer mirror arriving before xPON registers a callback. */
++		en75_pon_rx_dropped++;
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	if (en75_rx_before_recv(q->qdma->eth, skb, sport)) {
+ 		dev_kfree_skb(skb);
+ 	} else {
+@@ -857,7 +900,20 @@
+ 	[15] = IRQ_PURPOSE(ERR_COHERENT,	RX,	1),
+ 	[16] = IRQ_PURPOSE(GPON_INT,		UNSPEC,	-1),
+ 	[17] = IRQ_PURPOSE(EPON_INT,		UNSPEC,	-1),
+-	[18] = IRQ_PURPOSE(XPON_INT,		UNSPEC,	-1),
++	/* Bit 24 is INT_STATUS_XPON_PHY (vendor qdma_reg.h:300): the EXTERNAL xPON-PHY
++	 * interrupt, grouped with GPON_MAC(16)/EPON_MAC(17) in INT_STATUS_EXTERNAL
++	 * (0x01030000). Upstream had it at [18], but bit 18 does not exist in this
++	 * silicon -- whoever wrote the table assumed the three externals were
++	 * consecutive. It is a LEVEL condition from the PHY: mapping it to RX DONE
++	 * (tried) storms at ~240k irq/s because acking doesn't clear the source.
++	 * The vendor only enables it when a PHY handler is registered
++	 * (qdma_api.c:338), so masked-by-default here is the correct state; the ISR
++	 * routes it to the xPON sub-driver via pon_cb if one is registered.
++	 * (Historical note: rx_hwi=1/rx_cpui=0 seen alongside this bit is the RX
++	 * ring's INIT state, not "one descriptor received" -- see en75_init_rx_queue.)
++	 * Entries 18..23 and 25..30 stay zero (IPS_INVAL) and are never enabled. */
++	[24] = IRQ_PURPOSE(XPON_INT,		UNSPEC,	-1),
++	[31] = IRQ_PURPOSE(INVAL,		UNSPEC,	-1),
+ };
+ 
+ static bool en751221_valid_irq_bit(union irq_bit bit)
+@@ -904,6 +960,16 @@
+ 
+ /* End EN751221 IRQ functions */
+ 
++/* Enable/disable EVERY status bit that carries this purpose, not just the first.
++ * en751221_irq_bit() returns the first match, so when two bits share a purpose --
++ * as bits 1 and 24 both do for (DONE, RX, chain 0) on this SoC -- the NAPI
++ * completion path re-armed bit 1 and left bit 24 masked forever. The interrupt
++ * then fired exactly once and the PON engine's descriptors were never collected
++ * again (rx_hwi stuck at 1, rx_cpui at 0). */
++static void en75_qdma_set_irqmask_purpose(struct en75_qdma *qdma,
++					  union en75_irq_purpose purpose,
++					  bool enable);
++
+ static void en75_qdma_set_irqmask(struct en75_qdma *qdma, union irq_bit b, bool enable)
+ {
+ 	struct en75_irq *irq;
+@@ -934,6 +1000,20 @@
+ 	en75_rreg(irq->mask_reg[b.reg_idx]);
+ }
+ 
++/* See the forward declaration above for why this exists. */
++static void en75_qdma_set_irqmask_purpose(struct en75_qdma *qdma,
++					  union en75_irq_purpose purpose,
++					  bool enable)
++{
++	for (int i = 0; i < ARRAY_SIZE(EN751221_IRQ_MAP); i++) {
++		union irq_bit b = { .irq_idx = 0, .reg_idx = 0, .bit_idx = i };
++
++		if (EN751221_IRQ_MAP[i].word != purpose.word)
++			continue;
++		en75_qdma_set_irqmask(qdma, b, enable);
++	}
++}
++
+ static int en75_qdma_rx_napi_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct en75_q_rx *q = container_of(napi, struct en75_q_rx, napi);
+@@ -980,7 +1060,8 @@
+ 		
+ 		purpose = IRQ_PURPOSE(DONE, RX, q - &qdma->q_rx[0]);
+ 		b = en751221_irq_bit(purpose);
+-		en75_qdma_set_irqmask(qdma, b, true);
++		(void)b;
++		en75_qdma_set_irqmask_purpose(qdma, purpose, true);
+ 	}
+ 
+ 	en75_rxstat_note_poll(done);
+@@ -1047,6 +1128,20 @@
+ 				disable_int |= BIT(bit);
+ 				continue;
+ 			}
++			/* PON causes belong to the xPON sub-driver, not to us.
++			 * Note patch 160 keeps these masked by default, so this
++			 * only fires once xPON enables them. */
++			if (p.type == IPS_GPON_INT || p.type == IPS_EPON_INT ||
++			    p.type == IPS_XPON_INT) {
++				void (*cb)(void *, enum en75_irq_purpose_type) =
++					READ_ONCE(qdma->pon_cb);
++
++				if (cb) {
++					cb(qdma->pon_arg, p.type);
++					continue;
++				}
++			}
++
+ 			dev_dbg_ratelimited(qdma->dev,
+ 					    "%s IRQ from %s[%d]\n",
+ 					    en75_irq_purpose_type_str(p.type),
+@@ -1119,6 +1214,9 @@
+ 
+ 		e = &q->entry[index];
+ 		skb = e->skb;
++		if (unlikely(skb->mark == EN75_WHNAT_UP_MARK))
++			WRITE_ONCE(en75_whnat_up_done,
++				   READ_ONCE(en75_whnat_up_done) + 1);
+ 
+ 		dma_unmap_single(qdma->dev, e->dma_addr, e->dma_len,
+ 				 DMA_TO_DEVICE);
+@@ -1133,13 +1231,38 @@
+ 		q->entry[q->freelist_tail].freelist_next = index;
+ 		q->freelist_tail = index;
+ 
+-		txq = netdev_get_tx_queue(skb->dev,
+-					  skb_get_queue_mapping(skb));
+-		netdev_tx_completed_queue(txq, 1, skb->len);
+-		if (q->queues_stopped) {
+-			q->queues_stopped = false;
+-			netif_tx_wake_all_queues(skb->dev);
++		/* A frame submitted straight to the engine need not belong to a
++		 * netdev -- the xPON test injector and any other in-kernel user
++		 * of en75_qdma_xmit() can hand us one with skb->dev unset. Doing
++		 * the BQL accounting on it dereferences NULL inside
++		 * netdev_get_tx_queue() (dev->_tx), which panics right here in
++		 * interrupt context: "paging request at virtual address 00000010",
++		 * epc in en75_poll_tx_complete. Skip the accounting for those and
++		 * still release the queues, so one such frame cannot wedge TX. */
++		if (likely(skb->dev)) {
++			txq = netdev_get_tx_queue(skb->dev,
++						  skb_get_queue_mapping(skb));
++			netdev_tx_completed_queue(txq, 1, skb->len);
++			if (q->queues_stopped) {
++				q->queues_stopped = false;
++				netif_tx_wake_all_queues(skb->dev);
++			}
+ 		}
++		/* Deliberately no else-branch clearing queues_stopped for dev-less
++		 * frames. It was there to keep one such frame from wedging TX, but it
++		 * does the opposite once injected and real frames share this ring
++		 * (they do: the WHNAT probe uses qdma[0]/qid 0, same as the port).
++		 * A real frame stops its netdev and sets the flag; if an injected
++		 * frame's completion then clears it without waking anything, every
++		 * later real completion sees it false and never calls
++		 * netif_tx_wake_all_queues() -- the netdev stays XOFF forever, and BQL
++		 * cannot rescue it because stop_all_queues sets DRV_XOFF while
++		 * netdev_tx_completed_queue only reschedules on STACK_XOFF. The stall
++		 * shape of patch 396, reached by mixed traffic.
++		 *
++		 * Leaving the flag set is harmless in the only case it can happen --
++		 * injections alone filled the ring, so no netdev was ever stopped --
++		 * and the next real completion clears it with a redundant wake. */
+ 
+ 		dev_kfree_skb_any(skb);
+ 	}
+@@ -1248,6 +1371,69 @@
+ 	}
+ }
+ 
++/* ===================================================================== */
++/* PON integration seam: what the econet-xpon module links against.       */
++/* Modelled on the seam from openwrt PR #24577 (100-xpon-bench-spike),    */
++/* re-done by hand because that patch is against econet-eth 2026.01.27    */
++/* and does not apply over our tree (the PPE patch rewrote much of this   */
++/* file -- 5 of its 7 hunks fail).                                        */
++/* ===================================================================== */
++
++/* Tag this engine as the PON one: its RX has no netdev to fall back to. */
++void en75_qdma_mark_pon(struct en75_qdma *qdma)
++{
++	if (qdma)
++		qdma->is_pon = true;
++}
++
++/* Register the PON RX callback. NULL unregisters. */
++int en75_qdma_register_pon_rx(struct en75_qdma *qdma,
++			      void (*cb)(void *, struct sk_buff *, u8, u16),
++			      void *arg)
++{
++	if (!qdma)
++		return -EINVAL;
++
++	guard(mutex)(&qdma->lock);
++	qdma->pon_rx_arg = arg;
++	WRITE_ONCE(qdma->pon_rx_cb, cb);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en75_qdma_register_pon_rx);
++
++/* Register the PON interrupt callback. NULL unregisters. */
++int en75_qdma_register_pon(struct en75_qdma *qdma,
++			   void (*cb)(void *, enum en75_irq_purpose_type),
++			   void *arg)
++{
++	if (!qdma)
++		return -EINVAL;
++
++	guard(mutex)(&qdma->lock);
++	qdma->pon_arg = arg;
++	WRITE_ONCE(qdma->pon_cb, cb);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en75_qdma_register_pon);
++
++/* Loop this engine's TX back into its own RX -- lets the xPON driver
++ * exercise the datapath with no optics attached, which is the only way to
++ * test it safely without a fibre. */
++int en75_qdma_set_loopback(struct en75_qdma *qdma, bool on)
++{
++	struct qregs_qcfg qcfg;
++
++	if (!qdma)
++		return -EINVAL;
++
++	guard(mutex)(&qdma->lock);
++	qcfg = en75_rreg(&qdma->regs->qdma_cfg);
++	set_qregs_qcfg_qdma_loopback(&qcfg, on);
++	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en75_qdma_set_loopback);
++
+ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+ 		   union desc_msg *msg, int qid)
+ {
+@@ -1261,9 +1447,15 @@
+ 
+ 	guard(spinlock_bh)(&q->lock_bh);
+ 
++	/* skb->dev may be NULL: injected frames (the WHNAT upstream probe, the PON
++	 * seam) carry no netdev precisely so they stay out of BQL. There is nothing
++	 * to stop in that case -- the flag still gets set so the completion path
++	 * releases the queues, which it does regardless of skb->dev. Same guard the
++	 * completion side already carries. */
+ 	index = q->freelist_head;
+ 	if (index == 0xffff) {
+-		netif_tx_stop_all_queues(skb->dev);
++		if (likely(skb->dev))
++			netif_tx_stop_all_queues(skb->dev);
+ 		q->queues_stopped = true;
+ 		return -EBUSY;
+ 	}
+@@ -1271,7 +1463,8 @@
+ 	e = &q->entry[index];
+ 	next_index = e->freelist_next;
+ 	if (next_index == 0xffff) {
+-		netif_tx_stop_all_queues(skb->dev);
++		if (likely(skb->dev))
++			netif_tx_stop_all_queues(skb->dev);
+ 		q->queues_stopped = true;
+ 		return -EBUSY;
+ 	}
+@@ -1293,7 +1486,14 @@
+ 	q->freelist_head = next_index;
+ 	ring_full = q->entry[next_index].freelist_next == 0xffff;
+ 	if (ring_full) {
+-		netif_tx_stop_all_queues(skb->dev);
++		/* Third of the three stop sites, and the one that actually fires under
++		 * load: the two above only run when the ring was already full on
++		 * entry, this one when *this* frame filled it. An injected frame
++		 * (skb->dev == NULL) reaches it as soon as the injection rate fills
++		 * the ring -- dup=1 never got here, dup=50 panicked immediately in
++		 * netif_tx_stop_all_queues() reading dev->num_tx_queues at +0x2c8. */
++		if (likely(skb->dev))
++			netif_tx_stop_all_queues(skb->dev);
+ 		q->queues_stopped = true;
+ 	}
+ 
+@@ -1313,6 +1513,50 @@
+ 
+ 	return ring_full ? EBUSY : 0;
+ }
++EXPORT_SYMBOL_GPL(en75_qdma_xmit);
++
++/* The OEM LAN-QDMA driver enables this bit specifically for the learning
++ * path QDMA->PPE->QDMA: no real GDM egress exists there to return pkt_done,
++ * so QDMA must generate its own completion. Keep it runtime-gated for the
++ * lab because an old synthetic-probe run associated the global bit with a
++ * reboot; that run also predated the BQL hardening above. */
++int en75_qdma_set_tx_immediate_done(struct en75_qdma *qdma, bool enable,
++				    u32 *old_cfg, u32 *new_cfg)
++{
++	struct qregs_qcfg qcfg, rb;
++	u32 old, new;
++
++	if (!qdma)
++		return -ENODEV;
++
++	guard(mutex)(&qdma->lock);
++	qcfg = en75_rreg(&qdma->regs->qdma_cfg);
++	old = en75_word(qcfg);
++	set_qregs_qcfg_tx_immediate_done(&qcfg, enable);
++	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
++	rb = en75_rreg(&qdma->regs->qdma_cfg);
++	new = en75_word(rb);
++
++	if (old_cfg)
++		*old_cfg = old;
++	if (new_cfg)
++		*new_cfg = new;
++
++	return is_qregs_qcfg_tx_immediate_done(&rb) == enable ? 0 : -EIO;
++}
++
++/* Do NOT add an accessor handing out qdma->napi_dev for injected frames to do
++ * BQL accounting on. It looks like the obvious answer -- a netdev that carries
++ * no traffic of its own, so the sent/completed pair cannot desynchronise a real
++ * port -- and it panics: the NAPI dummy comes from alloc_netdev_dummy() and is
++ * never registered, so its txq->qdisc stays NULL. The first time BQL decides to
++ * wake the queue, netdev_tx_completed_queue() -> netif_schedule_queue() ->
++ * __netif_schedule(NULL) does a test_and_set_bit() on NULL + offsetof(struct
++ * Qdisc, state), which on MIPS is "paging request at virtual address 00000098"
++ * in interrupt context. Measured: panic ~5s after the first injection.
++ *
++ * Injected frames must instead go out with skb->dev == NULL and no BQL calls at
++ * all; both the xmit and the completion path handle that explicitly. */
+ 
+ /* patch 383: WHNAT TX probe (Phase 0 fail-fast).
+  * Build a synthetic broadcast or directed frame with a recognizable
+@@ -1340,18 +1584,19 @@
+ 	if (!qdma)
+ 		return -ENODEV;
+ 
+-	if (!qdma->napi_dev)
+-		return -ENODEV;
+-
+ 	if (set_imm) {
+ 		pr_warn("XR500v WHNAT probe: refusing whnat_tx_imm (TX_IMMEDIATE_DONE wedged/rebooted F0 test)\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+-	skb = netdev_alloc_skb(qdma->napi_dev, ETH_FRAME_LEN);
++	/* Keep synthetic probes completely outside BQL. qdma->napi_dev is an
++	 * unregistered dummy netdev whose qdisc is NULL, so attaching the skb to
++	 * it can panic when completion tries to schedule that queue. */
++	skb = alloc_skb(ETH_FRAME_LEN + NET_SKB_PAD, GFP_KERNEL);
+ 	if (!skb)
+ 		return -ENOMEM;
+ 	skb_reserve(skb, NET_SKB_PAD);
++	skb->mark = EN75_WHNAT_UP_MARK;
+ 
+ 	if (da_hi || da_lo) {
+ 		dst_mac[0] = da_hi >> 8;
+@@ -1873,6 +2118,9 @@
+ 	return en75_qdma_destroy_locked(qdma);
+ }
+ 
++EXPORT_SYMBOL_GPL(en75_qdma_use);
++EXPORT_SYMBOL_GPL(en75_qdma_unuse);
++
+ int en75_qdma_use(struct en75_qdma *qdma)
+ {
+ 	struct qregs_qcfg qcfg;
+

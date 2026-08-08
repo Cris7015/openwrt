@@ -1,0 +1,117 @@
+econet-eth: add an opt-in pre-GRO WHNAT handoff
+
+The netdev ingress hook runs after mt76 has submitted the receive list to
+GRO.  At useful rates most frames therefore arrive as non-linear fraglists,
+and original-skb takeover has to linearize them before QDMA can own them.
+
+Export a small, gated entry point which mt76 can call for each Ethernet skb
+immediately before napi_gro_receive().  It reuses the proven ingress/QDMA/PPE
+path and returns true only when QDMA took ownership.  While this mode is on,
+the later netfilter hook becomes a no-op so a backpressured frame is not tried
+twice after GRO.  Everything defaults off.
+
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -519,7 +519,16 @@ module_param_named(whnat_up_zerocopy_line
+ 		   en75_whnat_up_zerocopy_linearized, uint, 0444);
+ module_param_named(whnat_up_zerocopy_cow, en75_whnat_up_zerocopy_cow, uint, 0444);
+ module_param_named(whnat_up_zerocopy_prepare_err,
+ 		   en75_whnat_up_zerocopy_prepare_err, uint, 0444);
++module_param_named(whnat_up_early, en75_whnat_up_early, bool, 0644);
++module_param_named(whnat_up_early_seen,
++		   en75_whnat_up_early_seen, uint, 0444);
++module_param_named(whnat_up_early_taken,
++		   en75_whnat_up_early_taken, uint, 0444);
++module_param_named(whnat_up_early_fallback,
++		   en75_whnat_up_early_fallback, uint, 0444);
++module_param_named(whnat_up_early_nonlinear,
++		   en75_whnat_up_early_nonlinear, uint, 0444);
+ module_param_named(whnat_up_track, en75_whnat_up_track, bool, 0644);
+ module_param_named(whnat_up_track_tx, en75_whnat_up_track_tx, uint, 0444);
+ module_param_named(whnat_up_rx_cookie, en75_whnat_up_rx_cookie, uint, 0444);
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1368,6 +1368,11 @@ unsigned int en75_whnat_up_zerocopy_fall
+ unsigned int en75_whnat_up_zerocopy_linearized;
+ unsigned int en75_whnat_up_zerocopy_cow;
+ unsigned int en75_whnat_up_zerocopy_prepare_err;
++bool en75_whnat_up_early;
++unsigned int en75_whnat_up_early_seen;
++unsigned int en75_whnat_up_early_taken;
++unsigned int en75_whnat_up_early_fallback;
++unsigned int en75_whnat_up_early_nonlinear;
+ 
+ /* A low-noise acceptance oracle. Global CRSN histograms are dominated by
+  * unrelated physical-port traffic, so remember the exact last injected IPv4
+@@ -1585,6 +1590,12 @@ static unsigned int en75_whnat_ingress(vo
+ 		skb->mark = 0;
+ 		return NF_ACCEPT;
+ 	}
++
++	/* mt76 already offered this skb before napi_gro_receive(). Do not retry a
++	 * reserve/eligibility fallback later, after GRO changed its shape. */
++	if (READ_ONCE(en75_whnat_up_early) && state)
++		return NF_ACCEPT;
++
+ 
+ 	/* priv carries the vif index this hook was attached for = OEM VirIfIdx */
+ 	vid = (en75_whnat_up_vid == 0xffff) ? (u16)(uintptr_t)priv
+@@ -1855,6 +1866,43 @@ static unsigned int en75_whnat_ingress(vo
+ 	return NF_ACCEPT;	/* the original keeps going through the slow path */
+ }
+ 
++/* Called by mt76 after mac80211 has produced an Ethernet skb but before mt76
++ * feeds it to GRO. symbol_get() keeps this an optional relationship: mt76
++ * continues to work when econet-eth is absent. QDMA owns skb iff we return
++ * true; on false the caller must continue with napi_gro_receive(). */
++bool en75_whnat_upstream_early(struct sk_buff *skb)
++{
++	unsigned int verdict;
++	int idx;
++
++	if (!READ_ONCE(en75_whnat_up_early) || !skb || !skb->dev)
++		return false;
++
++	WRITE_ONCE(en75_whnat_up_early_seen,
++		   READ_ONCE(en75_whnat_up_early_seen) + 1);
++	if (skb_is_nonlinear(skb))
++		WRITE_ONCE(en75_whnat_up_early_nonlinear,
++			   READ_ONCE(en75_whnat_up_early_nonlinear) + 1);
++
++	idx = en75_whnat_idx_by_dev(skb->dev);
++	if (idx < 0) {
++		WRITE_ONCE(en75_whnat_up_early_fallback,
++			   READ_ONCE(en75_whnat_up_early_fallback) + 1);
++		return false;
++	}
++
++	verdict = en75_whnat_ingress((void *)(uintptr_t)idx, skb, NULL);
++	if (verdict == NF_STOLEN) {
++		WRITE_ONCE(en75_whnat_up_early_taken,
++			   READ_ONCE(en75_whnat_up_early_taken) + 1);
++		return true;
++	}
++	WRITE_ONCE(en75_whnat_up_early_fallback,
++		   READ_ONCE(en75_whnat_up_early_fallback) + 1);
++	return false;
++}
++EXPORT_SYMBOL_GPL(en75_whnat_upstream_early);
++
+ /* Attach on vif registration. This has to be an ingress hook rather than an
+  * rx_handler: the AP netdev sits in a bridge, and the bridge already owns the
+  * one rx_handler slot a device has. It is also where the flowtable hooks in,
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -362,6 +362,12 @@ extern unsigned int en75_whnat_up_zerocop
+ extern unsigned int en75_whnat_up_zerocopy_linearized;
+ extern unsigned int en75_whnat_up_zerocopy_cow;
+ extern unsigned int en75_whnat_up_zerocopy_prepare_err;
++extern bool en75_whnat_up_early;
++extern unsigned int en75_whnat_up_early_seen;
++extern unsigned int en75_whnat_up_early_taken;
++extern unsigned int en75_whnat_up_early_fallback;
++extern unsigned int en75_whnat_up_early_nonlinear;
++bool en75_whnat_upstream_early(struct sk_buff *skb);
+ extern bool en75_whnat_up_track;
+ extern unsigned int en75_whnat_up_track_tx;
+ extern unsigned int en75_whnat_up_rx_cookie;

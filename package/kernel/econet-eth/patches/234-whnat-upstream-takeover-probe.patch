@@ -1,0 +1,155 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: add fail-open WHNAT ingress takeover probe
+
+Add an opt-in first-light mode that consumes the original WiFi ingress skb only
+after its expanded replacement was accepted by QDMA. PPE misses return through
+QDMA RX and resume the software path; bound entries forward in hardware. Busy,
+unsupported, or failed injections remain on the original NF_ACCEPT path.
+
+The mode also requires TX_IMMEDIATE_DONE at runtime and remains disabled by
+default.
+
+---
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -351,6 +351,9 @@
+ extern unsigned int en75_whnat_up_tag;
+ extern unsigned int en75_whnat_up_vid;
+ extern bool en75_whnat_up_imm;
++extern bool en75_whnat_up_take;
++extern unsigned int en75_whnat_up_take_ok;
++extern unsigned int en75_whnat_up_take_fallback;
+ extern bool en75_whnat_up_track;
+ extern unsigned int en75_whnat_up_track_tx;
+ extern unsigned int en75_whnat_up_rx_cookie;
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -506,6 +506,9 @@
+ module_param_named(whnat_up_fport, en75_whnat_up_fport, uint, 0644);
+ module_param_named(whnat_up_tag, en75_whnat_up_tag, uint, 0644);
+ module_param_named(whnat_up_vid, en75_whnat_up_vid, uint, 0644);
++module_param_named(whnat_up_take, en75_whnat_up_take, bool, 0644);
++module_param_named(whnat_up_take_ok, en75_whnat_up_take_ok, uint, 0444);
++module_param_named(whnat_up_take_fallback, en75_whnat_up_take_fallback, uint, 0444);
+ module_param_named(whnat_up_track, en75_whnat_up_track, bool, 0644);
+ module_param_named(whnat_up_track_tx, en75_whnat_up_track_tx, uint, 0444);
+ module_param_named(whnat_up_rx_cookie, en75_whnat_up_rx_cookie, uint, 0444);
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1352,6 +1352,14 @@
+ unsigned int en75_whnat_up_tag = 2;	/* OEM PpeExtIfRxHandler: 0x8100/VirIfIdx */
+ unsigned int en75_whnat_up_vid = 0xffff;	/* 0xffff = use the vif index */
+ bool en75_whnat_up_imm;			/* OEM QDMA self-completion; default off */
++/* First-light OEM-style ownership transfer. Keep diagnostic-copy mode as the
++ * default; when enabled together with TX_IMMEDIATE_DONE, a successfully queued
++ * copy replaces the original and the ingress hook returns NF_STOLEN. An
++ * UNBIND/MISS comes back from PPE through QDMA RX and resumes the software path;
++ * a BIND is forwarded by hardware. Unsupported/busy frames remain NF_ACCEPT. */
++bool en75_whnat_up_take;
++unsigned int en75_whnat_up_take_ok;
++unsigned int en75_whnat_up_take_fallback;
+ 
+ /* A low-noise acceptance oracle. Global CRSN histograms are dominated by
+  * unrelated physical-port traffic, so remember the exact last injected IPv4
+@@ -1555,6 +1563,8 @@
+ 	unsigned int dup, i;
+ 	bool txdev_held;
+ 	unsigned int tag = READ_ONCE(en75_whnat_up_tag);
++	bool take = READ_ONCE(en75_whnat_up_take) &&
++		    READ_ONCE(en75_whnat_up_imm);
+ 	u16 vid;
+ 
+ 	/* priv carries the vif index this hook was attached for = OEM VirIfIdx */
+@@ -1586,8 +1596,11 @@
+ 
+ 	if (en75_whnat_up_inj >= READ_ONCE(en75_whnat_up_max))
+ 		return NF_ACCEPT;
+-	if (!en75_whnat_probe_qdma)
++	if (!en75_whnat_probe_qdma) {
++		if (take)
++			en75_whnat_up_take_fallback++;
+ 		return NF_ACCEPT;
++	}
+ 
+ 	/* skb_copy() returns NULL for aggregated frames (SKB_GSO_FRAGLIST), which
+ 	 * mt76/mac80211 hands us plenty of -- WARN_ON_ONCE in skbuff.c. Skip them
+@@ -1595,14 +1608,19 @@
+ 	 * deal with them, since they are exactly the high-throughput ones. */
+ 	if (skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) {
+ 		en75_whnat_up_fraglist++;
++		if (take)
++			en75_whnat_up_take_fallback++;
+ 		return NF_ACCEPT;
+ 	}
+ 
+ 	/* Ingress runs after eth_type_trans() pulled the L2 header; the PPE needs
+ 	 * the complete frame, so this is how much has to go back on. */
+ 	mac_len = skb->data - skb_mac_header(skb);
+-	if (mac_len <= 0)
++	if (mac_len <= 0) {
++		if (take)
++			en75_whnat_up_take_fallback++;
+ 		return NF_ACCEPT;
++	}
+ 
+ 	/* en75_qdma_xmit() calls netif_tx_stop_all_queues(skb->dev) when the ring
+ 	 * fills, and the completion wakes skb->dev, so the copies cannot go out
+@@ -1631,6 +1649,8 @@
+ 		if (!txdev) {
+ 			en75_whnat_up_err++;
+ 			en75_whnat_up_err_txdev++;
++			if (take)
++				en75_whnat_up_take_fallback++;
+ 			return NF_ACCEPT;
+ 		}
+ 		txdev_held = true;
+@@ -1640,7 +1660,7 @@
+ 	/* Send the same frame whnat_up_dup times. One packet of real traffic then
+ 	 * produces enough injections to show up against the background noise --
+ 	 * with a handful of copies the counters say nothing. */
+-	dup = READ_ONCE(en75_whnat_up_dup);
++	dup = take ? 1 : READ_ONCE(en75_whnat_up_dup);
+ 	if (dup < 1)
+ 		dup = 1;
+ 
+@@ -1657,6 +1677,8 @@
+ 		if (!inj) {
+ 			en75_whnat_up_err++;
+ 			en75_whnat_up_err_copy++;
++			if (take)
++				en75_whnat_up_take_fallback++;
+ 			break;
+ 		}
+ 
+@@ -1664,6 +1686,8 @@
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
+ 			en75_whnat_up_err_headroom++;
++			if (take)
++				en75_whnat_up_take_fallback++;
+ 			break;
+ 		}
+ 		skb_push(inj, mac_len);
+@@ -1730,6 +1754,8 @@
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
+ 			en75_whnat_up_err_xmit++;
++			if (take)
++				en75_whnat_up_take_fallback++;
+ 			break;		/* ring is full; stop pushing */
+ 		}
+ 
+@@ -1739,6 +1765,13 @@
+ 				skb->dev ? skb->dev->name : "?",
+ 				txdev ? txdev->name : "no netdev (BQL bypassed)",
+ 				inj->len);
++		if (take) {
++			en75_whnat_up_take_ok++;
++			if (txdev_held)
++				dev_put(txdev);
++			consume_skb(skb);
++			return NF_STOLEN;
++		}
+ 	}
+ 
+ 	if (txdev_held)

@@ -1,0 +1,88 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: resume PPE misses on the source WiFi vif
+
+PPE returns an external-interface miss to QDMA0 CPU with the injected
+0x8100/VirIfIdx classifier still present. Strip the private tag, restore the AP
+vif as the receive device, and mark the skb to bypass the ingress hook exactly
+once. This completes the OEM-style CPU to PPE to CPU ping-pong without routing
+the returned frame through the DSA conduit.
+
+Also treat the all-ones 14-bit entry marker as invalid in the exact tracker.
+
+---
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -211,6 +211,7 @@
+  * en75_qdma_xmit() and the completion path guard for it. See econet_qdma.c for
+  * why the NAPI dummy netdev is not an option. */
+ #define EN75_WHNAT_UP_MARK	0x57555050U /* "WUPP": probe completion cookie */
++#define EN75_WHNAT_UP_RETURN_MARK 0x57555052U /* "WUPR": bypass ingress once */
+ 
+ /* PON seam -- see econet_qdma.c. Used by the econet-xpon module. */
+ int en75_qdma_register_pon_rx(struct en75_qdma *qdma,
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1505,7 +1505,7 @@
+ 	WRITE_ONCE(en75_whnat_up_rx_last_hash, hash);
+ 	if (crsn < EN75_WHNAT_UP_TRACK_CRSN)
+ 		atomic_inc(&en75_whnat_up_crsn_hist[crsn]);
+-	if (hash < EN75_PPE_FOE_NUM)
++	if (hash < EN75_PPE_FOE_NUM && hash != 0x3fff)
+ 		atomic_inc(&en75_whnat_up_hash_valid);
+ 	pr_info_ratelimited("XR500v WHNAT track RX: strict=%u %pI4 -> %pI4 proto=%u id=%u l4=%08x sport=%u crsn=%u hash=%u msg=%08x/%08x\n",
+ 			    strict, &key.sip, &key.dip, key.proto,
+@@ -1567,6 +1567,13 @@
+ 		    READ_ONCE(en75_whnat_up_imm);
+ 	u16 vid;
+ 
++	/* A PPE miss is re-injected on its source WiFi vif by QDMA RX below. It
++	 * must pass this ingress hook exactly once without being sent back to PPE. */
++	if (unlikely(skb->mark == EN75_WHNAT_UP_RETURN_MARK)) {
++		skb->mark = 0;
++		return NF_ACCEPT;
++	}
++
+ 	/* priv carries the vif index this hook was attached for = OEM VirIfIdx */
+ 	vid = (en75_whnat_up_vid == 0xffff) ? (u16)(uintptr_t)priv
+ 					    : (u16)en75_whnat_up_vid;
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -11,6 +11,7 @@
+ #include <net/page_pool/helpers.h>
+ #include <linux/skbuff.h>
+ #include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
+ #include <net/dsa.h>
+ #include <linux/platform_device.h>
+ #include <linux/of_reserved_mem.h>
+@@ -801,6 +801,30 @@
+ 	}
+ 
+ 	sport = get_erx_sport(&desc.msg.erx);
++	/* OEM PpeExtIfRxHandler ping-pong: a WiFi ingress miss/unbind returns from
++	 * PPE to QDMA0 CPU with the 0x8100/VirIfIdx tag we inserted on TX. Strip
++	 * that private classifier and resume receive processing on the original AP
++	 * vif, not on the DSA conduit. Mark it so the netdev-ingress hook accepts
++	 * the return once instead of creating a CPU<->PPE loop. The 0x16 bound
++	 * force-to-WiFi path was handled above and is deliberately excluded. */
++	if (sport == ETX_FPORT_QDMA0_CPU && skb->len >= 18 &&
++	    get_erx_crsn(&desc.msg.erx) !=
++		MTK_PPE_CPU_REASON_HIT_BIND_FORCE_TO_CPU &&
++	    get_unaligned_be16(skb->data + 12) == ETH_P_8021Q) {
++		u16 vif = get_unaligned_be16(skb->data + 14) & 0xfff;
++		struct net_device *wdev = en75_wifi_vif_cached(vif_cache, vif);
++
++		if (wdev) {
++			memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
++			skb_pull(skb, VLAN_HLEN);
++			skb->mark = EN75_WHNAT_UP_RETURN_MARK;
++			skb->dev = wdev;
++			skb->protocol = eth_type_trans(skb, wdev);
++			napi_gro_receive(&q->napi, skb);
++			return;
++		}
++	}
++
+ 	en75_icmp_phase_rx(q, skb, cpu_i, sport,
+ 			   q - &q->qdma->q_rx[0]);
+ 

@@ -1,0 +1,324 @@
+--- a/econet_ppe.c	2026-08-05 05:17:58.054620143 -0300
++++ b/econet_ppe.c	2026-08-05 06:30:07.908558598 -0300
+@@ -6,14 +6,20 @@
+  * entries into it. Indexing uses the 80B stride, NOT an array of (oversized)
+  * structs. */
+ #include "econet_ppe.h"
++#include "econet_eth.h"		/* en75_qdma_xmit() for the upstream probe */
++#include "qdma_desc.h"		/* desc_msg / set_etx_* / ETX_FPORT_PPE */
+ #include <linux/atomic.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/delay.h>
+ #include <linux/etherdevice.h>
+ #include <linux/export.h>	/* EXPORT_SYMBOL for the WHNAT vif registry (F1) */
+ #include <linux/netdevice.h>	/* dev_hold/dev_put/dev_queue_xmit (WHNAT) */
++#include <linux/netfilter.h>	/* ingress hook for the WHNAT upstream probe */
++#include <linux/netfilter_netdev.h>
+ #include <linux/io.h>
+ #include <linux/ip.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
+ #include <linux/slab.h>
+ #include <linux/swab.h>
+ #include <linux/unaligned.h>
+@@ -1281,6 +1287,211 @@
+ static struct net_device *en75_wifi_vif[EN75_WHNAT_MAX_VIFS];
+ static DEFINE_SPINLOCK(en75_wifi_vif_lock);
+ 
++/* ===================================================================== */
++/* WHNAT upstream probe (phase 1): will the PPE process a frame the CPU   */
++/* hands it?                                                              */
++/*                                                                        */
++/* The downstream half of WHNAT works because the PPE sees the packet on   */
++/* one of its own ethernet ports, does the NAT in hardware and force-to-   */
++/* CPUs the result. Upstream has no such path: a frame born on the air     */
++/* reaches mt76 and from there the CPU carries it the whole way -- bridge, */
++/* flowtable, NAT, PPPoE encap, DSA tag, QDMA -- which is why the upload   */
++/* runs at software-forwarding speed (~200 Mbps) while the download does   */
++/* 519.                                                                    */
++/*                                                                        */
++/* The TX descriptor has ETX_FPORT_PPE, so the silicon can be handed a     */
++/* frame for the PPE to look up. Whether it actually does anything with    */
++/* one that came from the CPU is the single unknown the whole idea rests   */
++/* on, and it is cheap to answer -- so answer it before writing the real   */
++/* hook.                                                                   */
++/*                                                                        */
++/* This injects a COPY and lets the original continue down the slow path.  */
++/* If the PPE forwards it, the far end sees a duplicate (harmless, TCP     */
++/* drops it) and the WAN counters move; if the PPE ignores it, nothing is  */
++/* lost. Off by default and capped, so a failure cannot break the link.    */
++/* ===================================================================== */
++bool en75_whnat_up_probe;		/* gate; nothing happens until set */
++unsigned int en75_whnat_up_max = 32;	/* stop after this many injections */
++unsigned int en75_whnat_up_raw;		/* every frame the hook saw, unfiltered */
++unsigned int en75_whnat_up_seen;	/* candidate frames the hook saw */
++unsigned int en75_whnat_up_inj;		/* copies handed to the PPE */
++unsigned int en75_whnat_up_err;		/* copies we could not hand over */
++unsigned int en75_whnat_up_fraglist;	/* aggregated frames skipped (see below) */
++unsigned int en75_whnat_up_dup = 1;	/* injections per frame, to beat the noise */
++char en75_whnat_up_txif[IFNAMSIZ] = "lan3";
++
++static struct nf_hook_ops *en75_whnat_ing_ops[EN75_WHNAT_MAX_VIFS];
++
++static unsigned int en75_whnat_ingress(void *priv, struct sk_buff *skb,
++				       const struct nf_hook_state *state)
++{
++	union desc_msg msg = {0};
++	struct netdev_queue *txq;
++	struct net_device *txdev;
++	struct sk_buff *inj;
++	int mac_len, ret;
++	unsigned int dup, i;
++
++	if (!READ_ONCE(en75_whnat_up_probe))
++		return NF_ACCEPT;
++
++	/* Counted before any filtering, so "the hook never runs" and "the hook
++	 * runs but nothing matches" are distinguishable. */
++	en75_whnat_up_raw++;
++	if (en75_whnat_up_raw == 1)
++		pr_info("econet-eth: WHNAT ingress live on %s: proto=%04x pkt_type=%u\n",
++			skb->dev ? skb->dev->name : "?",
++			ntohs(skb->protocol), skb->pkt_type);
++
++	/* Only the traffic that could be offloaded: IPv4.
++	 *
++	 * Note there is deliberately NO PACKET_HOST test. These devices sit in
++	 * br-wlab, and a frame from a client is addressed to the bridge's MAC,
++	 * not to the AP netdev's -- so eth_type_trans() marks it
++	 * PACKET_OTHERHOST and the bridge fixes that up later. Filtering on
++	 * PACKET_HOST here drops everything. */
++	if (skb->protocol != htons(ETH_P_IP))
++		return NF_ACCEPT;
++
++	en75_whnat_up_seen++;
++
++	if (en75_whnat_up_inj >= READ_ONCE(en75_whnat_up_max))
++		return NF_ACCEPT;
++	if (!en75_whnat_probe_qdma)
++		return NF_ACCEPT;
++
++	/* skb_copy() returns NULL for aggregated frames (SKB_GSO_FRAGLIST), which
++	 * mt76/mac80211 hands us plenty of -- WARN_ON_ONCE in skbuff.c. Skip them
++	 * here rather than counting them as failures; the real hook will have to
++	 * deal with them, since they are exactly the high-throughput ones. */
++	if (skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) {
++		en75_whnat_up_fraglist++;
++		return NF_ACCEPT;
++	}
++
++	/* Ingress runs after eth_type_trans() pulled the L2 header; the PPE needs
++	 * the complete frame, so this is how much has to go back on. */
++	mac_len = skb->data - skb_mac_header(skb);
++	if (mac_len <= 0)
++		return NF_ACCEPT;
++
++	/* en75_qdma_xmit() calls netif_tx_stop_all_queues(skb->dev) when the ring
++	 * fills, and the completion wakes skb->dev. Handing it the AP netdev would
++	 * stop the WiFi queues with nothing to ever wake them -- the same shape as
++	 * the stall patch 396 fixed -- so the copies go out pointing at an
++	 * ethernet port. */
++	txdev = dev_get_by_name(&init_net, en75_whnat_up_txif);
++	if (!txdev) {
++		en75_whnat_up_err++;
++		return NF_ACCEPT;
++	}
++	txq = netdev_get_tx_queue(txdev, 0);
++
++	/* Send the same frame whnat_up_dup times. One packet of real traffic then
++	 * produces enough injections to show up against the background noise --
++	 * with a handful of copies the counters say nothing. */
++	dup = READ_ONCE(en75_whnat_up_dup);
++	if (dup < 1)
++		dup = 1;
++
++	for (i = 0; i < dup; i++) {
++		if (en75_whnat_up_inj >= READ_ONCE(en75_whnat_up_max))
++			break;
++
++		inj = skb_copy(skb, GFP_ATOMIC);
++		if (!inj) {
++			en75_whnat_up_err++;
++			break;
++		}
++
++		if (mac_len > skb_headroom(inj)) {
++			kfree_skb(inj);
++			en75_whnat_up_err++;
++			break;
++		}
++		skb_push(inj, mac_len);
++
++		inj->dev = txdev;
++		skb_set_queue_mapping(inj, 0);
++
++		/* Channel 0 / queue 0 on purpose: normal traffic uses other queues,
++		 * so chan_ctrs0 gives these injections a near-exclusive counter. */
++		set_etx_channel(&msg.etx, 0);
++		set_etx_queue(&msg.etx, 0);
++		set_etx_fport(&msg.etx, ETX_FPORT_PPE);
++
++		/* BQL has to balance. The completion path calls
++		 *	netdev_tx_completed_queue(txq, 1, skb->len)
++		 * unconditionally, and dql_completed() BUG_ON()s when asked to
++		 * complete bytes that were never queued -- on MIPS that is a trap,
++		 * so it panics in interrupt context and reboots the board.
++		 * Injecting without the matching sent_queue() does exactly that;
++		 * same accounting bug patch 397 fixed from the other side. */
++		netdev_tx_sent_queue(txq, inj->len);
++
++		ret = en75_qdma_xmit(en75_whnat_probe_qdma, inj, &msg, 0);
++		if (ret < 0) {
++			netdev_tx_completed_queue(txq, 1, inj->len);	/* undo */
++			kfree_skb(inj);
++			en75_whnat_up_err++;
++			break;		/* ring is full; stop pushing */
++		}
++
++		en75_whnat_up_inj++;
++		if (en75_whnat_up_inj == 1)
++			pr_info("econet-eth: WHNAT upstream probe: first frame handed to the PPE (dev=%s -> %s, %d bytes)\n",
++				skb->dev ? skb->dev->name : "?",
++				en75_whnat_up_txif, inj->len);
++	}
++
++	dev_put(txdev);	/* skb->dev stays a weak pointer, as everywhere */
++
++	return NF_ACCEPT;	/* the original keeps going through the slow path */
++}
++
++/* Attach on vif registration. This has to be an ingress hook rather than an
++ * rx_handler: the AP netdev sits in a bridge, and the bridge already owns the
++ * one rx_handler slot a device has. It is also where the flowtable hooks in,
++ * so we see the frame at the same point it does. */
++static void en75_whnat_ingress_attach(struct net_device *dev, int idx)
++{
++	struct nf_hook_ops *ops;
++
++	if (en75_whnat_ing_ops[idx])
++		return;
++
++	ops = kzalloc(sizeof(*ops), GFP_KERNEL);
++	if (!ops)
++		return;
++
++	ops->hook = en75_whnat_ingress;
++	ops->pf = NFPROTO_NETDEV;
++	ops->hooknum = NF_NETDEV_INGRESS;
++	ops->priority = INT_MIN;	/* before the flowtable */
++	ops->dev = dev;
++
++	if (nf_register_net_hook(dev_net(dev), ops)) {
++		kfree(ops);
++		return;
++	}
++
++	en75_whnat_ing_ops[idx] = ops;
++	pr_info("econet-eth: WHNAT ingress hook on %s (vif %d)\n", dev->name, idx);
++}
++
++static void en75_whnat_ingress_detach(struct net_device *dev, int idx)
++{
++	struct nf_hook_ops *ops = en75_whnat_ing_ops[idx];
++
++	if (!ops)
++		return;
++
++	en75_whnat_ing_ops[idx] = NULL;
++	if (dev)
++		nf_unregister_net_hook(dev_net(dev), ops);
++	kfree(ops);
++}
++
+ void en75_whnat_register_vif(struct net_device *dev, int idx)
+ {
+ 	struct net_device *old = NULL;
+@@ -1299,6 +1510,11 @@
+ 
+ 	if (old)
+ 		dev_put(old);
++
++	/* process context here (mt76 add_interface), so registering the hook,
++	 * which takes a mutex, is safe */
++	en75_whnat_ingress_attach(dev, idx);
++
+ 	pr_info("econet-eth: WHNAT vif[%d] = %s (%pM)\n",
+ 		idx, dev->name, dev->dev_addr);
+ }
+@@ -1319,6 +1535,7 @@
+ 	spin_unlock_irqrestore(&en75_wifi_vif_lock, flags);
+ 
+ 	if (old) {
++		en75_whnat_ingress_detach(old, idx);
+ 		pr_info("econet-eth: WHNAT vif[%d] released (%s)\n", idx, old->name);
+ 		dev_put(old);
+ 	}
+@@ -1340,9 +1557,12 @@
+ 	}
+ 	spin_unlock_irqrestore(&en75_wifi_vif_lock, flags);
+ 
+-	for (i = 0; i < EN75_WHNAT_MAX_VIFS; i++)
+-		if (old[i])
++	for (i = 0; i < EN75_WHNAT_MAX_VIFS; i++) {
++		if (old[i]) {
++			en75_whnat_ingress_detach(old[i], i);
+ 			dev_put(old[i]);
++		}
++	}
+ }
+ 
+ /* idx -> netdev with an EXTRA hold; the caller dev_put()s after dev_queue_xmit */
+--- a/econet_ppe.h	2026-08-05 05:17:58.054620143 -0300
++++ b/econet_ppe.h	2026-08-05 06:30:07.908558598 -0300
+@@ -7,6 +7,7 @@
+ #define __ECONET_PPE_H
+ 
+ #include <linux/bitfield.h>
++#include <linux/if.h>		/* IFNAMSIZ (WHNAT upstream probe egress name) */
+ #include <linux/if_ether.h>
+ 
+ /* OEM hw_nat.ko runs 16384 entries: the static gPpeFoeNum=0x2000 in .data is
+@@ -327,6 +328,19 @@
+ /* ===================================================================== */
+ #define EN75_WHNAT_MAX_VIFS	16	/* = OEM HWNAT_WLAN_IF_MAXNUM */
+ 
++/* WHNAT upstream probe (phase 1): does the PPE act on a frame from the CPU?
++ * Defined in econet_ppe.c, exposed as module params from econet_eth.c. */
++extern struct en75_qdma *en75_whnat_probe_qdma;
++extern bool en75_whnat_up_probe;
++extern unsigned int en75_whnat_up_max;
++extern unsigned int en75_whnat_up_raw;
++extern unsigned int en75_whnat_up_seen;
++extern unsigned int en75_whnat_up_inj;
++extern unsigned int en75_whnat_up_err;
++extern unsigned int en75_whnat_up_fraglist;
++extern unsigned int en75_whnat_up_dup;
++extern char en75_whnat_up_txif[IFNAMSIZ];
++
+ /* EXPORT_SYMBOL'd -- mt76 (separate module) calls these from add/remove_interface */
+ void en75_whnat_register_vif(struct net_device *dev, int idx);
+ void en75_whnat_unregister_vif(int idx);
+--- a/econet_eth.c	2026-08-05 05:17:58.054620143 -0300
++++ b/econet_eth.c	2026-08-05 06:30:07.908558598 -0300
+@@ -472,6 +472,21 @@
+ module_param(ppe_t_pt, uint, 0644);
+ static unsigned int ppe_t_pseport = 1;	/* 1=GDM1, 7=DISCARD (divert oracle) */
+ module_param(ppe_t_pseport, uint, 0644);
++/* WHNAT upstream probe (phase 1). whnat_up_probe arms it; it injects a COPY of
++ * up to whnat_up_max WiFi frames into the PPE and lets the originals take the
++ * normal software path, so a PPE that ignores them costs nothing. Read the
++ * counters afterwards to see what happened. */
++module_param_named(whnat_up_probe, en75_whnat_up_probe, bool, 0644);
++module_param_named(whnat_up_max, en75_whnat_up_max, uint, 0644);
++module_param_named(whnat_up_raw, en75_whnat_up_raw, uint, 0444);
++module_param_named(whnat_up_seen, en75_whnat_up_seen, uint, 0444);
++module_param_named(whnat_up_inj, en75_whnat_up_inj, uint, 0444);
++module_param_named(whnat_up_err, en75_whnat_up_err, uint, 0444);
++module_param_named(whnat_up_fraglist, en75_whnat_up_fraglist, uint, 0444);
++module_param_named(whnat_up_dup, en75_whnat_up_dup, uint, 0644);
++module_param_string(whnat_up_txif, en75_whnat_up_txif,
++		    sizeof(en75_whnat_up_txif), 0644);
++
+ module_param_named(ppe_rxdump, en75_ppe_rxdump, bool, 0644);
+ module_param_named(ppe_fpdump, en75_ppe_fpdump, bool, 0644);
+ module_param_named(ppe_fpdump_bind, en75_ppe_fpdump_bind, bool, 0644);

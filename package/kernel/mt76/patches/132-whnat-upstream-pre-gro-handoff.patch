@@ -1,0 +1,37 @@
+mt76: offer Ethernet RX skbs to WHNAT before GRO
+
+The existing netdev ingress hook sees mt76 traffic only after
+napi_gro_receive(), when high-rate traffic is commonly a non-linear fraglist.
+Give the optional econet-eth hook each fully-decapsulated Ethernet skb from
+mt76_rx_complete() immediately before GRO.  Resolve the symbol once per NAPI
+batch and preserve the normal path unless the hook explicitly takes ownership.
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1505,6 +1505,8 @@ void mt76_rx_complete(struct mt76_dev *de
+ 	struct ieee80211_hw *hw;
+ 	struct sk_buff *skb, *tmp;
+ 	LIST_HEAD(list);
++	bool (*whnat_early)(struct sk_buff *skb);
++	extern bool en75_whnat_upstream_early(struct sk_buff *skb);
+ 
+ 	spin_lock(&dev->rx_lock);
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+@@ -1531,10 +1533,17 @@ void mt76_rx_complete(struct mt76_dev *de
+ 		return;
+ 	}
+ 
++	/* Optional EN751221 WiFi-to-PPE handoff. Resolve once per NAPI batch,
++	 * rather than once per skb, and keep mt76 independent of econet-eth. */
++	whnat_early = symbol_get(en75_whnat_upstream_early);
+ 	list_for_each_entry_safe(skb, tmp, &list, list) {
+ 		skb_list_del_init(skb);
++		if (whnat_early && whnat_early(skb))
++			continue;
+ 		napi_gro_receive(napi, skb);
+ 	}
++	if (whnat_early)
++		symbol_put(en75_whnat_upstream_early);
+ }
+ 
+ void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,

@@ -1,0 +1,194 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: retain a window of WHNAT return keys
+
+QDMA TX and PPE-return interrupts are asynchronous, so a single last-packet
+cookie loses attribution under bursts. Keep 64 outstanding keys, consume the
+matching key on RX, and expose reset/dump triggers for an exact CRSN histogram.
+
+---
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -362,6 +362,8 @@
+ void en75_whnat_up_track_injected(struct sk_buff *skb);
+ void en75_whnat_up_track_received(struct sk_buff *skb, u8 sport, u8 crsn,
+ 				  u16 hash, u32 msg0, u32 msg1);
++void en75_whnat_up_track_dump(void);
++void en75_whnat_up_track_reset(void);
+ 
+ /* EXPORT_SYMBOL'd -- mt76 (separate module) calls these from add/remove_interface */
+ void en75_whnat_register_vif(struct net_device *dev, int idx);
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -514,6 +514,44 @@
+ module_param_named(whnat_up_rx_last_sport, en75_whnat_up_rx_last_sport, uint, 0444);
+ module_param_named(whnat_up_rx_last_hash, en75_whnat_up_rx_last_hash, uint, 0444);
+ 
++static int whnat_up_track_dump_set(const char *val,
++				   const struct kernel_param *kp)
++{
++	bool run;
++
++	if (kstrtobool(val, &run))
++		return -EINVAL;
++	if (run)
++		en75_whnat_up_track_dump();
++	return 0;
++}
++
++static int whnat_up_track_reset_set(const char *val,
++				    const struct kernel_param *kp)
++{
++	bool run;
++
++	if (kstrtobool(val, &run))
++		return -EINVAL;
++	if (run)
++		en75_whnat_up_track_reset();
++	return 0;
++}
++
++static const struct kernel_param_ops whnat_up_track_dump_ops = {
++	.set = whnat_up_track_dump_set,
++	.get = param_get_int,
++};
++static const struct kernel_param_ops whnat_up_track_reset_ops = {
++	.set = whnat_up_track_reset_set,
++	.get = param_get_int,
++};
++static int whnat_up_track_dump_v, whnat_up_track_reset_v;
++module_param_cb(whnat_up_track_dump, &whnat_up_track_dump_ops,
++		&whnat_up_track_dump_v, 0200);
++module_param_cb(whnat_up_track_reset, &whnat_up_track_reset_ops,
++		&whnat_up_track_reset_v, 0200);
++
+ static int whnat_up_imm_set(const char *val, const struct kernel_param *kp)
+ {
+ 	bool enable;
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1366,8 +1366,15 @@
+ 	bool valid;
+ };
+ 
++#define EN75_WHNAT_UP_TRACK_SLOTS	64
++#define EN75_WHNAT_UP_TRACK_CRSN		32
++
+ static DEFINE_SPINLOCK(en75_whnat_up_key_lock);
+-static struct en75_whnat_up_key en75_whnat_up_last_key;
++static struct en75_whnat_up_key
++	en75_whnat_up_keys[EN75_WHNAT_UP_TRACK_SLOTS];
++static u8 en75_whnat_up_key_next;
++static atomic_t en75_whnat_up_crsn_hist[EN75_WHNAT_UP_TRACK_CRSN];
++static atomic_t en75_whnat_up_hash_valid = ATOMIC_INIT(0);
+ bool en75_whnat_up_track;
+ unsigned int en75_whnat_up_track_tx;
+ unsigned int en75_whnat_up_rx_cookie;
+@@ -1419,12 +1426,14 @@
+ {
+ 	struct en75_whnat_up_key key;
+ 	unsigned long flags;
++	u8 slot;
+ 
+ 	if (!READ_ONCE(en75_whnat_up_track) ||
+ 	    !en75_whnat_up_parse_key(skb, &key))
+ 		return;
+ 	spin_lock_irqsave(&en75_whnat_up_key_lock, flags);
+-	en75_whnat_up_last_key = key;
++	slot = en75_whnat_up_key_next++ & (EN75_WHNAT_UP_TRACK_SLOTS - 1);
++	en75_whnat_up_keys[slot] = key;
+ 	spin_unlock_irqrestore(&en75_whnat_up_key_lock, flags);
+ 	WRITE_ONCE(en75_whnat_up_track_tx, READ_ONCE(en75_whnat_up_track_tx) + 1);
+ 	pr_info_ratelimited("XR500v WHNAT track TX: %pI4 -> %pI4 proto=%u id=%u l4=%08x\n",
+@@ -1438,12 +1447,37 @@
+ 	struct en75_whnat_up_key key, want;
+ 	unsigned long flags;
+ 	bool cookie, strict;
++	int i, loose = -1, match = -1;
+ 
+ 	if (!READ_ONCE(en75_whnat_up_track) ||
+ 	    !en75_whnat_up_parse_key(skb, &key))
+ 		return;
+ 	spin_lock_irqsave(&en75_whnat_up_key_lock, flags);
+-	want = en75_whnat_up_last_key;
++	/* TX and PPE-return interrupts are asynchronous. Remember a small window
++	 * instead of only the latest TX key, otherwise a burst overwrites the key
++	 * before its matching return reaches QDMA RX. Prefer a strict address
++	 * match, but retain the old cookie-only fallback for a future NAT rewrite. */
++	for (i = 0; i < EN75_WHNAT_UP_TRACK_SLOTS; i++) {
++		struct en75_whnat_up_key *cand = &en75_whnat_up_keys[i];
++
++		if (!cand->valid || key.proto != cand->proto ||
++		    key.ip_id != cand->ip_id || key.l4 != cand->l4)
++			continue;
++		if (key.sip == cand->sip && key.dip == cand->dip) {
++			match = i;
++			break;
++		}
++		if (loose < 0)
++			loose = i;
++	}
++	if (match < 0)
++		match = loose;
++	if (match >= 0) {
++		want = en75_whnat_up_keys[match];
++		en75_whnat_up_keys[match].valid = false;
++	} else {
++		memset(&want, 0, sizeof(want));
++	}
+ 	spin_unlock_irqrestore(&en75_whnat_up_key_lock, flags);
+ 	if (!want.valid)
+ 		return;
+@@ -1461,12 +1495,53 @@
+ 	WRITE_ONCE(en75_whnat_up_rx_last_crsn, crsn);
+ 	WRITE_ONCE(en75_whnat_up_rx_last_sport, sport);
+ 	WRITE_ONCE(en75_whnat_up_rx_last_hash, hash);
++	if (crsn < EN75_WHNAT_UP_TRACK_CRSN)
++		atomic_inc(&en75_whnat_up_crsn_hist[crsn]);
++	if (hash < EN75_PPE_FOE_NUM)
++		atomic_inc(&en75_whnat_up_hash_valid);
+ 	pr_info_ratelimited("XR500v WHNAT track RX: strict=%u %pI4 -> %pI4 proto=%u id=%u l4=%08x sport=%u crsn=%u hash=%u msg=%08x/%08x\n",
+ 			    strict, &key.sip, &key.dip, key.proto,
+ 			    ntohs(key.ip_id), be32_to_cpu(key.l4), sport, crsn,
+ 			    hash, msg0, msg1);
+ }
+ 
++void en75_whnat_up_track_dump(void)
++{
++	int i, v;
++
++	pr_info("XR500v WHNAT exact: tx=%u cookie=%u strict=%u valid_hash=%d\n",
++		READ_ONCE(en75_whnat_up_track_tx),
++		READ_ONCE(en75_whnat_up_rx_cookie),
++		READ_ONCE(en75_whnat_up_rx_strict),
++		atomic_read(&en75_whnat_up_hash_valid));
++	for (i = 0; i < EN75_WHNAT_UP_TRACK_CRSN; i++) {
++		v = atomic_read(&en75_whnat_up_crsn_hist[i]);
++		if (v)
++			pr_info("XR500v WHNAT exact crsn[%02x]=%d\n", i, v);
++	}
++}
++
++void en75_whnat_up_track_reset(void)
++{
++	unsigned long flags;
++	int i;
++
++	spin_lock_irqsave(&en75_whnat_up_key_lock, flags);
++	memset(en75_whnat_up_keys, 0, sizeof(en75_whnat_up_keys));
++	en75_whnat_up_key_next = 0;
++	spin_unlock_irqrestore(&en75_whnat_up_key_lock, flags);
++	WRITE_ONCE(en75_whnat_up_track_tx, 0);
++	WRITE_ONCE(en75_whnat_up_rx_cookie, 0);
++	WRITE_ONCE(en75_whnat_up_rx_strict, 0);
++	WRITE_ONCE(en75_whnat_up_rx_last_crsn, 0);
++	WRITE_ONCE(en75_whnat_up_rx_last_sport, 0);
++	WRITE_ONCE(en75_whnat_up_rx_last_hash, 0);
++	atomic_set(&en75_whnat_up_hash_valid, 0);
++	for (i = 0; i < EN75_WHNAT_UP_TRACK_CRSN; i++)
++		atomic_set(&en75_whnat_up_crsn_hist[i], 0);
++	pr_info("XR500v WHNAT exact: reset\n");
++}
++
+ static struct nf_hook_ops *en75_whnat_ing_ops[EN75_WHNAT_MAX_VIFS];
+ 
+ static unsigned int en75_whnat_ingress(void *priv, struct sk_buff *skb,

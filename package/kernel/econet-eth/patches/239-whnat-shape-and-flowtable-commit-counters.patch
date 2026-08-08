@@ -1,0 +1,75 @@
+econet-eth: distinguish pre-GRO skb fragments and count flowtable commits
+
+The pre-GRO handoff proved that GRO fraglists are no longer involved, but
+modern mac80211 deliberately keeps most A-MSDU payload in page fragments.
+Expose separate frag_list, nr_frags and maximum-nr_frags counters so that this
+hardware limit is visible without packet logging.
+
+Also account successful flowtable RX commits in the existing RX_COMMIT
+diagnostic.  The commit was previously visible only through rate-limited trace
+messages, leaving the summary counter at zero.
+
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -532,5 +532,11 @@ module_param_named(whnat_up_early_fallbac
+ module_param_named(whnat_up_early_nonlinear,
+ 		   en75_whnat_up_early_nonlinear, uint, 0444);
++module_param_named(whnat_up_early_fraglist,
++		   en75_whnat_up_early_fraglist, uint, 0444);
++module_param_named(whnat_up_early_frags,
++		   en75_whnat_up_early_frags, uint, 0444);
++module_param_named(whnat_up_early_nr_frags_max,
++		   en75_whnat_up_early_nr_frags_max, uint, 0444);
+ module_param_named(whnat_up_track, en75_whnat_up_track, bool, 0644);
+ module_param_named(whnat_up_track_tx, en75_whnat_up_track_tx, uint, 0444);
+ module_param_named(whnat_up_rx_cookie, en75_whnat_up_rx_cookie, uint, 0444);
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -835,5 +835,6 @@ void en75_ppe_ft_rx_bind(struct en75_ppe
+ 				e->hash = hash;
+ 				en75_foe_entry_commit(ppe, &fin, hash);
++				en75_ppe_diag_event(EN75_PPE_DIAG_RX_COMMIT);
+ 				ppe_trace_rl("XR500v FT(380) RX-bind slot=%u %08x:%u->%08x:%u (preserve-key)\n",
+ 						    hash, sip, sport, dip, dport);
+ 				return;
+@@ -1374,6 +1374,9 @@ unsigned int en75_whnat_up_early_seen;
+ unsigned int en75_whnat_up_early_taken;
+ unsigned int en75_whnat_up_early_fallback;
+ unsigned int en75_whnat_up_early_nonlinear;
++unsigned int en75_whnat_up_early_fraglist;
++unsigned int en75_whnat_up_early_frags;
++unsigned int en75_whnat_up_early_nr_frags_max;
+ 
+ /* A low-noise acceptance oracle. Global CRSN histograms are dominated by
+  * unrelated physical-port traffic, so remember the exact last injected IPv4
+@@ -1880,6 +1883,18 @@ bool en75_whnat_upstream_early(struct sk_
+ 		WRITE_ONCE(en75_whnat_up_early_nonlinear,
+ 			   READ_ONCE(en75_whnat_up_early_nonlinear) + 1);
+ 
++	if (skb_has_frag_list(skb))
++		WRITE_ONCE(en75_whnat_up_early_fraglist,
++			   READ_ONCE(en75_whnat_up_early_fraglist) + 1);
++	if (skb_shinfo(skb)->nr_frags) {
++		unsigned int nr = skb_shinfo(skb)->nr_frags;
++
++		WRITE_ONCE(en75_whnat_up_early_frags,
++			   READ_ONCE(en75_whnat_up_early_frags) + 1);
++		if (nr > READ_ONCE(en75_whnat_up_early_nr_frags_max))
++			WRITE_ONCE(en75_whnat_up_early_nr_frags_max, nr);
++	}
++
+ 	idx = en75_whnat_idx_by_dev(skb->dev);
+ 	if (idx < 0) {
+ 		WRITE_ONCE(en75_whnat_up_early_fallback,
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -373,6 +373,9 @@ extern unsigned int en75_whnat_up_early_s
+ extern unsigned int en75_whnat_up_early_taken;
+ extern unsigned int en75_whnat_up_early_fallback;
+ extern unsigned int en75_whnat_up_early_nonlinear;
++extern unsigned int en75_whnat_up_early_fraglist;
++extern unsigned int en75_whnat_up_early_frags;
++extern unsigned int en75_whnat_up_early_nr_frags_max;
+ bool en75_whnat_upstream_early(struct sk_buff *skb);
+ extern bool en75_whnat_up_track;
+ extern unsigned int en75_whnat_up_track_tx;

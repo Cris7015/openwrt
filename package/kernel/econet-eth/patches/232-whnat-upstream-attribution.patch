@@ -1,0 +1,268 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: attribute WHNAT upstream errors and PPE returns
+
+Guarantee headroom for the OEM VLAN with skb_copy_expand(), split injection
+errors by cause, and add an optional exact-packet RX oracle. The latter records
+the IPv4 ID plus ICMP id/sequence or TCP/UDP ports of the most recent injected
+copy and looks for that identity on QDMA RX, avoiding unrelated CRSN histogram
+noise.
+
+---
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -338,6 +338,10 @@
+ extern unsigned int en75_whnat_up_inj;
+ extern unsigned int en75_whnat_up_done;
+ extern unsigned int en75_whnat_up_err;
++extern unsigned int en75_whnat_up_err_copy;
++extern unsigned int en75_whnat_up_err_headroom;
++extern unsigned int en75_whnat_up_err_xmit;
++extern unsigned int en75_whnat_up_err_txdev;
+ extern unsigned int en75_whnat_up_fraglist;
+ extern unsigned int en75_whnat_up_dup;
+ extern char en75_whnat_up_txif[IFNAMSIZ];
+@@ -347,6 +351,17 @@
+ extern unsigned int en75_whnat_up_tag;
+ extern unsigned int en75_whnat_up_vid;
+ extern bool en75_whnat_up_imm;
++extern bool en75_whnat_up_track;
++extern unsigned int en75_whnat_up_track_tx;
++extern unsigned int en75_whnat_up_rx_cookie;
++extern unsigned int en75_whnat_up_rx_strict;
++extern unsigned int en75_whnat_up_rx_last_crsn;
++extern unsigned int en75_whnat_up_rx_last_sport;
++extern unsigned int en75_whnat_up_rx_last_hash;
++
++void en75_whnat_up_track_injected(struct sk_buff *skb);
++void en75_whnat_up_track_received(struct sk_buff *skb, u8 sport, u8 crsn,
++				  u16 hash, u32 msg0, u32 msg1);
+ 
+ /* EXPORT_SYMBOL'd -- mt76 (separate module) calls these from add/remove_interface */
+ void en75_whnat_register_vif(struct net_device *dev, int idx);
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -493,6 +493,10 @@
+ module_param_named(whnat_up_inj, en75_whnat_up_inj, uint, 0444);
+ module_param_named(whnat_up_done, en75_whnat_up_done, uint, 0444);
+ module_param_named(whnat_up_err, en75_whnat_up_err, uint, 0444);
++module_param_named(whnat_up_err_copy, en75_whnat_up_err_copy, uint, 0444);
++module_param_named(whnat_up_err_headroom, en75_whnat_up_err_headroom, uint, 0444);
++module_param_named(whnat_up_err_xmit, en75_whnat_up_err_xmit, uint, 0444);
++module_param_named(whnat_up_err_txdev, en75_whnat_up_err_txdev, uint, 0444);
+ module_param_named(whnat_up_fraglist, en75_whnat_up_fraglist, uint, 0444);
+ module_param_named(whnat_up_dup, en75_whnat_up_dup, uint, 0644);
+ module_param_string(whnat_up_txif, en75_whnat_up_txif,
+@@ -502,6 +506,13 @@
+ module_param_named(whnat_up_fport, en75_whnat_up_fport, uint, 0644);
+ module_param_named(whnat_up_tag, en75_whnat_up_tag, uint, 0644);
+ module_param_named(whnat_up_vid, en75_whnat_up_vid, uint, 0644);
++module_param_named(whnat_up_track, en75_whnat_up_track, bool, 0644);
++module_param_named(whnat_up_track_tx, en75_whnat_up_track_tx, uint, 0444);
++module_param_named(whnat_up_rx_cookie, en75_whnat_up_rx_cookie, uint, 0444);
++module_param_named(whnat_up_rx_strict, en75_whnat_up_rx_strict, uint, 0444);
++module_param_named(whnat_up_rx_last_crsn, en75_whnat_up_rx_last_crsn, uint, 0444);
++module_param_named(whnat_up_rx_last_sport, en75_whnat_up_rx_last_sport, uint, 0444);
++module_param_named(whnat_up_rx_last_hash, en75_whnat_up_rx_last_hash, uint, 0444);
+ 
+ static int whnat_up_imm_set(const char *val, const struct kernel_param *kp)
+ {
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1318,6 +1318,10 @@
+ unsigned int en75_whnat_up_inj;		/* copies handed to the PPE */
+ unsigned int en75_whnat_up_done;	/* marked copies recycled by QDMA */
+ unsigned int en75_whnat_up_err;		/* copies we could not hand over */
++unsigned int en75_whnat_up_err_copy;	/* copy/expand allocation failed */
++unsigned int en75_whnat_up_err_headroom;	/* invariant failure after expansion */
++unsigned int en75_whnat_up_err_xmit;	/* QDMA ring rejected the copy */
++unsigned int en75_whnat_up_err_txdev;	/* optional BQL A/B netdev missing */
+ unsigned int en75_whnat_up_fraglist;	/* aggregated frames skipped (see below) */
+ unsigned int en75_whnat_up_dup = 1;	/* injections per frame, to beat the noise */
+ char en75_whnat_up_txif[IFNAMSIZ] = "lan3";
+@@ -1345,10 +1349,124 @@
+  * (QDMA0_HWF) is known to complete from this same ring while 4 never does, so
+  * sweeping 0..7 says whether the rejection is specific to port 4 or a class. */
+ unsigned int en75_whnat_up_fport = ETX_FPORT_PPE;
+-unsigned int en75_whnat_up_tag;
++unsigned int en75_whnat_up_tag = 2;	/* OEM PpeExtIfRxHandler: 0x8100/VirIfIdx */
+ unsigned int en75_whnat_up_vid = 0xffff;	/* 0xffff = use the vif index */
+ bool en75_whnat_up_imm;			/* OEM QDMA self-completion; default off */
+ 
++/* A low-noise acceptance oracle. Global CRSN histograms are dominated by
++ * unrelated physical-port traffic, so remember the exact last injected IPv4
++ * packet and look for that packet on QDMA RX. For ICMP the cookie is id+seq;
++ * for TCP/UDP it is the port pair. This is diagnostic-only and defaults off. */
++struct en75_whnat_up_key {
++	__be32 sip;
++	__be32 dip;
++	__be32 l4;
++	__be16 ip_id;
++	u8 proto;
++	bool valid;
++};
++
++static DEFINE_SPINLOCK(en75_whnat_up_key_lock);
++static struct en75_whnat_up_key en75_whnat_up_last_key;
++bool en75_whnat_up_track;
++unsigned int en75_whnat_up_track_tx;
++unsigned int en75_whnat_up_rx_cookie;
++unsigned int en75_whnat_up_rx_strict;
++unsigned int en75_whnat_up_rx_last_crsn;
++unsigned int en75_whnat_up_rx_last_sport;
++unsigned int en75_whnat_up_rx_last_hash;
++
++static bool en75_whnat_up_parse_key(const struct sk_buff *skb,
++				    struct en75_whnat_up_key *key)
++{
++	struct iphdr iph;
++	__be16 proto;
++	int ipoff = ETH_HLEN;
++	int l4off;
++
++	if (skb_copy_bits(skb, 2 * ETH_ALEN, &proto, sizeof(proto)))
++		return false;
++	if (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
++		if (skb_copy_bits(skb, 2 * ETH_ALEN + VLAN_HLEN,
++				  &proto, sizeof(proto)))
++			return false;
++		ipoff += VLAN_HLEN;
++	}
++	if (proto != htons(ETH_P_IP) ||
++	    skb_copy_bits(skb, ipoff, &iph, sizeof(iph)) ||
++	    iph.version != 4 || iph.ihl < 5)
++		return false;
++
++	l4off = ipoff + iph.ihl * 4;
++	memset(key, 0, sizeof(*key));
++	key->sip = iph.saddr;
++	key->dip = iph.daddr;
++	key->ip_id = iph.id;
++	key->proto = iph.protocol;
++	/* ICMP type/code/checksum can be rewritten independently; id+seq are the
++	 * stable four bytes. TCP/UDP use their source/destination port pair. */
++	if (iph.protocol == IPPROTO_ICMP)
++		l4off += 4;
++	if (iph.protocol == IPPROTO_ICMP || iph.protocol == IPPROTO_TCP ||
++	    iph.protocol == IPPROTO_UDP)
++		if (skb_copy_bits(skb, l4off, &key->l4, sizeof(key->l4)))
++			return false;
++	key->valid = true;
++	return true;
++}
++
++void en75_whnat_up_track_injected(struct sk_buff *skb)
++{
++	struct en75_whnat_up_key key;
++	unsigned long flags;
++
++	if (!READ_ONCE(en75_whnat_up_track) ||
++	    !en75_whnat_up_parse_key(skb, &key))
++		return;
++	spin_lock_irqsave(&en75_whnat_up_key_lock, flags);
++	en75_whnat_up_last_key = key;
++	spin_unlock_irqrestore(&en75_whnat_up_key_lock, flags);
++	WRITE_ONCE(en75_whnat_up_track_tx, READ_ONCE(en75_whnat_up_track_tx) + 1);
++	pr_info_ratelimited("XR500v WHNAT track TX: %pI4 -> %pI4 proto=%u id=%u l4=%08x\n",
++			    &key.sip, &key.dip, key.proto, ntohs(key.ip_id),
++			    be32_to_cpu(key.l4));
++}
++
++void en75_whnat_up_track_received(struct sk_buff *skb, u8 sport, u8 crsn,
++				  u16 hash, u32 msg0, u32 msg1)
++{
++	struct en75_whnat_up_key key, want;
++	unsigned long flags;
++	bool cookie, strict;
++
++	if (!READ_ONCE(en75_whnat_up_track) ||
++	    !en75_whnat_up_parse_key(skb, &key))
++		return;
++	spin_lock_irqsave(&en75_whnat_up_key_lock, flags);
++	want = en75_whnat_up_last_key;
++	spin_unlock_irqrestore(&en75_whnat_up_key_lock, flags);
++	if (!want.valid)
++		return;
++
++	cookie = key.proto == want.proto && key.ip_id == want.ip_id &&
++		 key.l4 == want.l4;
++	if (!cookie)
++		return;
++	strict = key.sip == want.sip && key.dip == want.dip;
++	WRITE_ONCE(en75_whnat_up_rx_cookie,
++		   READ_ONCE(en75_whnat_up_rx_cookie) + 1);
++	if (strict)
++		WRITE_ONCE(en75_whnat_up_rx_strict,
++			   READ_ONCE(en75_whnat_up_rx_strict) + 1);
++	WRITE_ONCE(en75_whnat_up_rx_last_crsn, crsn);
++	WRITE_ONCE(en75_whnat_up_rx_last_sport, sport);
++	WRITE_ONCE(en75_whnat_up_rx_last_hash, hash);
++	pr_info_ratelimited("XR500v WHNAT track RX: strict=%u %pI4 -> %pI4 proto=%u id=%u l4=%08x sport=%u crsn=%u hash=%u msg=%08x/%08x\n",
++			    strict, &key.sip, &key.dip, key.proto,
++			    ntohs(key.ip_id), be32_to_cpu(key.l4), sport, crsn,
++			    hash, msg0, msg1);
++}
++
+ static struct nf_hook_ops *en75_whnat_ing_ops[EN75_WHNAT_MAX_VIFS];
+ 
+ static unsigned int en75_whnat_ingress(void *priv, struct sk_buff *skb,
+@@ -1437,6 +1555,7 @@
+ 		txdev = dev_get_by_name(&init_net, en75_whnat_up_txif);
+ 		if (!txdev) {
+ 			en75_whnat_up_err++;
++			en75_whnat_up_err_txdev++;
+ 			return NF_ACCEPT;
+ 		}
+ 		txdev_held = true;
+@@ -1454,15 +1573,22 @@
+ 		if (en75_whnat_up_inj >= READ_ONCE(en75_whnat_up_max))
+ 			break;
+ 
+-		inj = skb_copy(skb, GFP_ATOMIC);
++		/* skb_copy() preserves the original headroom. RX frames often have
++		 * exactly ETH_HLEN bytes after eth_type_trans(), which is four bytes
++		 * short once the OEM VLAN is inserted. Expand explicitly so those
++		 * frames are not misreported as random injection failures. */
++		inj = skb_copy_expand(skb, mac_len + (tag ? VLAN_HLEN : 0), 0,
++				      GFP_ATOMIC);
+ 		if (!inj) {
+ 			en75_whnat_up_err++;
++			en75_whnat_up_err_copy++;
+ 			break;
+ 		}
+ 
+ 		if (mac_len + (tag ? VLAN_HLEN : 0) > skb_headroom(inj)) {
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
++			en75_whnat_up_err_headroom++;
+ 			break;
+ 		}
+ 		skb_push(inj, mac_len);
+@@ -1520,6 +1646,7 @@
+ 		 * usable third option. */
+ 		if (txq)
+ 			netdev_tx_sent_queue(txq, inj->len);
++		en75_whnat_up_track_injected(inj);
+ 
+ 		ret = en75_qdma_xmit(en75_whnat_probe_qdma, inj, &msg, 0);
+ 		if (ret < 0) {
+@@ -1527,6 +1654,7 @@
+ 				netdev_tx_completed_queue(txq, 1, inj->len); /* undo */
+ 			kfree_skb(inj);
+ 			en75_whnat_up_err++;
++			en75_whnat_up_err_xmit++;
+ 			break;		/* ring is full; stop pushing */
+ 		}
+ 
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -662,6 +662,9 @@
+ 	hash = get_erx_ppe_entry(&desc.msg.erx);
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
++	en75_whnat_up_track_received(skb, get_erx_sport(&desc.msg.erx),
++				       get_erx_crsn(&desc.msg.erx), hash,
++				       desc.msg.raw[0], desc.msg.raw[1]);
+ 	/* PPE RX: optional crsn/ppe_entry diagnostic + the bind hook. On the
+ 	 * EN751221 the steered-but-unbound crsn is NO_FLOW(0x07) (mainline uses
+ 	 * HIT_UNBIND_RATE_REACHED(0x0f) -- accept both). 'hash' is the RAW engine
+

@@ -1,0 +1,178 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] econet: add original-skb WiFi upstream takeover
+
+The diagnostic takeover copies every skb and frees the original after QDMA
+accepts the copy. That proves ownership and forwarding but keeps the full
+allocation/copy cost on every packet.
+
+Add an opt-in OEM-style path that prepares the original skb with linearization
+and writable headroom when needed, pushes the L2 header and classifier, transfers
+that skb directly to QDMA, and lets the completion own it. If the descriptor
+reserve rejects the transfer, restore the skb byte-for-byte and fail open through
+the normal network stack. Preparation costs and failures have separate counters.
+
+---
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -1362,6 +1362,12 @@
+ bool en75_whnat_up_take;
+ unsigned int en75_whnat_up_take_ok;
+ unsigned int en75_whnat_up_take_fallback;
++bool en75_whnat_up_zerocopy;
++unsigned int en75_whnat_up_zerocopy_ok;
++unsigned int en75_whnat_up_zerocopy_fallback;
++unsigned int en75_whnat_up_zerocopy_linearized;
++unsigned int en75_whnat_up_zerocopy_cow;
++unsigned int en75_whnat_up_zerocopy_prepare_err;
+ 
+ /* A low-noise acceptance oracle. Global CRSN histograms are dominated by
+  * unrelated physical-port traffic, so remember the exact last injected IPv4
+@@ -1560,10 +1566,13 @@
+ 	union desc_msg msg = {0};
+ 	struct netdev_queue *txq;
+ 	struct net_device *txdev;
++	struct net_device *orig_dev = NULL;
+ 	struct sk_buff *inj;
+ 	int mac_len, ret;
+ 	unsigned int dup, i;
+-	bool txdev_held;
++	unsigned int orig_mark = 0;
++	u16 orig_qmap = 0;
++	bool txdev_held, zerocopy;
+ 	unsigned int tag = READ_ONCE(en75_whnat_up_tag);
+ 	bool take = READ_ONCE(en75_whnat_up_take) &&
+ 		    READ_ONCE(en75_whnat_up_imm);
+@@ -1677,22 +1686,55 @@
+ 		if (en75_whnat_up_inj >= READ_ONCE(en75_whnat_up_max))
+ 			break;
+ 
+-		/* skb_copy() preserves the original headroom. RX frames often have
+-		 * exactly ETH_HLEN bytes after eth_type_trans(), which is four bytes
+-		 * short once the OEM VLAN is inserted. Expand explicitly so those
+-		 * frames are not misreported as random injection failures. */
+-		inj = skb_copy_expand(skb, mac_len + (tag ? VLAN_HLEN : 0), 0,
+-				      GFP_ATOMIC);
+-		if (!inj) {
+-			en75_whnat_up_err++;
+-			en75_whnat_up_err_copy++;
+-			if (take)
++		/* In takeover mode the OEM transfers the original skb to QDMA; making
++		 * and then freeing a full copy costs most of the acceleration. Keep the
++		 * zero-copy path opt-in until hardware testing proves every fallback.
++		 * Prepare the original storage in-place; if this or the ring reserve
++		 * fails, the skb remains valid for the normal fail-open path. */
++		zerocopy = take && READ_ONCE(en75_whnat_up_zerocopy);
++		if (zerocopy) {
++			bool need_cow;
++			unsigned int need = mac_len + (tag ? VLAN_HLEN : 0);
++
++			if (skb_is_nonlinear(skb)) {
++				if (skb_linearize(skb)) {
++					en75_whnat_up_zerocopy_prepare_err++;
++					en75_whnat_up_zerocopy_fallback++;
++					en75_whnat_up_take_fallback++;
++					break;
++				}
++				en75_whnat_up_zerocopy_linearized++;
++			}
++			need_cow = skb_headroom(skb) < need || skb_header_cloned(skb);
++			if (skb_cow_head(skb, need)) {
++				en75_whnat_up_zerocopy_prepare_err++;
++				en75_whnat_up_zerocopy_fallback++;
+ 				en75_whnat_up_take_fallback++;
+-			break;
++				break;
++			}
++			if (need_cow)
++				en75_whnat_up_zerocopy_cow++;
++			inj = skb;
++			orig_dev = skb->dev;
++			orig_mark = skb->mark;
++			orig_qmap = skb_get_queue_mapping(skb);
++		} else {
++			/* Diagnostic/copy mode needs extra room for the OEM VLAN tag. */
++			inj = skb_copy_expand(skb,
++					      mac_len + (tag ? VLAN_HLEN : 0), 0,
++					      GFP_ATOMIC);
++			if (!inj) {
++				en75_whnat_up_err++;
++				en75_whnat_up_err_copy++;
++				if (take)
++					en75_whnat_up_take_fallback++;
++				break;
++			}
+ 		}
+ 
+ 		if (mac_len + (tag ? VLAN_HLEN : 0) > skb_headroom(inj)) {
+-			kfree_skb(inj);
++			if (!zerocopy)
++				kfree_skb(inj);
+ 			en75_whnat_up_err++;
+ 			en75_whnat_up_err_headroom++;
+ 			if (take)
+@@ -1761,7 +1803,19 @@
+ 		if (ret < 0) {
+ 			if (txq)
+ 				netdev_tx_completed_queue(txq, 1, inj->len); /* undo */
+-			kfree_skb(inj);
++			if (zerocopy) {
++				if (tag) {
++					memmove(inj->data + VLAN_HLEN, inj->data,
++						2 * ETH_ALEN);
++					skb_pull(inj, VLAN_HLEN);
++				}
++				skb_pull(inj, mac_len);
++				inj->dev = orig_dev;
++				inj->mark = orig_mark;
++				skb_set_queue_mapping(inj, orig_qmap);
++			} else {
++				kfree_skb(inj);
++			}
+ 			if (ret == -EAGAIN)
+ 				en75_whnat_up_backpressure++;
+ 			else {
+@@ -1783,7 +1837,10 @@
+ 			en75_whnat_up_take_ok++;
+ 			if (txdev_held)
+ 				dev_put(txdev);
+-			consume_skb(skb);
++			if (zerocopy)
++				en75_whnat_up_zerocopy_ok++;
++			else
++				consume_skb(skb);
+ 			return NF_STOLEN;
+ 		}
+ 	}
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -356,6 +356,12 @@
+ extern bool en75_whnat_up_take;
+ extern unsigned int en75_whnat_up_take_ok;
+ extern unsigned int en75_whnat_up_take_fallback;
++extern bool en75_whnat_up_zerocopy;
++extern unsigned int en75_whnat_up_zerocopy_ok;
++extern unsigned int en75_whnat_up_zerocopy_fallback;
++extern unsigned int en75_whnat_up_zerocopy_linearized;
++extern unsigned int en75_whnat_up_zerocopy_cow;
++extern unsigned int en75_whnat_up_zerocopy_prepare_err;
+ extern bool en75_whnat_up_track;
+ extern unsigned int en75_whnat_up_track_tx;
+ extern unsigned int en75_whnat_up_rx_cookie;
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -511,6 +511,15 @@
+ module_param_named(whnat_up_take, en75_whnat_up_take, bool, 0644);
+ module_param_named(whnat_up_take_ok, en75_whnat_up_take_ok, uint, 0444);
+ module_param_named(whnat_up_take_fallback, en75_whnat_up_take_fallback, uint, 0444);
++module_param_named(whnat_up_zerocopy, en75_whnat_up_zerocopy, bool, 0644);
++module_param_named(whnat_up_zerocopy_ok, en75_whnat_up_zerocopy_ok, uint, 0444);
++module_param_named(whnat_up_zerocopy_fallback,
++		   en75_whnat_up_zerocopy_fallback, uint, 0444);
++module_param_named(whnat_up_zerocopy_linearized,
++		   en75_whnat_up_zerocopy_linearized, uint, 0444);
++module_param_named(whnat_up_zerocopy_cow, en75_whnat_up_zerocopy_cow, uint, 0444);
++module_param_named(whnat_up_zerocopy_prepare_err,
++		   en75_whnat_up_zerocopy_prepare_err, uint, 0444);
+ module_param_named(whnat_up_track, en75_whnat_up_track, bool, 0644);
+ module_param_named(whnat_up_track_tx, en75_whnat_up_track_tx, uint, 0444);
+ module_param_named(whnat_up_rx_cookie, en75_whnat_up_rx_cookie, uint, 0444);
