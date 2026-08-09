@@ -85,20 +85,12 @@ xr500v_prepare_ubi_overlay() {
 			xr500v_upgrade_fail "ubi0 belongs to mtd$mounted_mtd instead of openwrt_ubi"
 	fi
 
-	if [ -n "$UPGRADE_BACKUP" ]; then
-		if [ ! -d /sys/class/ubi/ubi0 ]; then
-			ubiattach -m "$mtdnum" -d 0 >/dev/console 2>&1 ||
-				xr500v_upgrade_fail "cannot attach openwrt_ubi while preserving configuration; retry with -n only if erasing it is intended"
-		fi
-		volume=$(xr500v_ubi_rootfs_data) ||
-			xr500v_upgrade_fail "rootfs_data is missing while configuration preservation was requested"
-		echo "Preserving the XR500v rootfs_data UBI volume" >&2
-		return 0
-	fi
-
-	# -n has an explicit no-preserve meaning.  Recreate only the dedicated
-	# OpenWrt partition; the OEM slot, active OpenWrt slot and BMT reserve are
-	# separate MTD regions and are never passed to these tools.
+	# Recreate only the dedicated OpenWrt overlay partition on every upgrade.
+	# Keeping rootfs_data wholesale also keeps stale packages, kernel modules
+	# and APK state from the previous SquashFS.  With normal preservation,
+	# restore the standard sysupgrade config archive into the fresh UBIFS below.
+	# The OEM slot, active OpenWrt slot and BMT reserve are separate MTD regions
+	# and are never passed to these tools.
 	if [ -d /sys/class/ubi/ubi0 ]; then
 		ubidetach /dev/ubi_ctrl -d 0 >/dev/console 2>&1 ||
 			xr500v_upgrade_fail "cannot detach openwrt_ubi before reprovisioning"
@@ -120,11 +112,18 @@ xr500v_prepare_ubi_overlay() {
 	mount -t ubifs ubi0:rootfs_data /tmp/.xr500v-ubifs-provision \
 		>/dev/console 2>&1 ||
 		xr500v_upgrade_fail "could not initialize rootfs_data as UBIFS"
+	if [ -n "$UPGRADE_BACKUP" ]; then
+		tar -xzf "$UPGRADE_BACKUP" -C /tmp/.xr500v-ubifs-provision \
+			>/dev/console 2>&1 ||
+			xr500v_upgrade_fail "could not restore the configuration backup"
+		echo "Restored configuration into a fresh XR500v rootfs_data volume" >&2
+	else
+		echo "Reprovisioned the XR500v rootfs_data UBI volume (-n)" >&2
+	fi
 	sync
 	umount /tmp/.xr500v-ubifs-provision >/dev/console 2>&1 ||
 		xr500v_upgrade_fail "could not unmount the initialized rootfs_data"
 	rmdir /tmp/.xr500v-ubifs-provision
-	echo "Reprovisioned the XR500v rootfs_data UBI volume (-n)" >&2
 }
 
 platform_check_image() {
