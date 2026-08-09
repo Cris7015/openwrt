@@ -112,23 +112,14 @@ xr500v_prepare_ubi_overlay() {
 	mount -t ubifs ubi0:rootfs_data /tmp/.xr500v-ubifs-provision \
 		>/dev/console 2>&1 ||
 		xr500v_upgrade_fail "could not initialize rootfs_data as UBIFS"
-	# rootfs_data is the backing store for overlayfs, not the overlay root
-	# itself.  Sysupgrade archives contain paths such as etc/config/network,
-	# so they must be restored below upper/.  Extracting them at the UBIFS
-	# root leaves them invisible after mount_root creates upper/ and work/.
-	mkdir -p /tmp/.xr500v-ubifs-provision/upper \
-		/tmp/.xr500v-ubifs-provision/work ||
-		xr500v_upgrade_fail "could not initialize the overlay directories"
-	# fstools stores the state as a symlink whose target is the enum value.
-	# Mark the freshly provisioned overlay ready so mount_root does not treat it
-	# as an interrupted firstboot and erase the restored upperdir.
-	ln -s 2 /tmp/.xr500v-ubifs-provision/.fs_state ||
-		xr500v_upgrade_fail "could not mark the overlay ready"
 	if [ -n "$UPGRADE_BACKUP" ]; then
-		tar -xzf "$UPGRADE_BACKUP" -C /tmp/.xr500v-ubifs-provision/upper \
-			>/dev/console 2>&1 ||
-			xr500v_upgrade_fail "could not restore the configuration backup"
-		echo "Restored configuration into a fresh XR500v rootfs_data volume" >&2
+		# Follow the normal fstools firstboot contract.  mount_root treats this
+		# UBIFS as pending, deletes everything except sysupgrade.tgz, pivots to
+		# the new overlay and then 80_mount_root extracts the archive through it.
+		cp -f "$UPGRADE_BACKUP" \
+			/tmp/.xr500v-ubifs-provision/sysupgrade.tgz ||
+			xr500v_upgrade_fail "could not stage the configuration backup"
+		echo "Staged configuration in a fresh XR500v rootfs_data volume" >&2
 	else
 		echo "Reprovisioned the XR500v rootfs_data UBI volume (-n)" >&2
 	fi
