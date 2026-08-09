@@ -112,8 +112,15 @@ xr500v_prepare_ubi_overlay() {
 	mount -t ubifs ubi0:rootfs_data /tmp/.xr500v-ubifs-provision \
 		>/dev/console 2>&1 ||
 		xr500v_upgrade_fail "could not initialize rootfs_data as UBIFS"
+	# rootfs_data is the backing store for overlayfs, not the overlay root
+	# itself.  Sysupgrade archives contain paths such as etc/config/network,
+	# so they must be restored below upper/.  Extracting them at the UBIFS
+	# root leaves them invisible after mount_root creates upper/ and work/.
+	mkdir -p /tmp/.xr500v-ubifs-provision/upper \
+		/tmp/.xr500v-ubifs-provision/work ||
+		xr500v_upgrade_fail "could not initialize the overlay directories"
 	if [ -n "$UPGRADE_BACKUP" ]; then
-		tar -xzf "$UPGRADE_BACKUP" -C /tmp/.xr500v-ubifs-provision \
+		tar -xzf "$UPGRADE_BACKUP" -C /tmp/.xr500v-ubifs-provision/upper \
 			>/dev/console 2>&1 ||
 			xr500v_upgrade_fail "could not restore the configuration backup"
 		echo "Restored configuration into a fresh XR500v rootfs_data volume" >&2
