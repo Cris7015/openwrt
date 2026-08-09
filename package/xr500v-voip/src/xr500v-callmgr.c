@@ -141,6 +141,26 @@ static void line_standby_both(void)
 	set_slic_ec(2); lpm_set(1);
 }
 
+/* A channel that goes straight from cold initialization to low-power standby
+ * does not reliably arm the Le9642 hook comparator.  PHONE2/EC_1 then remains
+ * at hook_raw=0 even after the handset is lifted.  Prime each channel with a
+ * short active-feed interval before parking it in standby.  This is needed
+ * once at call-manager startup only; normal hang-up paths use
+ * line_standby_both() directly and therefore do not pulse the line again. */
+static void line_prime_and_standby_both(void)
+{
+	int ec;
+
+	for (ec = 1; ec <= 2; ec++) {
+		set_slic_ec(ec);
+		lpm_set(0);
+		usleep(100000);
+		lpm_set(1);
+		usleep(100000);
+	}
+	set_slic_ec(2);
+}
+
 /* Off-hook / in-call: raise the active feed on the jack the call is on, and
  * re-run audio_setup to wake the codec/ADC. Standby (STATE 0x0c) powers the
  * codec down, so the FIRST call after boot would otherwise establish with no
@@ -275,7 +295,7 @@ int main(void)
 
 	logmsg("starting");
 	leds_off();			/* idle: both PHONE LEDs off */
-	line_standby_both();		/* idle: silent low-power feed on both jacks */
+	line_prime_and_standby_both();	/* cold boot: arm both hook comparators, then idle */
 	for (;;) {
 		struct pollfd pfd;
 		int rc, ringing_now = 0;
