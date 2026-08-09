@@ -119,6 +119,11 @@ xr500v_prepare_ubi_overlay() {
 	mkdir -p /tmp/.xr500v-ubifs-provision/upper \
 		/tmp/.xr500v-ubifs-provision/work ||
 		xr500v_upgrade_fail "could not initialize the overlay directories"
+	# fstools stores the state as a symlink whose target is the enum value.
+	# Mark the freshly provisioned overlay ready so mount_root does not treat it
+	# as an interrupted firstboot and erase the restored upperdir.
+	ln -s 2 /tmp/.xr500v-ubifs-provision/.fs_state ||
+		xr500v_upgrade_fail "could not mark the overlay ready"
 	if [ -n "$UPGRADE_BACKUP" ]; then
 		tar -xzf "$UPGRADE_BACKUP" -C /tmp/.xr500v-ubifs-provision/upper \
 			>/dev/console 2>&1 ||
