@@ -1,0 +1,130 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * TP-Link Archer XR500v v1 kept on the OEM bootloader (tcboot): OpenWrt boots
+ * from slot B of the factory layout (kernel1 + rootfs1) and keeps its overlay
+ * in a dedicated UBI partition. The bootloader, its bad block table, slot A
+ * and the factory data stay where the vendor put them.
+ */
+
+#include "en751221_tplink_archer-xr500v-v1.dts"
+
+/ {
+	model = "TP-Link Archer XR500v v1 (OEM bootloader)";
+
+	chosen {
+		/delete-property/ rootdisk;
+		bootargs = "console=ttyS0,115200 loglevel=4";
+	};
+};
+
+/* There is no U-Boot environment on this layout: the GPON serial number comes
+ * from the MAC address until the OMCI agent applies the one in UCI. */
+&xpon {
+	/delete-property/ nvmem-cells;
+	/delete-property/ nvmem-cell-names;
+};
+
+/* After the OEM bootloader, port 0 (MT7603) only enumerates with the vendor
+ * config-TLP format and a second reset once the PHY is up, both opt-in in
+ * pcie-mediatek. */
+&pcie0 {
+	econet,en751221-port0-quirks;
+};
+
+&nand {
+	econet,bmt;
+	econet,esmt-f50l1g41a-oem-fdm;
+	econet,bmt-write-through;
+	econet,assert-reserve-size = <94>;
+
+	/delete-node/ partitions;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "bootloader";
+			reg = <0x0 0x40000>;
+			read-only;
+		};
+
+		partition@40000 {
+			label = "romfile";
+			reg = <0x40000 0x40000>;
+			read-only;
+		};
+
+		partition@80000 {
+			label = "kernel";
+			reg = <0x80000 0x300000>;
+			read-only;
+		};
+
+		partition@380000 {
+			label = "rootfs_stock";
+			reg = <0x380000 0x1000000>;
+			read-only;
+		};
+
+		partition@1380000 {
+			label = "misc";
+			reg = <0x1380000 0x480000>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* LAN MAC from the label; WAN is +1, Wi-Fi +2. */
+				macaddr_misc_f100: macaddr@f100 {
+					compatible = "mac-base";
+					reg = <0xf100 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+
+				/* Airoha LDD/LA calibration: 100 words, magic 0x07050700 at +0x94. */
+				en7570_cal: calibration@20000 {
+					reg = <0x20000 0x190>;
+				};
+
+				/* MT7662 (5 GHz) EEPROM, for the PCIe radio node. */
+				eeprom_misc_e0000: eeprom@e0000 {
+					reg = <0xe0000 0x200>;
+				};
+			};
+		};
+
+		partition@1800000 {
+			label = "kernel1";
+			reg = <0x1800000 0x300000>;
+		};
+
+		partition@1b00000 {
+			label = "rootfs1";
+			reg = <0x1b00000 0x1000000>;
+			linux,rootfs;
+		};
+
+		partition@2b00000 {
+			label = "others";
+			reg = <0x2b00000 0x4e0000>;
+			read-only;
+		};
+
+		partition@2fe0000 {
+			label = "bootflag";
+			reg = <0x2fe0000 0x20000>;
+			read-only;
+		};
+
+		/* Dedicated OpenWrt overlay in the range the vendor leaves unused,
+		 * apart from the firmware slots and the bad block table reserve. */
+		partition@3000000 {
+			label = "openwrt_ubi";
+			reg = <0x3000000 0x4000000>;
+		};
+	};
+};

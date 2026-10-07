@@ -171,6 +171,29 @@ define Device/tplink_archer-xr500v-v1
 endef
 TARGET_DEVICES += tplink_archer-xr500v-v1
 
+define Device/tplink_archer-xr500v-v1-oem
+  DEVICE_VENDOR := TP-Link
+  DEVICE_MODEL := Archer XR500v
+  DEVICE_VARIANT := v1 (OEM bootloader)
+  DEVICE_DTS := en751221_tplink_archer-xr500v-v1-oem
+  SUPPORTED_DEVICES := tplink,archer-xr500v-v1
+  # Slot B of the OEM layout: kernel1 is 3 MiB. The bootloader LZMA-decompresses
+  # at most 0x2ffe00 bytes there, which is the zboot image plus the DTB; the
+  # zboot then unpacks the real kernel itself (double compression).
+  KERNEL_SIZE := 3072k
+  KERNEL := kernel-bin | append-dtb | lzma
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | uImage none
+  BLOCKSIZE := 128k
+  DEVICE_PACKAGES := kmod-usb3 kmod-mt7603 kmod-mt76x2 wpad-basic-mbedtls \
+    omci-agent kmod-usb-ledtrig-usbport \
+    kmod-wireguard wireguard-tools luci-proto-wireguard
+  IMAGES := sysupgrade.bin
+  IMAGE/sysupgrade.bin := append-kernel | check-size 0x2ffe00 | \
+    pad-to $$$$(KERNEL_SIZE) | append-rootfs | check-size 0x1300000 | \
+    xr500v-trendchip-header | append-metadata
+endef
+TARGET_DEVICES += tplink_archer-xr500v-v1-oem
+
 define Device/zyxel_pmg5617ga
   $(Device/tcboot_trx)
   DEVICE_VENDOR := Zyxel
