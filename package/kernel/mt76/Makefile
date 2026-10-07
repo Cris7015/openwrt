@@ -408,7 +408,10 @@ NOSTDINC_FLAGS := \
 	-I$(STAGING_DIR)/usr/include/mac80211/uapi \
 	-I$(STAGING_DIR)/usr/include/mac80211 \
 	-include backport/autoconf.h \
-	-include backport/backport.h
+	-include backport/backport.h \
+	-fmacro-prefix-map=$(STAGING_DIR)/usr/include/mac80211-backport/= \
+	-fmacro-prefix-map=$(STAGING_DIR)/usr/include/mac80211/= \
+	-fmacro-prefix-map=$(PKG_BUILD_DIR)/=
 
 ifdef CONFIG_PACKAGE_MAC80211_MESH
   NOSTDINC_FLAGS += -DCONFIG_MAC80211_MESH
