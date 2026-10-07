@@ -56,6 +56,7 @@ static void ctrl_lost(void)
 	ctrl_s = -1;
 	other_callid[0] = 0; other_kind = OTHER_NONE; recall_pending = 0;
 	finish_owned_call();
+	reg_reset();	/* baresip is gone, and its registrations with it */
 }
 
 /* The handset went on-hook with a second call left: ring the phone for it.
@@ -159,6 +160,8 @@ static void handle_call_event(int s, const char *payload)
 	token = event_string(obj, "token");
 	if (event_true(obj, "response")) {
 		if (token && !strncmp(token, "diag-", 5)) logmsg(payload);
+		if (token && !strcmp(token, "callmgr-reginfo") && event_true(obj, "ok"))
+			reg_reginfo(event_string(obj, "data"));
 		if (token && !strcmp(token, "callmgr-dial") &&
 		    !event_true(obj, "ok") && !*active_callid &&
 		    (state == DIALING || state == ENDING)) {
@@ -171,8 +174,27 @@ static void handle_call_event(int s, const char *payload)
 	type = event_string(obj, "type");
 	id = event_string(obj, "id");
 	direction = event_string(obj, "direction");
-	if (!event_true(obj, "event") || !klass || strcmp(klass, "call") ||
-	    !type || !valid_callid(id)) goto out;
+	if (!event_true(obj, "event") || !klass || !type) goto out;
+	if (!strcmp(klass, "register")) {
+		reg_event(type, event_string(obj, "accountaor"), event_string(obj, "param"));
+		goto out;
+	}
+	if (strcmp(klass, "call")) goto out;
+	if (!valid_callid(id)) {
+		/* A dialog the call manager cannot track would hold one of
+		 * Baresip's call slots for good: reject it. One too long to
+		 * address is still Baresip's current call while this line owns
+		 * none, so hang that up. */
+		if (!strcmp(type, "CALL_INCOMING")) {
+			if (state == IDLE && !*active_callid && !*other_callid) {
+				ctrl_cmd(s, "hangup", NULL);
+				logmsg("INCOMING with an untrackable Call-ID -> rejected");
+			} else {
+				logmsg("INCOMING with an untrackable Call-ID -> ignored (line busy)");
+			}
+		}
+		goto out;
+	}
 	if (!strcmp(type, "CALL_INCOMING")) {
 		if (!strcmp(id, active_callid) || !strcmp(id, other_callid))
 			goto out; /* duplicate event */

@@ -6,7 +6,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=xr500v-voip
-PKG_RELEASE:=11
+PKG_RELEASE:=12
 PKG_BUILD_DEPENDS:=speexdsp
 PKG_LICENSE:=GPL-2.0-or-later BSD-3-Clause
 PKG_MAINTAINER:=Cristian Papa <pcristian292@gmail.com>
