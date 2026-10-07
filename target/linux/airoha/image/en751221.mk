@@ -181,6 +181,7 @@ define Device/tplink_archer-xr500v-v1-oem
   # at most 0x2ffe00 bytes there, which is the zboot image plus the DTB; the
   # zboot then unpacks the real kernel itself (double compression).
   KERNEL_SIZE := 3072k
+  KERNEL_NAME := vmlinuz.bin
   KERNEL := kernel-bin | append-dtb | lzma
   KERNEL_INITRAMFS := kernel-bin | append-dtb | uImage none
   BLOCKSIZE := 128k
