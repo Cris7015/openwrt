@@ -1,0 +1,2 @@
+config whnat 'main'
+	option enabled '0'

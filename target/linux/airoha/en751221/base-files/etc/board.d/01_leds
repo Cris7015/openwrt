@@ -32,6 +32,8 @@ case "$board" in
     ucidef_set_led_netdev "lan3" "lan3" "mt7530-2:02:green:lan" "lan3" "link tx rx"
     ucidef_set_led_netdev "lan2" "lan2" "mt7530-2:03:green:lan" "lan2" "link tx rx"
     ucidef_set_led_netdev "lan1" "lan1" "mt7530-2:04:green:lan" "lan1" "link tx rx"
+    ucidef_set_led_usbport "usb" "USB" "green:usb" "usb1-port1" "usb1-port2" "usb2-port1"
+    # green:internet follows the wan interface: hotplug.d/iface/50-xr500v-internet-led
     ;;
 esac
 

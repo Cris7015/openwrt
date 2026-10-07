@@ -4,13 +4,12 @@ Date: Thu, 17 Sep 2026 18:38:45 -0300
 Subject: [PATCH] airoha: xpon: enable gpon tx after upstream overhead
  detection
 
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_xpon.c | 40 +++++++++++++++++++----
  1 file changed, 33 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
-index 73de8ab5a38d..b45e5ae0463d 100644
+index 73de8ab5a..b45e5ae04 100644
 --- a/drivers/net/ethernet/airoha/airoha_xpon.c
 +++ b/drivers/net/ethernet/airoha/airoha_xpon.c
 @@ -1373,6 +1373,33 @@ static void gpon_cb_set_overhead(void *hw_priv,
@@ -75,6 +74,3 @@ index 73de8ab5a38d..b45e5ae0463d 100644
  err_stop_phy:
  	airoha_xpon_tx_enable(priv->dev, priv->frontend, false);
  	airoha_xpon_phy_stop(priv->dev, priv->phy,
--- 
-2.55.0
-

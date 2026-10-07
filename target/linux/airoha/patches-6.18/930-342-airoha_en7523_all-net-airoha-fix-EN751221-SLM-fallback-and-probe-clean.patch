@@ -6,15 +6,13 @@ Subject: [PATCH] net: airoha: fix EN751221 SLM fallback and probe cleanup
 Do not fail EN751221 QDMA1 initialization when firmware has SLM bypassed. The vendor QDMA_WAN implementation supports a non-SLM DRAM-backed hardware-forwarding mode, and the common EcoNet path already has an equivalent DRAM allocation fallback.
 
 Also track whether QDMA NAPI instances were actually started before stopping them during error unwind. airoha_hw_init() may clean up partially initialized QDMA state before returning an error, leaving qdma->eth set while qdma->econet is gone. Calling airoha_qdma_stop_napi() again then falls into the modern Airoha path and touches uninitialized NAPI structures.
-
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 34 +++++++++++++++++-------
  drivers/net/ethernet/airoha/airoha_eth.h |  1 +
  2 files changed, 26 insertions(+), 9 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
-index 688beff747cd..c2372479624c 100644
+index 688beff74..c23724796 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
 @@ -1337,10 +1337,12 @@ static int econet_en751221_slm_init(struct airoha_qdma_mips *qdma,
@@ -81,7 +79,7 @@ index 688beff747cd..c2372479624c 100644
  	err = airoha_register_gdm_devices(eth);
  	if (err)
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index b96b59393cbb..083cd9ab338b 100644
+index b96b59393..083cd9ab3 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
 @@ -305,6 +305,7 @@ enum {
@@ -92,6 +90,3 @@ index b96b59393cbb..083cd9ab338b 100644
  };
  
  enum {
--- 
-2.55.0
-

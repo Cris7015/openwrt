@@ -9,7 +9,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  1 file changed, 24 insertions(+), 2 deletions(-)
 
 diff --git a/arch/mips/boot/dts/econet/en751221.dtsi b/arch/mips/boot/dts/econet/en751221.dtsi
-index 5bb0c7b04209..2014653ec624 100644
+index 5bb0c7b04..2014653ec 100644
 --- a/arch/mips/boot/dts/econet/en751221.dtsi
 +++ b/arch/mips/boot/dts/econet/en751221.dtsi
 @@ -27,11 +27,33 @@ cpus: cpus {
@@ -56,6 +56,3 @@ index 5bb0c7b04209..2014653ec624 100644
  		interrupt-parent = <&intc>;
  		interrupts = <28>;
  	};
--- 
-2.55.0
-

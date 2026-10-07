@@ -1,0 +1,23 @@
+{
+  "admin/services/xr500v-voip": {
+    "title": "Telephony",
+    "order": 65,
+    "action": { "type": "firstchild" },
+    "depends": { "acl": [ "luci-app-xr500v-voip" ] }
+  },
+  "admin/services/xr500v-voip/status": {
+    "title": "Status",
+    "order": 10,
+    "action": { "type": "view", "path": "xr500v-voip/status" }
+  },
+  "admin/services/xr500v-voip/accounts": {
+    "title": "Accounts",
+    "order": 15,
+    "action": { "type": "view", "path": "xr500v-voip/accounts" }
+  },
+  "admin/services/xr500v-voip/config": {
+    "title": "Configuration",
+    "order": 20,
+    "action": { "type": "view", "path": "xr500v-voip/config" }
+  }
+}

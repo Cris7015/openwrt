@@ -1,0 +1,80 @@
+From f2c0662a56039a629e8db7a97c846b4d1e0edfb0 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 27 Sep 2026 01:12:00 -0300
+Subject: [PATCH] net: omci: never let the identity NVMEM cells keep the PON
+ down
+
+The GPON serial number and registration password can be NVMEM cells,
+such as U-Boot environment variables, so that the first activation after
+boot already uses the identity the ISP has provisioned. The cells are
+optional, yet some of their failures take the xPON device down with
+them:
+
+- a provider that never becomes ready, like a U-Boot environment whose
+  bad CRC keeps its layout from binding, defers the probe forever;
+- a value that cannot be read, or a malformed one such as a mistyped
+  variable, fails the probe;
+- an erased cell (all 0xff or all zeroes) is used as a serial.
+
+Treat them all as "not provisioned": once the driver core says to stop
+waiting for a deferred provider (the deferred probe timeout expired),
+go on without it, warn about unreadable and malformed cells without
+printing the value, and skip erased ones. The driver then uses its own
+identity, as it does without the cells, and userspace can still set the
+provisioned one at run time.
+
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit cc7c9e6702279e6929a25c2571d38f9c8679139e)
+---
+ net/xpon/omci/identity.c | 30 ++++++++++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/net/xpon/omci/identity.c b/net/xpon/omci/identity.c
+index d71cc8caf..0b40aef40 100644
+--- a/net/xpon/omci/identity.c
++++ b/net/xpon/omci/identity.c
+@@ -356,18 +356,40 @@ static int omci_identity_read_cell(struct device *dev,
+ 	size_t len;
+ 	int ret;
+ 
++	/*
++	 * The identity cells are optional: whatever goes wrong with them, the
++	 * PON must still come up with the driver's own identity, which
++	 * userspace can replace at run time. Never log a value, it is a
++	 * registration credential.
++	 */
+ 	cell = nvmem_cell_get(dev, name);
+ 	if (IS_ERR(cell)) {
+ 		ret = PTR_ERR(cell);
+-		if (ret == -ENOENT || ret == -ENODEV || ret == -EOPNOTSUPP)
++		/* Stop waiting for a provider that never becomes ready. */
++		if (ret == -EPROBE_DEFER)
++			ret = driver_deferred_probe_check_state(dev);
++		if (ret == -ENOENT || ret == -ENODEV || ret == -EOPNOTSUPP ||
++		    ret == -ETIMEDOUT)
+ 			return 0;
+ 		return ret;
+ 	}
+ 	data = nvmem_cell_read(cell, &len);
+ 	nvmem_cell_put(cell);
+-	if (IS_ERR(data))
+-		return PTR_ERR(data);
+-	ret = setter(identity, data, len, OMCI_CONFIG_SOURCE_NVMEM);
++	if (IS_ERR(data)) {
++		dev_warn(dev, "cannot read %s NVMEM cell: %pe\n", name, data);
++		return 0;
++	}
++
++	/* An erased cell is not provisioned. */
++	ret = 0;
++	if (len && memchr_inv(data, 0xff, len) && memchr_inv(data, 0, len)) {
++		ret = setter(identity, data, len, OMCI_CONFIG_SOURCE_NVMEM);
++		if (ret == -EINVAL || ret == -E2BIG) {
++			dev_warn(dev, "ignoring malformed %s NVMEM cell (%zu bytes)\n",
++				 name, len);
++			ret = 0;
++		}
++	}
+ 	kfree(data);
+ 	return ret;
+ }

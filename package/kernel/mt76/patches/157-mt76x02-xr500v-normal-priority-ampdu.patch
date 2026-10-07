@@ -1,0 +1,71 @@
+mt76x02: keep tracked AMPDU traffic in EDCA on XR500v
+
+A/B/A and per-packet evidence associate prioritised rate probes with old
+frames arriving after an advanced BA response and peer DELBA. Use the
+validated EDCA policy by default on XR500v, without changing requested
+rates, AMPDU, ACKs, packet IDs or disconnect thresholds.
+Other boards retain original behaviour; qsel_edca=0 restores it here.
+No per-packet recorder is included.
+
+--- a/mt76x02_txrx.c
++++ b/mt76x02_txrx.c
+@@ -5,8 +5,31 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/of.h>
+ 
+ #include "mt76x02.h"
++#include "mt76x02_qsel_policy.h"
++
++/* -1 selects the validated XR500v policy, leaving other boards unchanged.
++ * Keep a load-time override for an explicit rollback; never change rate,
++ * aggregation, packet-id or ACK policy to hide failed transmissions.
++ */
++static int qsel_edca = -1;
++module_param(qsel_edca, int, 0444);
++MODULE_PARM_DESC(qsel_edca, "XR500v tracked AMPDU queue: -1 auto, 0 original, 1 EDCA");
++
++static int __init mt76x02_qsel_init(void)
++{
++	qsel_edca = mt76x02_resolve_qsel(
++		of_machine_is_compatible("tplink,archer-xr500v-v1"), qsel_edca);
++	return qsel_edca < 0 ? -EINVAL : 0;
++}
++module_init(mt76x02_qsel_init);
++
++static void __exit mt76x02_qsel_exit(void)
++{
++}
++module_exit(mt76x02_qsel_exit);
+ 
+ void mt76x02_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
+ 		struct sk_buff *skb)
+@@ -163,7 +186,7 @@
+ 
+ 	txwi->pktid = pid;
+ 
+-	if (mt76_is_skb_pktid(pid) && ampdu)
++	if (mt76x02_use_mgmt_qsel(mt76_is_skb_pktid(pid), ampdu, qsel_edca))
+ 		qsel = MT_QSEL_MGMT;
+ 
+ 	tx_info->info = FIELD_PREP(MT_TXD_INFO_QSEL, qsel) |
+--- /dev/null
++++ b/mt76x02_qsel_policy.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++#ifndef __MT76X02_QSEL_POLICY_H
++#define __MT76X02_QSEL_POLICY_H
++static inline bool mt76x02_use_mgmt_qsel(bool tracked, bool ampdu, bool edca)
++{
++	return tracked && ampdu && !edca;
++}
++static inline int mt76x02_resolve_qsel(bool xr500v, int requested)
++{
++	if (requested == -1)
++		return xr500v;
++	if (requested == 0 || (requested == 1 && xr500v))
++		return requested;
++	return -1;
++}
++#endif

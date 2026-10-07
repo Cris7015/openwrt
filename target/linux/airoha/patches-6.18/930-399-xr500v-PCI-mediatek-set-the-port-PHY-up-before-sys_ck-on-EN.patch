@@ -1,0 +1,95 @@
+From 186c78e60f71d155199a02a4aa9b4e72742130de Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 20 Sep 2026 19:27:10 -0300
+Subject: [PATCH] PCI: mediatek: set the port PHY up before sys_ck on EN7528
+
+The "pcie" clock prepare callback of the EN7528/EN751221 SCU driver ends by
+deasserting PERST#.  mtk_pcie_enable_port() prepares that clock before the
+port PHY is initialised, so the endpoint is let out of reset while its
+reference clock is still unconfigured, which is the reverse of what PCIe CEM
+2.2 (PERST# Signal) asks for.
+
+The MT7662 on port 1 of the TP-Link Archer XR500v tolerates it.  The MT7603 on
+port 0 does not: the link trains, but the endpoint never completes a
+configuration transaction, so it is never enumerated and the 2.4 GHz radio is
+missing.
+
+Bring the PHY up before the clock on the SoCs that need it, selected by a flag
+in the SoC data so the other users of this driver keep the current order.  The
+phy_init() and phy_power_on() calls further down become no-ops, both are
+refcounted by the PHY core.
+
+Tested on an Archer XR500v (EN7526G package, MT7603 on port 0, MT7662 on port
+1) by TFTP-booting an initramfs on 6.18.41, two warm reboots and one cold power
+cycle:
+
+  pci 0000:01:00.0: [14c3:7603] type 00 class 0x028000 PCIe Endpoint
+  mtk-pcie 1fb81000.pcie: port0 link retrained
+  mt7603e 0000:01:00.0: ASIC revision: 76030010
+  mt7603e 0000:01:00.0: firmware init done
+  mt76x2e 0001:01:00.0: Firmware running!
+
+Port 1 is unaffected, and port 0 trains at 0.66 s instead of 1.04 s, since the
+vendor sequence no longer has to be run a second time after the PHY.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+(cherry picked from commit 0b0b879108b7f91ba92215498f3fdfa3252ce8be)
+---
+ drivers/pci/controller/pcie-mediatek.c | 29 ++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/drivers/pci/controller/pcie-mediatek.c b/drivers/pci/controller/pcie-mediatek.c
+index 538b3adf2..232969d2c 100644
+--- a/drivers/pci/controller/pcie-mediatek.c
++++ b/drivers/pci/controller/pcie-mediatek.c
+@@ -163,6 +163,7 @@ struct mtk_pcie_soc {
+ 	bool need_fix_class_id;
+ 	bool need_fix_device_id;
+ 	bool no_msi;
++	bool phy_before_sys_ck;
+ 	unsigned int device_id;
+ 	struct pci_ops *ops;
+ 	int (*startup)(struct mtk_pcie_port *port);
+@@ -922,6 +923,33 @@ static int mtk_pcie_enable_port(struct mtk_pcie_port *port)
+ 	struct device *dev = pcie->dev;
+ 	int err;
+ 
++	/*
++	 * On the EN7528/EN751221 the "pcie" clock prepare callback ends by
++	 * deasserting PERST#, so preparing it before the port PHY is set up
++	 * lets the endpoint out of reset while its reference clock is still
++	 * unconfigured.  PCIe CEM 2.2 asks for the opposite order, and an
++	 * MT7603 on port 0 never answers configuration transactions when it
++	 * is brought up this way.  Set the PHY up first on those SoCs; the
++	 * phy_init()/phy_power_on() calls below are refcounted and become
++	 * no-ops.
++	 */
++	if (pcie->soc->phy_before_sys_ck) {
++		err = phy_init(port->phy);
++		if (err) {
++			dev_err(dev, "failed to initialize port%d phy\n",
++				port->slot);
++			return err;
++		}
++
++		err = phy_power_on(port->phy);
++		if (err) {
++			dev_err(dev, "failed to power on port%d phy\n",
++				port->slot);
++			phy_exit(port->phy);
++			return err;
++		}
++	}
++
+ 	err = clk_prepare_enable(port->sys_ck);
+ 	if (err) {
+ 		dev_err(dev, "failed to enable sys_ck%d clock\n", port->slot);
+@@ -1345,6 +1373,7 @@ static const struct mtk_pcie_soc mtk_pcie_soc_mt7629 = {
+ };
+ 
+ static const struct mtk_pcie_soc mtk_pcie_soc_en7528 = {
++	.phy_before_sys_ck = true,
+ 	.ops = &mtk_pcie_ops_v2,
+ 	.startup = mtk_pcie_startup_port_en7528,
+ 	.setup_irq = mtk_pcie_setup_irq,

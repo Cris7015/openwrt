@@ -1,0 +1,77 @@
+From 2436a095663473f4eb3928cedce61e2c2a10c110 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 27 Sep 2026 01:20:00 -0300
+Subject: [PATCH] mtd: ubi: nvmem: do not read whole static volumes on first
+ open
+
+The first ubi_open_volume() of a static volume runs ubi_check_volume(),
+which reads every LEB to check its data CRC, and the UBI NVMEM provider
+opens the volume for every read. Its consumers only fetch a few bytes
+(MAC addresses, calibration data, Wi-Fi EEPROM) with partial LEB reads,
+which never check the CRC, so the whole read buys them nothing.
+
+On the Archer XR500v the factory data is a 4.5 MiB static volume
+("misc") on an SPI-NAND that reads at ~0.66 MB/s: the first read of the
+Ethernet MAC address holds airoha-eth's probe, and everything after it
+(xPON, DSA, the root filesystem), back by 7.3 s at every boot.
+
+Mark static volumes with an NVMEM layout as checked when the provider
+registers them. NAND ECC still covers every read, and the check only
+sets the "corrupted" flag that sysfs reports: reads do not act on it.
+
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit 07ebaca72f5edae6459e6295a0941d00898b6db3)
+---
+ drivers/mtd/ubi/nvmem.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/mtd/ubi/nvmem.c b/drivers/mtd/ubi/nvmem.c
+index d887c033f..b6f0085bc 100644
+--- a/drivers/mtd/ubi/nvmem.c
++++ b/drivers/mtd/ubi/nvmem.c
+@@ -58,6 +58,37 @@ static int ubi_nvmem_reg_read(void *priv, unsigned int from,
+ 	return 0;
+ }
+ 
++/*
++ * The first ubi_open_volume() of a static volume reads all of it to check
++ * the data CRC of every LEB, and every NVMEM read opens the volume. NVMEM
++ * cells are a few bytes (MAC addresses, calibration data) fetched by
++ * partial LEB reads, which never check the CRC: the whole read buys them
++ * nothing, while on a slow NAND it holds the probe of the first consumer
++ * back for seconds (7 s for a 4.5 MiB volume on EN751221). Consider NVMEM
++ * volumes checked; NAND ECC still covers every read.
++ */
++static void ubi_nvmem_skip_check(struct ubi_volume_info *vi)
++{
++	struct ubi_device *ubi;
++	struct ubi_volume *vol;
++
++	if (vi->vol_type != UBI_STATIC_VOLUME)
++		return;
++
++	ubi = ubi_get_device(vi->ubi_num);
++	if (!ubi)
++		return;
++
++	mutex_lock(&ubi->ckvol_mutex);
++	spin_lock(&ubi->volumes_lock);
++	vol = ubi->volumes[vi->vol_id];
++	if (vol)
++		vol->checked = 1;
++	spin_unlock(&ubi->volumes_lock);
++	mutex_unlock(&ubi->ckvol_mutex);
++	ubi_put_device(ubi);
++}
++
+ static int ubi_nvmem_add(struct ubi_volume_info *vi)
+ {
+ 	struct device_node *np = dev_of_node(vi->dev);
+@@ -98,6 +129,7 @@ static int ubi_nvmem_add(struct ubi_volume_info *vi)
+ 	unv->ubi_num = vi->ubi_num;
+ 	unv->vol_id = vi->vol_id;
+ 	unv->usable_leb_size = vi->usable_leb_size;
++	ubi_nvmem_skip_check(vi);
+ 	unv->nvmem = nvmem_register(&config);
+ 	if (IS_ERR(unv->nvmem)) {
+ 		ret = dev_err_probe(vi->dev, PTR_ERR(unv->nvmem),

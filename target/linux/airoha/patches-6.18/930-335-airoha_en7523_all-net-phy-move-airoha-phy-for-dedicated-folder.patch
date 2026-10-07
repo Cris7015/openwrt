@@ -8,7 +8,6 @@ and add polarity fix for en8801s
 
 Signed-off-by: Matheus Sampaio Queiroga <me@sirherobrine23.com.br>
 Signed-off-by: Matt Eaton <git@divinehawk.com>
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/phy/Kconfig                       | 11 +-----
  drivers/net/phy/Makefile                      |  3 +-
@@ -23,7 +22,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  rename drivers/net/phy/{air_en8811h.c => airoha/en8811h.c} (100%)
 
 diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
-index 44be15e96b42..7ec901de9977 100644
+index 44be15e96..7ec901de9 100644
 --- a/drivers/net/phy/Kconfig
 +++ b/drivers/net/phy/Kconfig
 @@ -170,16 +170,7 @@ config AS21XXX_PHY
@@ -45,7 +44,7 @@ index 44be15e96b42..7ec901de9977 100644
  config AMD_PHY
  	tristate "AMD and Altima PHYs"
 diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
-index 7ce6ac5b354b..b867d5b76a15 100644
+index 7ce6ac5b3..b867d5b76 100644
 --- a/drivers/net/phy/Makefile
 +++ b/drivers/net/phy/Makefile
 @@ -44,8 +44,7 @@ obj-y				+= $(sfp-obj-y) $(sfp-obj-m)
@@ -60,7 +59,7 @@ index 7ce6ac5b354b..b867d5b76a15 100644
  obj-$(CONFIG_AQUANTIA_PHY)	+= aquantia/
 diff --git a/drivers/net/phy/airoha/Kconfig b/drivers/net/phy/airoha/Kconfig
 new file mode 100644
-index 000000000000..c2e0c2cf668c
+index 000000000..c2e0c2cf6
 --- /dev/null
 +++ b/drivers/net/phy/airoha/Kconfig
 @@ -0,0 +1,10 @@
@@ -76,7 +75,7 @@ index 000000000000..c2e0c2cf668c
 +	  Currently supports the Airoha EN8811H PHY.
 diff --git a/drivers/net/phy/airoha/Makefile b/drivers/net/phy/airoha/Makefile
 new file mode 100644
-index 000000000000..ad64ac539280
+index 000000000..ad64ac539
 --- /dev/null
 +++ b/drivers/net/phy/airoha/Makefile
 @@ -0,0 +1,2 @@
@@ -86,7 +85,7 @@ diff --git a/drivers/net/phy/air_en8801s.c b/drivers/net/phy/airoha/en8801s.c
 similarity index 98%
 rename from drivers/net/phy/air_en8801s.c
 rename to drivers/net/phy/airoha/en8801s.c
-index 2ebc7e3257d9..c79914bc0944 100644
+index 2ebc7e325..c79914bc0 100644
 --- a/drivers/net/phy/air_en8801s.c
 +++ b/drivers/net/phy/airoha/en8801s.c
 @@ -1,4 +1,9 @@
@@ -174,6 +173,3 @@ diff --git a/drivers/net/phy/air_en8811h.c b/drivers/net/phy/airoha/en8811h.c
 similarity index 100%
 rename from drivers/net/phy/air_en8811h.c
 rename to drivers/net/phy/airoha/en8811h.c
--- 
-2.55.0
-

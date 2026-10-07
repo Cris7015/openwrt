@@ -3,13 +3,12 @@ From: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 Date: Fri, 18 Sep 2026 16:37:15 -0300
 Subject: [PATCH] airoha: add gn25l98 optical transmitter enable control
 
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/optical/semtech/gn25l95.c | 43 +++++++++++++++++++++++++++
  1 file changed, 43 insertions(+)
 
 diff --git a/drivers/net/optical/semtech/gn25l95.c b/drivers/net/optical/semtech/gn25l95.c
-index 530039bda743..c5e2af7f21ba 100644
+index 530039bda..c5e2af7f2 100644
 --- a/drivers/net/optical/semtech/gn25l95.c
 +++ b/drivers/net/optical/semtech/gn25l95.c
 @@ -106,6 +106,9 @@
@@ -72,6 +71,3 @@ index 530039bda743..c5e2af7f21ba 100644
  	.tx_rearm = gn25l95_frontend_tx_rearm,
  };
  
--- 
-2.55.0
-

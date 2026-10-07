@@ -11,7 +11,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 
 diff --git a/arch/mips/boot/dts/econet/en7580.dtsi b/arch/mips/boot/dts/econet/en7580.dtsi
 new file mode 100644
-index 000000000000..9989d634b0d3
+index 000000000..9989d634b
 --- /dev/null
 +++ b/arch/mips/boot/dts/econet/en7580.dtsi
 @@ -0,0 +1,851 @@
@@ -866,6 +866,3 @@ index 000000000000..9989d634b0d3
 +		};
 +	};
 +};
--- 
-2.55.0
-

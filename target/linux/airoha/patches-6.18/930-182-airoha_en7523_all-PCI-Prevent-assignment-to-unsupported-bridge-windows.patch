@@ -44,7 +44,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  1 file changed, 6 insertions(+)
 
 diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
-index 362321e121ea..115e9381b894 100644
+index 362321e12..115e9381b 100644
 --- a/drivers/pci/probe.c
 +++ b/drivers/pci/probe.c
 @@ -398,6 +398,9 @@ static void pci_read_bridge_io(struct pci_dev *dev, struct resource *res,
@@ -67,6 +67,3 @@ index 362321e121ea..115e9381b894 100644
  	pci_read_config_word(dev, PCI_PREF_MEMORY_BASE, &mem_base_lo);
  	pci_read_config_word(dev, PCI_PREF_MEMORY_LIMIT, &mem_limit_lo);
  	base64 = (mem_base_lo & PCI_PREF_RANGE_MASK) << 16;
--- 
-2.55.0
-

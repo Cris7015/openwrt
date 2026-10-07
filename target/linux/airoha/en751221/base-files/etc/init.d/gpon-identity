@@ -1,0 +1,129 @@
+#!/bin/sh /etc/rc.common
+# The xPON driver reads the GPON serial number from the U-Boot environment
+# when it probes, if the board DT points its "gpon-serial-number" NVMEM cell
+# there. Keep the serial provisioned in UCI (omci.main.serial) in the
+# environment, so the first activation after boot already registers with it
+# instead of the MAC-derived serial that rpcd's omci.agent only replaces some
+# 30 s later (the OLT meanwhile hands out temporary ONU-IDs and deactivates
+# them). The environment mirrors UCI: clearing the option, or a factory
+# reset, removes the variable too. The PLOAM password is not stored.
+
+START=99
+STOP=01
+USE_PROCD=1
+
+GPON_SN_VAR=gpon-serial-number
+
+gpon_identity_wanted() {
+	local f
+
+	command -v fw_setenv >/dev/null || return 1
+	for f in $(find /sys/firmware/devicetree/base -name nvmem-cell-names 2>/dev/null); do
+		grep -qs "$GPON_SN_VAR" "$f" && return 0
+	done
+	return 1
+}
+
+# The copy of the environment the kernel reads is the first UBI volume
+# named ubootenv; fw_printenv reads the newer of the two copies.
+gpon_env_volume() {
+	local v
+
+	for v in /sys/class/ubi/ubi*_*; do
+		[ "$(cat "$v/name" 2>/dev/null)" = ubootenv ] && { echo "/dev/${v##*/}"; return; }
+	done
+}
+
+# The serial in the kernel's copy. Compared in the shell: the value only
+# goes through pipes, never through a command's argv.
+gpon_env_copy_serial() {
+	local vol="$(gpon_env_volume)"
+
+	[ -n "$vol" ] || return 0
+	dd if="$vol" bs=4096 count=1 2>/dev/null | tr '\0' '\n' |
+		sed -n "s/^$GPON_SN_VAR=//p" | head -n 1
+}
+
+gpon_env_copy_has_var() {
+	local vol="$(gpon_env_volume)"
+
+	[ -n "$vol" ] || return 1
+	dd if="$vol" bs=4096 count=1 2>/dev/null | tr '\0' '\n' | grep -q "^$GPON_SN_VAR="
+}
+
+# fw_setenv rewrites only the older of the two redundant copies: run the
+# script twice so that both carry it. The value goes through stdin, never
+# through argv. Never log it.
+gpon_env_write() {
+	local script="$1"
+
+	if printf '%s\n' "$script" | fw_setenv -s - &&
+	   printf '%s\n' "$script" | fw_setenv -s -; then
+		return 0
+	fi
+	logger -t gpon-identity "cannot write the U-Boot environment"
+	return 1
+}
+
+gpon_identity_sync() {
+	local sn vendor
+
+	gpon_identity_wanted || return 0
+	# Never let fw_setenv initialise a blank or corrupt environment: it
+	# would write its own defaults, not U-Boot's.
+	fw_printenv 2>&1 >/dev/null | grep -q "Bad CRC" && return 0
+
+	sn="$(uci -q get omci.main.serial)"
+	vendor="$(uci -q get omci.main.vendor_id)"
+
+	# A vendor ID set apart from the serial replaces its vendor part
+	# (omci.agent applies it after the serial): store the identity the ONU
+	# ends up with, as 4 vendor characters and 8 hex digits.
+	if [ ${#vendor} -eq 4 ]; then
+		case ${#sn} in
+		12) sn="$vendor$(echo "$sn" | cut -c5-)" ;;
+		16) sn="$vendor$(echo "$sn" | cut -c9-)" ;;
+		esac
+	fi
+
+	if [ -z "$sn" ]; then
+		if [ -n "$(fw_printenv -n "$GPON_SN_VAR" 2>/dev/null)" ] || gpon_env_copy_has_var; then
+			gpon_env_write "$GPON_SN_VAR" &&
+				logger -t gpon-identity "removed $GPON_SN_VAR from the U-Boot environment"
+		fi
+		return 0
+	fi
+
+	# 4 vendor characters and 8 hex digits, or 16 hex digits. Anything else
+	# is left to omci.agent at run time (and could not go into a fw_setenv
+	# script safely).
+	case "$sn" in
+	*[!0-9A-Za-z]*) logger -t gpon-identity "omci.main.serial has an unexpected format, not stored"; return 0 ;;
+	esac
+	case ${#sn} in
+	12|16) ;;
+	*) logger -t gpon-identity "omci.main.serial has an unexpected length, not stored"; return 0 ;;
+	esac
+
+	[ "$(fw_printenv -n "$GPON_SN_VAR" 2>/dev/null)" = "$sn" ] &&
+		[ "$(gpon_env_copy_serial)" = "$sn" ] && return 0
+
+	gpon_env_write "$GPON_SN_VAR $sn" &&
+		logger -t gpon-identity "stored $GPON_SN_VAR in the U-Boot environment"
+}
+
+start_service() {
+	gpon_identity_sync
+}
+
+stop_service() {
+	gpon_identity_sync
+}
+
+reload_service() {
+	gpon_identity_sync
+}
+
+service_triggers() {
+	procd_add_reload_trigger omci
+}

@@ -13,7 +13,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  1 file changed, 15 insertions(+)
 
 diff --git a/Documentation/devicetree/bindings/net/airoha,en7523-xpon.yaml b/Documentation/devicetree/bindings/net/airoha,en7523-xpon.yaml
-index debcc59ed474..0a66a44ed97a 100644
+index debcc59ed..0a66a44ed 100644
 --- a/Documentation/devicetree/bindings/net/airoha,en7523-xpon.yaml
 +++ b/Documentation/devicetree/bindings/net/airoha,en7523-xpon.yaml
 @@ -53,6 +53,16 @@ properties:
@@ -59,6 +59,3 @@ index debcc59ed474..0a66a44ed97a 100644
          airoha,scu = <&scuclk>;
          airoha,pon-mode = "gpon";
          airoha,gpon-serial-number = [49 4e 56 50 71 43 86 02];
--- 
-2.55.0
-
