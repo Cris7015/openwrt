@@ -26,9 +26,10 @@
 
 /* After the OEM bootloader, port 0 (MT7603) only enumerates with the vendor
  * config-TLP format and a second reset once the PHY is up, both opt-in in
- * pcie-mediatek. */
+ * pcie-mediatek, which reaches the reference clock through the SCU. */
 &pcie0 {
 	econet,en751221-port0-quirks;
+	econet,en751221-scu = <&scuclk>;
 };
 
 &nand {
