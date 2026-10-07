@@ -1,12 +1,12 @@
 REQUIRE_IMAGE_METADATA=1
-RAMFS_COPY_BIN='fitblk fit_check_sign tr'
+RAMFS_COPY_BIN='fitblk fit_check_sign tr head'
 
 # TP-Link Archer XR500v v1. With the OEM bootloader (tcboot) OpenWrt lives in
 # slot B of the factory layout (kernel1 3 MiB + rootfs1 16 MiB behind the
 # TrendChip header) with a dedicated UBI overlay (openwrt_ubi); the header is
 # validated fail-closed and every write is read back. After the migration to
 # U-Boot the flash is "u-boot" + "ubi" and the image is a FIT in the "fit" UBI
-# volume.
+# volume. The migration itself is in xr500v-migrate.sh.
 xr500v_is_uboot_layout() {
 	[ -n "$(find_mtd_index u-boot)" ] && [ -n "$(find_mtd_index ubi)" ]
 }
@@ -145,6 +145,12 @@ platform_do_upgrade() {
 			fit_do_upgrade "$1"
 			return
 		fi
+		# The U-Boot image on the OEM layout: xr500v-migrate-uboot staged it
+		# (platform_check_image let it through only then).
+		if [ "$(xr500v_image_hex "$1" 0 4)" = "d00dfeed" ]; then
+			xr500v_migrate_stage2 "$1"
+			return
+		fi
 		# fwtool metadata is for sysupgrade validation only.  Strip it before
 		# slicing so the hardware receives the exact BLDR-validated container.
 		fwtool -q -t -i /dev/null "$1" ||
@@ -197,6 +203,11 @@ platform_check_image() {
 		if xr500v_is_uboot_layout; then
 			fit_check_image "$1"
 			return $?
+		fi
+		if [ "$(xr500v_image_hex "$image" 0 4)" = "d00dfeed" ]; then
+			xr500v_migrate_armed "$image" && return 0
+			echo "This image is for OpenWrt's U-Boot: install it with xr500v-migrate-uboot"
+			return 74
 		fi
 		base_image=$(mktemp /tmp/xr500v-image.XXXXXX) || return 1
 		if ! fwtool -q -T -i /dev/null "$image" > "$base_image"; then

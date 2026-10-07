@@ -126,5 +126,19 @@
 			label = "openwrt_ubi";
 			reg = <0x3000000 0x4000000>;
 		};
+
+		/* Only for xr500v-migrate-uboot, which moves the router to the
+		 * U-Boot layout: its "u-boot" and "ubi" partitions over everything
+		 * above, up to the bad block table reserve (the kernel trims
+		 * migrate_ubi when factory bad blocks shorten the device). */
+		migrate-uboot@0 {
+			label = "migrate_uboot";
+			reg = <0x0 0x100000>;
+		};
+
+		migrate-ubi@100000 {
+			label = "migrate_ubi";
+			reg = <0x100000 0x7340000>;
+		};
 	};
 };
