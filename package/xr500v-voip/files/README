@@ -1,0 +1,129 @@
+XR500v dual FXS
+===============
+
+/etc/init.d/voip starts both lines automatically. Audio defaults match the
+tested RAM setup: echo cancellation, mild noise reduction and 50% playback.
+Use /etc/config/xr500v-voip for enable/disable and audio options, then restart
+voip with handsets on-hook. Do not run the old laboratory voip-dual alongside.
+
+Phone1: /dev/xr500v-voice, SIP LAN:5060, ctrl_tcp loopback:4444.
+Phone2: /dev/xr500v-voice1, SIP LAN:5062, ctrl_tcp loopback:4445.
+Each manager owns its ctrl_tcp connection. Diagnostics go through the root-only
+FIFO under /var/run/xr500v-voip/phoneN/control; never displace it with nc.
+
+Persistent configuration:
+  /etc/xr500v-voip/config                 common baresip settings
+  /etc/xr500v-voip/phoneN/accounts.template  @LANIP@ substitution
+  /etc/xr500v-voip/phoneN/accounts        optional exact account-file override
+  /etc/xr500v-voip/phoneN/config          optional per-line settings override
+  /etc/xr500v-voip/phoneN/contacts        optional contacts override
+  /etc/xr500v-voip/phoneN/speeddial       optional URI to dial on lifting
+
+Accounts/config are rendered privately into /var/run/xr500v-voip/phoneN;
+stored files are not overwritten. No test speed dial or ISP credentials are
+shipped. Defaults are local SIP accounts phone1/phone2, regint=0 (no registrar).
+ISP voice provisioning and a general outgoing digit dialplan are not provided
+by this package. A successful local two-phone call does not validate ISP voice.
+
+UCI options (/etc/config/xr500v-voip)
+-------------------------------------
+config voip 'globals'
+  ring_on_ms / ring_off_ms   ring cadence in ms (default 1000 / 4000, AR POTS)
+  ring_prefeed_ms            active feed before the first burst (default 1500, 0-5000;
+                             0 rings straight out of low-power standby)
+  emergency_numbers          dialed immediately, without the 4 s inter-digit wait;
+                             empty by default because it is per country and a
+                             longer number starting with one of them can no longer
+                             be dialed (Argentina: '911 100 101 103 105 106 107 135
+                             142 144')
+  caller_id                  off (default) | v23 | bell202: FSK caller ID in the
+                             pause after the first burst (date and time, the
+                             number or "private"/"unavailable", the name if the
+                             network sends one). The phone's clock is set from
+                             it, so set the router's time zone. EXPERIMENTAL:
+                             the phone it was tested with did not decode it yet
+
+  call_waiting               1 (default) | 0: a call ringing in during a
+                             conversation gets the call waiting tone (425 Hz,
+                             0.2/0.2/0.2 s every 5 s) instead of busy
+  flash_min_ms/flash_max_ms  hook flash window, the R key (80/750; the Movistar
+                             AR HGU uses 120/750). A longer on-hook hangs up,
+                             so with call waiting on, hanging up takes
+                             flash_max_ms instead of 450 ms
+
+config line 'phoneN'
+  enabled        0/1
+  account_mode   local | provider | custom        (phone1 and phone2)
+                 shared                            (phone2 ONLY)
+  idle_feed      standby (default) | active
+  dial_mode      none | keypad | hotline
+  network, username, domain, auth_user, proxy, transport, register,
+  reg_interval, dtmf, hotline, password            (see LuCI -> Telephony)
+
+Call waiting (globals.call_waiting)
+-----------------------------------
+  * R during the tone answers the waiting call; the first one goes on hold
+    (SIP re-INVITE, the far end sees "on hold").
+  * R with one call on hold swaps the two.
+  * Hanging up with a call waiting rings the phone for it; with a call on hold
+    it rings back and lifting resumes that call.
+  * If the far end of the call being talked on hangs up, a held call is
+    resumed at once; a waiting one stays waiting (R answers it).
+  * A waiting call not answered within 30 s is rejected.
+The network must deliver the second INVITE: an operator whose call waiting
+service is off for the line answers the second caller busy itself (Movistar AR
+did on 2026-09-26). scripts/voip-cw-robot.sh places a local second call.
+
+Keys pressed during a call (IVR menus) are detected in the handset audio and
+sent the way the account's dtmf option says (rtpevent = RFC 4733, the
+default; info = SIP INFO; auto = RFC 4733 if the far end offered it). The
+tone itself is muted in the voice sent meanwhile. XR500V_INCALL_DTMF=0 in the
+baresip environment turns this off (the tones then go in-band, as before).
+
+account_mode=shared on phone2: the shared ring group
+----------------------------------------------------
+Both jacks become ONE line, served by phone1's SIP account:
+  * an incoming call rings BOTH bells and blinks BOTH PHONE LEDs;
+  * the first handset lifted takes the call, the other bell stops and its LED
+    goes off; lifting the other handset during the call is ignored (logged
+    once), it does not join, take over or end the call;
+  * lifting either handset while idle gives dial tone and dials on the phone1
+    account (dial_mode/dialing settings of phone1);
+  * phone2 gets NO SIP account, NO baresip and NO call manager: only
+    phone1-sip and phone1-manager run. Applying shared while phone1 has no
+    account_mode is refused and logged; phone2 is then not started at all.
+  * the 1# / 2# local intercom DOES NOT EXIST in this mode -- there is no
+    second account to call. dial_mode must be "none" on the shared port.
+The phone1 manager publishes the answering jack in
+/var/run/xr500v-voip/phone1/audio_device (0600, replaced atomically); the
+baresip "xr500v" module reads it through XR500V_DEVICE_FILE when a call starts
+and opens /dev/xr500v-voice (jack phone1) or /dev/xr500v-voice1 (jack phone2).
+
+idle_feed: silence vs. instant dial tone
+----------------------------------------
+  standby (default)  On hook, the line is parked in SS_LOWPOWER (SLIC STATE
+                     0x0c) with the LPM hook comparator armed. The router's
+                     DC-DC buck-boost runs at light load and is SILENT. Cost:
+                     the line has to be raised to the active feed when the
+                     handset is lifted, so dial tone is a few tens of ms late
+                     and the handset can make a faint "clack" on the edge.
+  active             The line stays at the active feed (STATE 0x23) while on
+                     hook: dial tone is immediate and there is no transition
+                     click. Cost: the buck-boost hisses ("tssss") into the
+                     earpiece while idle, which is exactly the noise standby
+                     was introduced to remove. Use it per line only if the
+                     delay bothers you more than the hiss.
+Set per line: xr500v-voip.phone1.idle_feed / xr500v-voip.phone2.idle_feed, or
+LuCI -> Telephony -> Configuration -> Line feed.
+Related driver experiment: insmod econet-slic dual_soft_offhook=1 makes the
+standby->active edge two-step (switcher LP, active, 20 ms, switcher HP) to
+soften that click. Default 0 = current behaviour. It is skipped automatically
+while the other jack is powered, because the switcher rail is shared.
+
+Legacy single-line accounts.template and contacts are retained for backup;
+custom legacy account settings must be explicitly mapped to phoneN before
+using the new dual service. Check real NAND configuration before sysupgrade.
+The package's keep.d entry preserves the whole configuration directory.
+
+The audio module statically links SpeexDSP; see speexdsp.COPYING for its notice.
+RAM-only checkpoints 0c4839c and 75b4cd8 are retained in the project for rollback.

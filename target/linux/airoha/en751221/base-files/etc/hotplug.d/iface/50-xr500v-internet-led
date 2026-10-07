@@ -1,0 +1,23 @@
+#!/bin/sh
+# Archer XR500v: the Internet LED follows the wan interface whatever its
+# protocol (PPPoE on the fibre, DHCP, static): the netdev trigger on its
+# layer 3 device while it is up (link, tx, rx), off when it goes down.
+
+[ "$INTERFACE" = wan ] || exit 0
+led=/sys/class/leds/green:internet
+[ -d "$led" ] || exit 0
+
+case "$ACTION" in
+ifup)
+	[ -n "$DEVICE" ] || exit 0
+	echo netdev > "$led/trigger"
+	echo "$DEVICE" > "$led/device_name"
+	echo 1 > "$led/link"
+	echo 1 > "$led/tx"
+	echo 1 > "$led/rx"
+	;;
+ifdown)
+	echo none > "$led/trigger"
+	echo 0 > "$led/brightness"
+	;;
+esac

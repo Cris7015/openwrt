@@ -3,14 +3,13 @@ From: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 Date: Thu, 17 Sep 2026 23:27:12 -0300
 Subject: [PATCH] net: dsa: mt7530: fix EN751221 MCM remove path
 
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/dsa/mt7530-mdio.c | 27 ++++++++++++++++++---------
  drivers/net/dsa/mt7530-mmio.c |  7 ++++++-
  2 files changed, 24 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/net/dsa/mt7530-mdio.c b/drivers/net/dsa/mt7530-mdio.c
-index 78551cefea0b..662c46b54cc9 100644
+index 78551cefe..662c46b54 100644
 --- a/drivers/net/dsa/mt7530-mdio.c
 +++ b/drivers/net/dsa/mt7530-mdio.c
 @@ -226,7 +226,12 @@ mt7530_probe(struct mdio_device *mdiodev)
@@ -56,7 +55,7 @@ index 78551cefea0b..662c46b54cc9 100644
  	mt7530_remove_common(priv);
  
 diff --git a/drivers/net/dsa/mt7530-mmio.c b/drivers/net/dsa/mt7530-mmio.c
-index c9c60cae95f2..6737b464aee4 100644
+index c9c60cae9..6737b464a 100644
 --- a/drivers/net/dsa/mt7530-mmio.c
 +++ b/drivers/net/dsa/mt7530-mmio.c
 @@ -85,7 +85,12 @@ mt7988_probe(struct platform_device *pdev)
@@ -73,6 +72,3 @@ index c9c60cae95f2..6737b464aee4 100644
  }
  
  static void mt7988_remove(struct platform_device *pdev)
--- 
-2.55.0
-

@@ -24,13 +24,12 @@ as a diagnostic and the window per lane is still logged.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 (cherry picked from commit 71acb0a1cdccb13c5e01a56b6c42bc9b99613c98)
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/dsa/mt7530.c | 55 +++++++++++++++++++++++++++++++++-------
  1 file changed, 46 insertions(+), 9 deletions(-)
 
 diff --git a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
-index 40d17681ecd4..2b9504751229 100644
+index 40d17681e..2b9504751 100644
 --- a/drivers/net/dsa/mt7530.c
 +++ b/drivers/net/dsa/mt7530.c
 @@ -554,11 +554,46 @@ static bool en751221_trgmii_sample_good(struct mt7530_priv *rx, u32 reg)
@@ -123,6 +122,3 @@ index 40d17681ecd4..2b9504751229 100644
  }
  
  static void en751221_trgmii_set_drive_strength(struct mt7530_priv *priv)
--- 
-2.55.0
-

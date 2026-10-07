@@ -1,0 +1,62 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Fri, 2 Oct 2026 05:30:00 -0300
+Subject: [PATCH] wifi: mt76: mt7603: retire only the frames the PSD ring has
+ room for
+
+mt7603_release_buffered_frames() takes up to nframes frames off the
+station's power-save queue, marks the last one with EOSP for a U-APSD
+service period and queues them on the PSD ring with
+mt76_tx_queue_skb_raw(), which frees what does not fit. The ring is
+shared with the other stations and with the multicast sent after DTIM,
+so with 96 frames buffered and 32 ring entries in use the last two
+frames were freed, EOSP with them, while the driver still ended the
+service period locally: the station lost the frames and kept waiting
+for an EOSP that never came.
+
+Only retire as many frames as the ring has room for. The rest stay on
+the power-save queue, the TIM bit stays set and the last frame sent
+carries more data, so the station picks them up with its next trigger.
+With no room at all, nothing is retired and the service period ends as
+for an empty queue.
+
+Found by a Codex audit agent (user-space harness running this function
+and the DMA raw path): 96 frames with 32 entries in use now queue 94
+with EOSP on the last and keep 2 buffered, instead of dropping 2 and
+EOSP.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+--- a/mt7603/main.c
++++ b/mt7603/main.c
+@@ -475,18 +475,30 @@
+ {
+ 	struct mt7603_dev *dev = hw->priv;
+ 	struct mt7603_sta *msta = (struct mt7603_sta *)sta->drv_priv;
++	struct mt76_queue *q = dev->mphy.q_tx[MT_TXQ_PSD];
+ 	struct sk_buff_head list;
+ 	struct sk_buff *skb, *tmp, *last;
+ 	bool eosp_null, uapsd;
+ 	unsigned long drained;
+ 	u16 pending = 0;
+ 	u8 last_tid;
+-	int i;
++	int i, room;
+ 
+ 	__skb_queue_head_init(&list);
+ 
+ 	mt7603_wtbl_set_ps(dev, msta, false);
+ 
++	/*
++	 * mt76_tx_queue_skb_raw() frees a frame the PSD ring has no room for,
++	 * and the ring is shared with the other stations and the multicast
++	 * after DTIM. Only retire what fits, so that EOSP goes out on a frame
++	 * that is actually queued; the rest stays buffered, with more data
++	 * set, for the next trigger.
++	 */
++	room = q->ndesc - 2 - READ_ONCE(q->queued);
++	if (nframes > room)
++		nframes = max(room, 0);
++
+ 	spin_lock_bh(&dev->ps_lock);
+ 	skb_queue_walk_safe(&msta->psq, skb, tmp) {
+ 		if (!nframes)

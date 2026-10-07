@@ -8,6 +8,13 @@ initscript=$1
 action=${2:-help}
 shift 2
 
+# Boot timing: a kernel log line (level 6, not on the console) when each rc.d
+# script starts and ends at boot.
+[ "$action" = boot ] && [ -w /dev/kmsg ] && {
+	echo "<6>boottrace: ${initscript##*/} begin" >/dev/kmsg
+	trap 'echo "<6>boottrace: ${initscript##*/} end" >/dev/kmsg' EXIT
+}
+
 start() {
 	return 0
 }

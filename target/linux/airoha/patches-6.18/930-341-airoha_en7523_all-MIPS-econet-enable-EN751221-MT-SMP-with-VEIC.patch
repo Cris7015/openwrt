@@ -8,8 +8,6 @@ The EN751221 MIPS 34Kc exposes two VPEs, but MT SMP cannot use the legacy cascad
 Keep the generic VSMP secondary setup unchanged and override init_secondary only for EN751221 so that only IP0/IP1 are unmasked. This replaces the earlier EN751221-specific changes made in generic smp-mt code.
 
 Adapted from upstream commits 2ee2a685ee83 (irqchip/econet-en751221: Support MIPS 34Kc VEIC mode) and 8ae6e79ee0ce (mips: econet: add multi-vpe capability to EN751221).
-
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  .../econet,en751221-intc.yaml                 |  20 ++
  arch/mips/Kconfig                             |   2 +
@@ -22,7 +20,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  8 files changed, 513 insertions(+), 107 deletions(-)
 
 diff --git a/Documentation/devicetree/bindings/interrupt-controller/econet,en751221-intc.yaml b/Documentation/devicetree/bindings/interrupt-controller/econet,en751221-intc.yaml
-index 5536319c49c3..44c09785e6bb 100644
+index 5536319c4..44c09785e 100644
 --- a/Documentation/devicetree/bindings/interrupt-controller/econet,en751221-intc.yaml
 +++ b/Documentation/devicetree/bindings/interrupt-controller/econet,en751221-intc.yaml
 @@ -52,6 +52,25 @@ properties:
@@ -59,7 +57,7 @@ index 5536319c49c3..44c09785e6bb 100644
      };
  ...
 diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index a651e9e9c0d2..be98c9985967 100644
+index a651e9e9c..be98c9985 100644
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -2212,6 +2212,8 @@ config MIPS_MT_SMP
@@ -72,7 +70,7 @@ index a651e9e9c0d2..be98c9985967 100644
  	select MIPS_MT
  	select SMP
 diff --git a/arch/mips/boot/dts/econet/en751221.dtsi b/arch/mips/boot/dts/econet/en751221.dtsi
-index 2014653ec624..db2f6f046890 100644
+index 2014653ec..db2f6f046 100644
 --- a/arch/mips/boot/dts/econet/en751221.dtsi
 +++ b/arch/mips/boot/dts/econet/en751221.dtsi
 @@ -33,27 +33,11 @@ cpu0: cpu@0 {
@@ -374,7 +372,7 @@ index 2014653ec624..db2f6f046890 100644
  				};
  			};
 diff --git a/arch/mips/econet/Kconfig b/arch/mips/econet/Kconfig
-index f29485e5e990..c40cc851f0f4 100644
+index f29485e5e..c40cc851f 100644
 --- a/arch/mips/econet/Kconfig
 +++ b/arch/mips/econet/Kconfig
 @@ -17,9 +17,6 @@ choice
@@ -388,7 +386,7 @@ index f29485e5e990..c40cc851f0f4 100644
  		help
  		  The EN751221 family includes EN7512, RN7513, EN7521, EN7526.
 diff --git a/arch/mips/econet/init.c b/arch/mips/econet/init.c
-index ef89d1f4c390..379e4918d38f 100644
+index ef89d1f4c..379e4918d 100644
 --- a/arch/mips/econet/init.c
 +++ b/arch/mips/econet/init.c
 @@ -23,6 +23,8 @@
@@ -468,7 +466,7 @@ index ef89d1f4c390..379e4918d38f 100644
  	snprintf(system_type, sizeof(system_type), "EcoNet %s", soc);
  	return system_type;
 diff --git a/arch/mips/kernel/smp-mt.c b/arch/mips/kernel/smp-mt.c
-index 274f21a6b67f..7729cc733421 100644
+index 274f21a6b..7729cc733 100644
 --- a/arch/mips/kernel/smp-mt.c
 +++ b/arch/mips/kernel/smp-mt.c
 @@ -115,7 +115,7 @@ static void vsmp_init_secondary(void)
@@ -481,7 +479,7 @@ index 274f21a6b67f..7729cc733421 100644
  
  static void vsmp_smp_finish(void)
 diff --git a/drivers/irqchip/irq-econet-en751221.c b/drivers/irqchip/irq-econet-en751221.c
-index 12a64c178eba..2c85ea0876d0 100644
+index 12a64c178..2c85ea087 100644
 --- a/drivers/irqchip/irq-econet-en751221.c
 +++ b/drivers/irqchip/irq-econet-en751221.c
 @@ -29,6 +29,11 @@
@@ -824,7 +822,7 @@ index 12a64c178eba..2c85ea0876d0 100644
  
  err_unmap:
 diff --git a/include/linux/soc/airoha/pkgids.h b/include/linux/soc/airoha/pkgids.h
-index 3d86fcb989f7..78705f9bcd48 100644
+index 3d86fcb98..78705f9bc 100644
 --- a/include/linux/soc/airoha/pkgids.h
 +++ b/include/linux/soc/airoha/pkgids.h
 @@ -25,10 +25,22 @@
@@ -918,6 +916,3 @@ index 3d86fcb989f7..78705f9bcd48 100644
 +}
 +
  #endif
--- 
-2.55.0
-

@@ -34,7 +34,6 @@ Boards whose flash carries the four-segment anchors are unaffected; the
 erased-flash defaults are unchanged.
 
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/optical/airoha/en7570_main.c |  8 ++++++--
  drivers/net/optical/airoha/en7570_regs.h | 17 ++++++++++++-----
@@ -42,7 +41,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  3 files changed, 28 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/net/optical/airoha/en7570_main.c b/drivers/net/optical/airoha/en7570_main.c
-index 76fe7d1680bf..091b43ab8eb7 100644
+index 76fe7d168..091b43ab8 100644
 --- a/drivers/net/optical/airoha/en7570_main.c
 +++ b/drivers/net/optical/airoha/en7570_main.c
 @@ -82,12 +82,16 @@ static void en7570_load_config(struct en7570_priv *priv)
@@ -65,7 +64,7 @@ index 76fe7d1680bf..091b43ab8eb7 100644
  	if (w != EN7570_FLASH_ERASED)
  		priv->apd_knee_mv = w * 10;		/* V x100 -> mV */
 diff --git a/drivers/net/optical/airoha/en7570_regs.h b/drivers/net/optical/airoha/en7570_regs.h
-index 40634b5e348c..9dc862ae610a 100644
+index 40634b5e3..9dc862ae6 100644
 --- a/drivers/net/optical/airoha/en7570_regs.h
 +++ b/drivers/net/optical/airoha/en7570_regs.h
 @@ -178,16 +178,23 @@
@@ -98,7 +97,7 @@ index 40634b5e348c..9dc862ae610a 100644
  #define EN7570_FL_VOLTAGE_OFFSET	0x03c	/* supply-voltage ADC offset correction */
  #define EN7570_FL_TX_K1			0x040	/* Tx K-point #1 (tx_power<<16 | mpd_K) */
 diff --git a/drivers/net/optical/airoha/en7570_txrx.c b/drivers/net/optical/airoha/en7570_txrx.c
-index f2dd97a434eb..ba0628c4a29d 100644
+index f2dd97a43..ba0628c4a 100644
 --- a/drivers/net/optical/airoha/en7570_txrx.c
 +++ b/drivers/net/optical/airoha/en7570_txrx.c
 @@ -390,13 +390,19 @@ static int en7570_apd_voltage_to_code(struct en7570_priv *priv, s32 v_mv)
@@ -125,6 +124,3 @@ index f2dd97a434eb..ba0628c4a29d 100644
  
  		code = div_s64((s64)(v_mv - zero_mv) * 1000, step_uv);
  	}
--- 
-2.55.0
-

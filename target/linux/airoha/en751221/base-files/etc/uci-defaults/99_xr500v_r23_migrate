@@ -1,0 +1,115 @@
+#!/bin/sh
+# One-shot migration of an Archer XR500v configuration kept by sysupgrade from
+# the r23 daily build: GDM2 was eth1 there and is renamed pon0 here, and WHNAT
+# was configured in xr500v-whnat.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+tplink,archer-xr500v-v1) ;;
+*) exit 0 ;;
+esac
+
+changed=0
+
+fix_device() {
+	local sec="$1" val
+
+	config_get val "$sec" ifname
+	if [ "$val" = eth1 ]; then
+		uci set network."$sec".ifname=pon0
+		changed=1
+	fi
+	config_get val "$sec" name
+	case "$val" in
+	eth1.*) uci set network."$sec".name="pon0.${val#eth1.}"; changed=1 ;;
+	esac
+}
+
+fix_interface() {
+	local sec="$1" val
+
+	config_get val "$sec" device
+	case "$val" in
+	eth1) uci set network."$sec".device=pon0; changed=1 ;;
+	eth1.*) uci set network."$sec".device="pon0.${val#eth1.}"; changed=1 ;;
+	esac
+}
+
+config_load network
+config_foreach fix_device device
+config_foreach fix_interface interface
+[ "$changed" = 1 ] && uci commit network
+
+# Firewall rules and zones may name the device directly (e.g. the provider
+# SIP rule on eth1.12).
+pon_name() {
+	case "$1" in
+	eth1) echo pon0 ;;
+	eth1.*) echo "pon0.${1#eth1.}" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+fix_fw_option() {
+	local sec="$1" val
+
+	config_get val "$sec" device
+	case "$val" in
+	eth1|eth1.*) uci set firewall."$sec".device="$(pon_name "$val")"; changed=1 ;;
+	esac
+}
+
+fix_fw_zone() {
+	local sec="$1" val dev
+
+	config_get val "$sec" device
+	case " $val " in
+	*" eth1 "*|*" eth1."*) ;;
+	*) return ;;
+	esac
+	uci delete firewall."$sec".device
+	for dev in $val; do
+		uci add_list firewall."$sec".device="$(pon_name "$dev")"
+	done
+	changed=1
+}
+
+changed=0
+config_load firewall
+config_foreach fix_fw_option rule
+config_foreach fix_fw_option redirect
+config_foreach fix_fw_zone zone
+[ "$changed" = 1 ] && uci commit firewall
+
+# The LAN LEDs are the MCM PHY LEDs now (LAN n = port 5 - n). A kept config
+# may have none (r23) or name the older gpio-leds (green:lanN), and board.d
+# only writes the netdev triggers into a fresh system config.
+changed=0
+for n in 1 2 3 4; do
+	led="mt7530-2:0$((5 - n)):green:lan"
+	[ "$(uci -q get system.led_lan$n.sysfs)" = "$led" ] && continue
+	uci set system.led_lan$n=led
+	uci set system.led_lan$n.name="lan$n"
+	uci set system.led_lan$n.sysfs="$led"
+	uci set system.led_lan$n.trigger=netdev
+	uci set system.led_lan$n.dev="lan$n"
+	uci set system.led_lan$n.mode="link tx rx"
+	changed=1
+done
+# r23's Internet LED watched eth0, the conduit, which is always up here; the
+# LED follows the wan interface now (hotplug.d/iface/50-xr500v-internet-led).
+if [ "$(uci -q get system.led_internet.sysfs)" = green:internet ] &&
+   [ "$(uci -q get system.led_internet.dev)" = eth0 ]; then
+	uci delete system.led_internet
+	changed=1
+fi
+[ "$changed" = 1 ] && uci commit system
+
+if [ "$(uci -q get xr500v-whnat.main.enabled)" = 1 ] &&
+   uci -q get whnat.main >/dev/null; then
+	uci set whnat.main.enabled=1
+	uci commit whnat
+fi
+
+exit 0

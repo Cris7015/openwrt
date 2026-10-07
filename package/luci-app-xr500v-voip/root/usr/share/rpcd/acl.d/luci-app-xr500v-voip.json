@@ -1,0 +1,7 @@
+{
+  "luci-app-xr500v-voip": {
+    "description": "XR500v telephony status and validated audio configuration",
+    "read": { "ubus": { "xr500v.voip": [ "status", "config_get", "accounts_get" ] } },
+    "write": { "ubus": { "xr500v.voip": [ "config_apply", "accounts_apply" ] } }
+  }
+}

@@ -1,0 +1,13 @@
+# The failsafe interface is the first LAN port in board.json, which is what
+# preinit_config_board() finds by running /bin/board_detect on every boot
+# (~1.5 s of shell on this SoC). Name it here and skip the detection.
+
+en751221_set_preinit_iface() {
+	case $(board_name) in
+	tplink,archer-xr500v-v1)
+		ifname=lan1
+		;;
+	esac
+}
+
+boot_hook_add preinit_main en751221_set_preinit_iface

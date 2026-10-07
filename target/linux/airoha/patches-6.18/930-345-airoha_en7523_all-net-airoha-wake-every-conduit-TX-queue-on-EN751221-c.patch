@@ -29,13 +29,12 @@ the queue and the next completion re-wakes it.
 
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
 (cherry picked from commit 0519ae66a35ca29d37e0c585288502e5b84c30e5)
-Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 23 +++++++++++++++++++++--
  1 file changed, 21 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
-index c2372479624c..343c2d584378 100644
+index c23724796..343c2d584 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
 @@ -890,6 +890,7 @@ static int econet_poll_tx_complete(struct napi_struct *napi, int budget)
@@ -79,6 +78,3 @@ index c2372479624c..343c2d584378 100644
  	if (done) {
  		int i, len = done >> 7;
  
--- 
-2.55.0
-

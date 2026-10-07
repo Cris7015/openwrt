@@ -19,7 +19,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  1 file changed, 76 insertions(+)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
-index ed288ae324c8..c8b1a67c2066 100644
+index ed288ae32..c8b1a67c2 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
 @@ -30,6 +30,9 @@
@@ -133,6 +133,3 @@ index ed288ae324c8..c8b1a67c2066 100644
  static int airoha_qdma_set_tx_rate_limit(struct net_device *netdev,
  					 int channel, u32 rate,
  					 u32 bucket_size)
--- 
-2.55.0
-

@@ -9,7 +9,7 @@ Signed-off-by: Matheus Sampaio Queiroga <srherobrine20@gmail.com>
  1 file changed, 84 insertions(+), 32 deletions(-)
 
 diff --git a/drivers/spi/spi-airoha-snfi.c b/drivers/spi/spi-airoha-snfi.c
-index d522017abd52..08dcfea30c4e 100644
+index d522017ab..08dcfea30 100644
 --- a/drivers/spi/spi-airoha-snfi.c
 +++ b/drivers/spi/spi-airoha-snfi.c
 @@ -12,6 +12,7 @@
@@ -234,6 +234,3 @@ index d522017abd52..08dcfea30c4e 100644
  	ctrl->mem_ops = &airoha_spi_mem_ops;
  	ctrl->bits_per_word_mask = SPI_BPW_MASK(8);
  	ctrl->mode_bits = SPI_RX_DUAL | SPI_TX_DUAL;
--- 
-2.55.0
-

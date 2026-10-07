@@ -1,0 +1,35 @@
+#!/bin/sh /etc/rc.common
+# WHNAT: let the EN751221 PPE offload the NAT flows of the mt76 radios.
+
+START=99
+STOP=05
+EXTRA_COMMANDS="status"
+EXTRA_HELP="	status	Show the WHNAT counters"
+
+PARAMS=/sys/module/airoha_eth/parameters
+
+start() {
+	local enabled
+
+	[ -w "$PARAMS/whnat_enable" ] || return 0
+	config_load whnat
+	config_get_bool enabled main enabled 0
+	if [ "$enabled" = 1 ]; then
+		echo Y > "$PARAMS/whnat_enable"
+	else
+		echo N > "$PARAMS/whnat_enable"
+	fi
+}
+
+stop() {
+	[ -w "$PARAMS/whnat_enable" ] && echo N > "$PARAMS/whnat_enable"
+}
+
+status() {
+	local name
+
+	for name in enable handed completed returned downstream fallback; do
+		[ -r "$PARAMS/whnat_$name" ] || continue
+		echo "$name: $(cat "$PARAMS/whnat_$name")"
+	done
+}

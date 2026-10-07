@@ -146,6 +146,17 @@
  * switch; port 0 of the MT7530 is not wired. Physical LAN labels run
  * opposite to the switch port indices.
  */
+/*
+ * Two FXS ports on a Le9642 SLIC. The econet-pcm driver routes the ZSI/PCM
+ * pads itself; the generic pcm1 pin group would claim GPIO 25-28, which are
+ * the Phone1/Phone2/Internet LEDs on this board.
+ */
+&pcm0 {
+	/delete-property/ pinctrl-names;
+	/delete-property/ pinctrl-0;
+	status = "okay";
+};
+
 &switch1 {
 	status = "okay";
 };
@@ -239,6 +250,10 @@
 
 					nvmem-layout {
 						compatible = "u-boot,env-redundant-bool";
+
+						/* Optional, see &xpon. */
+						gpon_sn_env: gpon-serial-number {
+						};
 					};
 				};
 
@@ -310,7 +325,14 @@
 
 &xpon_phy {
 	status = "okay";
-
+	/* High asserts TX_DISABLE: the laser is off. */
+	tx-disable-gpios = <&pinctrl 16 GPIO_ACTIVE_HIGH>;
+	/*
+	 * GPIO 27 switches the BOSA transmitter 3V3 supply (OEM
+	 * "LED_PHY_VCC_DISABLE"): high powers it off. It floats high unless
+	 * driven low; without it the laser only survives short bursts and the
+	 * upstream stalls at ~60 Mbit/s.
+	 */
 	vcc-disable-gpios = <&pinctrl 27 GPIO_ACTIVE_HIGH>;
 };
 
@@ -319,6 +341,15 @@
 
 	airoha,gpon-serial-from-mac;
 	omci-vendor-id = "TPLG";
+
+	/*
+	 * A serial number provisioned by the ISP is read from the U-Boot
+	 * environment, where /etc/init.d/gpon-identity keeps the one in UCI,
+	 * so the first activation after boot already uses it. Without it the
+	 * serial is derived from the MAC address.
+	 */
+	nvmem-cells = <&gpon_sn_env>;
+	nvmem-cell-names = "gpon-serial-number";
 
 	/* Order consumed by airoha-xpon: GPON status, then LOS. */
 	leds = <&led_pon>, <&led_los>;

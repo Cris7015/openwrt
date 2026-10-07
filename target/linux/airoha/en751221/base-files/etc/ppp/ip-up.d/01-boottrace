@@ -1,0 +1,5 @@
+#!/bin/sh
+# Boot timing: log when IPCP is up (run by /lib/netifd/ppp-up with pppd's
+# ip-up arguments: $1 = ppp device, $6 = netifd interface; no addresses).
+[ -w /dev/kmsg ] && echo "<6>boottrace: ppp ip-up $1 $6" >/dev/kmsg
+exit 0

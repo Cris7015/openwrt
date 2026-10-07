@@ -1,0 +1,3 @@
+# Boot timing: log when netifd's serialized iface hotplug queue reaches each
+# event (kernel log, level 6: not printed on the console).
+[ -w /dev/kmsg ] && echo "<6>boottrace: iface $ACTION $INTERFACE ${DEVICE:-}" >/dev/kmsg

@@ -1,0 +1,77 @@
+From 6eede0006b183f6b0d6de0eaa6f314d5e62f2351 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 27 Sep 2026 00:40:00 -0300
+Subject: [PATCH] nvmem: layouts: u-boot-env: bind an unusable environment
+ without cells
+
+A U-Boot environment that cannot be parsed makes the layout fail to add
+its cells, so the layout device never binds and every consumer of one of
+its variables defers until the deferred probe timeout, even when the
+variable is optional. On the Archer XR500v the environment lives in two
+static UBI volumes that U-Boot creates empty and nothing writes until
+the first saveenv or fw_setenv; the empty one reports "Device too small"
+at every boot, and would hold the xPON probe (the GPON serial number
+cell) back by some ten seconds.
+
+An environment that was never saved, has a bad CRC, or cannot be read
+(UBI volume left mid-update by a power cut, read error) holds no
+variables: tell these apart from other errors and bind the layout
+without cells, so that consumers of optional variables go on at once.
+Callers of u_boot_env_parse() still get an error.
+
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit 52cf6da884b1dc4cecc85234c1efd6b0ad38cdb4)
+---
+ drivers/nvmem/layouts/u-boot-env.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/nvmem/layouts/u-boot-env.c b/drivers/nvmem/layouts/u-boot-env.c
+index ab32bf129..ff85d05c5 100644
+--- a/drivers/nvmem/layouts/u-boot-env.c
++++ b/drivers/nvmem/layouts/u-boot-env.c
+@@ -141,7 +141,7 @@ int u_boot_env_parse(struct device *dev, struct nvmem_device *nvmem,
+ 
+ 	if (dev_size < data_offset) {
+ 		dev_err(dev, "Device too small for u-boot-env\n");
+-		err = -EIO;
++		err = -ENODATA;
+ 		goto err_kfree;
+ 	}
+ 
+@@ -153,7 +153,7 @@ int u_boot_env_parse(struct device *dev, struct nvmem_device *nvmem,
+ 	calc = crc32_le(~0, buf + crc32_data_offset, crc32_data_len) ^ ~0L;
+ 	if (calc != crc32) {
+ 		dev_err(dev, "Invalid calculated CRC32: 0x%08x (expected: 0x%08x)\n", calc, crc32);
+-		err = -EINVAL;
++		err = -EBADMSG;
+ 		goto err_kfree;
+ 	}
+ 
+@@ -171,10 +171,26 @@ static int u_boot_env_add_cells(struct nvmem_layout *layout)
+ {
+ 	struct device *dev = &layout->dev;
+ 	enum u_boot_env_format format;
++	int err;
+ 
+ 	format = (uintptr_t)device_get_match_data(dev);
+ 
+-	return u_boot_env_parse(dev, layout->nvmem, format);
++	err = u_boot_env_parse(dev, layout->nvmem, format);
++	switch (err) {
++	case -ENODATA:	/* never saved, e.g. an empty static UBI volume */
++	case -EBADMSG:	/* bad CRC, or an ECC error while reading it */
++	case -EBADF:	/* UBI volume left mid-update by a power cut */
++	case -EIO:
++		/*
++		 * No usable environment means no variables: bind without
++		 * cells, so that consumers of optional variables go on at
++		 * once instead of deferring until the probe timeout.
++		 */
++		dev_warn(dev, "no usable environment (%pe), no cells\n", ERR_PTR(err));
++		return 0;
++	default:
++		return err;
++	}
+ }
+ 
+ static int u_boot_env_probe(struct nvmem_layout *layout)

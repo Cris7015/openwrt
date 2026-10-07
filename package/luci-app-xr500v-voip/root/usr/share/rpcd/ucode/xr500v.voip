@@ -1,0 +1,384 @@
+'use strict';
+
+import { readfile, stat, lstat, mkdir, open, chmod } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+import { account_defaults, account_validate, sip_uri } from '/usr/share/xr500v-voip/accounts.uc';
+
+const bus = connect();
+const config = cursor();
+let cached = null;
+let cached_at = 0;
+let applying = false;
+let backup_sequence = 0;
+let profile_snapshot = null;
+let profile_revision = '';
+let profile_sequence = 0;
+
+// Read methods never execute commands or write configuration. config_apply
+// has a strict option whitelist and one fixed service restart command.
+// SLIC status is the selected-channel read-only node, never legacy probes.
+function read(path) {
+	try { return readfile(path); } catch (e) { return null; }
+}
+
+function exists(path) {
+	try { return stat(path) != null; } catch (e) { return false; }
+}
+
+function number(text, key) {
+	if (type(text) != 'string') return null;
+	let m = match(text, regexp('(^|[[:space:]])' + key + '=(-?0x[0-9a-fA-F]+|-?[0-9]+)'));
+	return m ? int(m[2], 0) : null;
+}
+
+function option(section, key, fallback) {
+	let v = config.get('xr500v-voip', section, key);
+	return v == null ? fallback : v;
+}
+
+function enabled(section, key, fallback) {
+	return index(['1', 'yes', 'true', 'on'], '' + option(section, key, fallback)) >= 0;
+}
+
+function call(object, method, args) {
+	try { return bus ? bus.call(object, method, args) : null; } catch (e) { return null; }
+}
+
+function accounts(line) {
+	let content = read('/var/run/xr500v-voip/phone' + line + '/accounts');
+	if (content == null) return { mode: 'unknown', count: null };
+	let count = 0;
+	let local_count = 0;
+	for (let row in split(content, '\n')) {
+		row = trim(row);
+		if (!length(row) || substr(row, 0, 1) == '#') continue;
+		if (!match(row, /sips?:/)) continue;
+		count++;
+		if (match(replace(row, /[ \t]/g, ''), /(^|;)regint=0(;|$)/)) local_count++;
+	}
+	// Deliberately never return SIP URIs, passwords or raw account contents.
+	return { count, mode: !count ? 'unconfigured' : local_count == count ? 'local' : 'registration' };
+}
+
+function status() {
+	let now = time();
+	if (cached && now >= cached_at && now - cached_at < 5) return cached;
+	let board = trim(read('/tmp/sysinfo/board_name') || '');
+	if (board != 'tplink,archer-xr500v-v1')
+		return { available: false, reason: 'unsupported_board', version: '0.4.0' };
+	config.unload('xr500v-voip');
+	let services = call('service', 'list', { name: 'voip' });
+	let instances = services?.voip?.instances;
+	let wan = call('network.interface.wan', 'status', {});
+	let pcm = read('/sys/kernel/debug/pcm-en751221/dual_status');
+	let lines = [];
+	let running = 0;
+	for (let id in [1, 2]) {
+		let name = 'phone' + id;
+		let slic = read('/sys/kernel/debug/econet-slic/' + name + '/status');
+		let stream = null;
+		for (let row in split(pcm || '', '\n'))
+			if (substr(row, 0, length(name) + 1) == name + ' ') stream = row;
+		let sip = instances == null ? null : instances[name + '-sip']?.running == true;
+		let manager = instances == null ? null : instances[name + '-manager']?.running == true;
+		if (sip) running++;
+		if (manager) running++;
+		let trigger = read('/sys/class/leds/green:' + name + '/trigger');
+		let ring = number(slic, 'ring_requested');
+		let hook = number(slic, 'hook_cache');
+		let ringing = ring == null && trigger == null ? null : ring == 1 || index(trigger || '', '[timer]') >= 0;
+		let acc = accounts(id);
+		let selected = option(name, 'network', 'lan');
+		let managed = option(name, 'account_mode', '') != '';
+		let link = managed && !match(selected, /[^a-zA-Z0-9_]/) ? call('network.interface.' + selected, 'status', {}) : null;
+		push(lines, {
+			id, enabled: enabled(name, 'enabled', '1'),
+			configured_network: selected, network_managed: managed,
+			network_ready: managed ? link?.up == true && length(link?.['ipv4-address'] || []) > 0 : null,
+			dial_mode: option(name, 'dial_mode', 'legacy'),
+			configured_mode: option(name, 'account_mode', ''),
+			idle_feed: option(name, 'idle_feed', 'standby'),
+			hook: hook == 0 ? 'on_hook' : hook == 1 ? 'off_hook' : 'unknown',
+			ringing, audio_open: stream == null ? null : number(stream, 'opened') == 1,
+			sip_running: sip, manager_running: manager,
+			account_mode: acc.mode, account_count: acc.count,
+			registration: 'not_observed',
+			ec: number(slic, 'ec'), tx_slot: number(slic, 'tx_slot'), rx_slot: number(slic, 'rx_slot'),
+			rx_dma: number(stream, 'rx_dma'), tx_dma: number(stream, 'tx_dma'),
+			capture_bytes: number(stream, 'cap'), playback_bytes: number(stream, 'play'),
+			read_bytes: number(stream, 'read_bytes'), write_bytes: number(stream, 'write_bytes'),
+			capture_drops: number(stream, 'cap_drop_frames'), tx_short_frames: number(stream, 'tx_short_frames')
+		});
+	}
+	let gain = int(option('globals', 'playback_percent', '50'));
+	cached = {
+		available: true, version: '0.4.0', read_only: true, timestamp: now,
+		service_enabled: enabled('globals', 'enabled', '1'), service_available: instances != null,
+		// A shared port runs no process of its own; it rides on phone1's.
+		processes_running: running,
+		expected_processes: 2 * length(filter(lines, (line) => line.enabled && line.configured_mode != 'shared')),
+		drivers: { pcm: exists('/sys/module/pcm_en751221'), slic: exists('/sys/module/econet_slic') },
+		wan_up: wan == null ? null : wan.up == true,
+		pcm: { running: pcm == null ? null : number(pcm, 'running') == 1,
+			rx_frames: number(pcm, 'rx_frames'), tx_frames: number(pcm, 'tx_frames'), play_limit: number(pcm, 'play_limit') },
+		audio: { echo_cancel: enabled('globals', 'echo_cancel', '1'),
+			noise_suppress: enabled('globals', 'noise_suppress', '1'),
+			playback_percent: gain >= 25 && gain <= 100 ? gain : null },
+		lines
+	};
+	cached_at = now;
+	return cached;
+}
+
+// Enumerated (non-boolean) options handled by config_apply. Strictly whitelisted
+// values; anything else is rejected before a single UCI write happens.
+const feed_fields = {
+	phone1_idle_feed: [ 'phone1', 'idle_feed' ],
+	phone2_idle_feed: [ 'phone2', 'idle_feed' ]
+};
+const feed_values = [ 'standby', 'active' ];
+
+const setting_fields = {
+	service_enabled: [ 'globals', 'enabled' ],
+	phone1_enabled: [ 'phone1', 'enabled' ],
+	phone2_enabled: [ 'phone2', 'enabled' ],
+	echo_cancel: [ 'globals', 'echo_cancel' ],
+	noise_suppress: [ 'globals', 'noise_suppress' ],
+	playback_percent: [ 'globals', 'playback_percent' ]
+};
+
+function settings() {
+	config.unload('xr500v-voip');
+	let values = {};
+	let revision = [];
+	for (let key, target in setting_fields) {
+		let raw = option(target[0], target[1], key == 'playback_percent' ? '50' : '1');
+		values[key] = key == 'playback_percent' ? int(raw) : enabled(target[0], target[1], '1');
+		push(revision, key + '=' + raw);
+	}
+	for (let key, target in feed_fields) {
+		let raw = '' + option(target[0], target[1], 'standby');
+		values[key] = index(feed_values, raw) >= 0 ? raw : 'standby';
+		push(revision, key + '=' + raw);
+	}
+	return { settings: values, revision: join(';', revision) };
+}
+
+function idle_check() {
+	let service = call('service', 'list', { name: 'voip' });
+	if (service == null) return 'cannot_verify_service';
+	let instances = service?.voip?.instances || {};
+	let pcm = read('/sys/kernel/debug/pcm-en751221/dual_status');
+	for (let id in [1, 2]) {
+		let name = 'phone' + id;
+		let active = instances[name + '-sip']?.running || instances[name + '-manager']?.running;
+		let slic = read('/sys/kernel/debug/econet-slic/' + name + '/status');
+		let trigger = read('/sys/class/leds/green:' + name + '/trigger');
+		let stream = null;
+		for (let row in split(pcm || '', '\n'))
+			if (substr(row, 0, length(name) + 1) == name + ' ') stream = row;
+		if (number(slic, 'hook_cache') == 1 || number(slic, 'ring_requested') == 1 ||
+		    index(trigger || '', '[timer]') >= 0 || number(stream, 'opened') == 1)
+			return 'line_busy';
+		if (active && (number(slic, 'hook_cache') != 0 || number(slic, 'ring_requested') != 0 ||
+		    trigger == null || number(stream, 'opened') != 0))
+			return 'cannot_verify_idle';
+	}
+	return null;
+}
+
+function backup_config(raw) {
+	const dir = '/root/xr500v-voip-ui-backups';
+	let info = lstat(dir);
+	if (info == null) { mkdir(dir, 448); info = lstat(dir); }
+	if (info?.type != 'directory' || info.uid != 0 || (info.mode & 63)) return null;
+	let path = sprintf('%s/config-%d-%d', dir, time(), ++backup_sequence);
+	let f = open(path, 'wxe', 384);
+	if (!f) return null;
+	let written = f.write(raw);
+	let flushed = f.flush();
+	let closed = f.close();
+	return written == length(raw) && flushed && closed ? path : null;
+}
+
+function restart_voice() { return system([ '/etc/init.d/voip', 'restart' ]); }
+
+function apply_config(args) {
+	if (trim(read('/tmp/sysinfo/board_name') || '') != 'tplink,archer-xr500v-v1')
+		return { ok: false, error: 'unsupported_board' };
+	if (applying) return { ok: false, error: 'busy' };
+	if (type(args.confirm) != 'bool' || !args.confirm)
+		return { ok: false, error: 'confirmation_required' };
+	for (let key, target in setting_fields) {
+		if (key == 'playback_percent') {
+			if (type(args[key]) != 'int' || args[key] < 25 || args[key] > 100)
+				return { ok: false, error: 'invalid_volume' };
+		} else if (type(args[key]) != 'bool') return { ok: false, error: 'invalid_option' };
+	}
+	for (let key, target in feed_fields)
+		if (type(args[key]) != 'string' || index(feed_values, args[key]) < 0)
+			return { ok: false, error: 'invalid_option' };
+	let old = settings();
+	if (type(args.revision) != 'string' || args.revision != old.revision)
+		return { ok: false, error: 'configuration_changed' };
+	let changed = false;
+	for (let key, target in setting_fields) if (args[key] != old.settings[key]) changed = true;
+	for (let key, target in feed_fields) if (args[key] != old.settings[key]) changed = true;
+	if (!changed) return { ok: true, changed: false, restarted: false, config: old };
+	let safety = idle_check();
+	if (safety) return { ok: false, error: safety };
+	let raw = read('/etc/config/xr500v-voip');
+	if (raw == null) return { ok: false, error: 'configuration_unavailable' };
+	applying = true;
+	let backup = null;
+	let committed = false;
+	try {
+		backup = backup_config(raw);
+		if (!backup) die('backup_failed');
+		// Recheck after the backup: never use the status page's cached hook.
+		safety = idle_check();
+		if (safety) die(safety);
+		if (settings().revision != old.revision) die('configuration_changed');
+		for (let key, target in setting_fields) {
+			let value = key == 'playback_percent' ? '' + args[key] : args[key] ? '1' : '0';
+			if (!config.set('xr500v-voip', target[0], target[1], value)) die('save_failed');
+		}
+		for (let key, target in feed_fields)
+			if (!config.set('xr500v-voip', target[0], target[1], args[key])) die('save_failed');
+		if (!config.commit('xr500v-voip')) die('save_failed');
+		committed = true;
+		cached = null;
+		// No user data is interpolated into a shell command. No general UCI
+		// apply: unrelated pending network changes must remain untouched.
+		let rc = restart_voice();
+		applying = false;
+		return { ok: rc == 0, changed: true, saved: true, restarted: rc == 0,
+			error: rc == 0 ? null : 'restart_failed', backup, config: settings() };
+	} catch (e) {
+		config.unload('xr500v-voip');
+		applying = false;
+		let reason = type(e) == 'string' ? e : e?.message;
+		if (index(['backup_failed', 'save_failed', 'line_busy', 'cannot_verify_service',
+		    'cannot_verify_idle', 'configuration_changed'], reason) < 0) reason = 'apply_failed';
+		return { ok: false, saved: committed, error: reason, backup };
+	}
+}
+
+function profile(line) {
+	let p = {};
+	let name = 'phone' + line;
+	for (let k, v in account_defaults) p[k] = option(name, k, v);
+	// Imported/hand-edited files remain authoritative until explicitly opted in.
+	if (option(name, 'account_mode', '') == '') {
+		p.account_mode = exists('/etc/xr500v-voip/' + name + '/accounts') ? 'custom' : 'local';
+		let dial = trim(read('/etc/xr500v-voip/' + name + '/speeddial') || '');
+		if (dial && sip_uri(dial)) { p.dial_mode = 'hotline'; p.hotline = dial; }
+	}
+	p.password = option(name, 'password', '');
+	return p;
+}
+
+function profiles_get() {
+	config.unload('xr500v-voip');
+	let full = [profile(1), profile(2)];
+	let snapshot = sprintf('%J', full) + (read('/etc/config/xr500v-voip') || '');
+	let lines = [];
+	for (let i in [0, 1]) {
+		let p = { id: i + 1, values: {}, password_set: length(full[i].password) > 0,
+			custom_available: exists('/etc/xr500v-voip/phone' + (i + 1) + '/accounts') };
+		for (let k, v in account_defaults) p.values[k] = full[i][k];
+		snapshot += read('/etc/xr500v-voip/phone' + (i + 1) + '/accounts') || '';
+		snapshot += read('/etc/xr500v-voip/phone' + (i + 1) + '/speeddial') || '';
+		push(lines, p);
+	}
+	// Opaque process-local token: never return a password-derived hash or raw
+	// UCI contents. A rpcd reload invalidates old forms, requiring a refresh.
+	if (snapshot != profile_snapshot) {
+		profile_snapshot = snapshot;
+		profile_revision = sprintf('%d-%d', time(), ++profile_sequence);
+	}
+	let networks = [];
+	let dump = call('network.interface', 'dump', {});
+	for (let n in dump?.interface || []) {
+		if (!match(n.interface || '', /^[a-zA-Z0-9_]{1,32}$/) || n.interface == 'loopback') continue;
+		push(networks, { name: n.interface, up: n.up == true, device: n.l3_device || '',
+			ipv4: n['ipv4-address']?.[0]?.address || '' });
+	}
+	return { revision: profile_revision, lines, networks };
+}
+
+function apply_profile(args) {
+	if (trim(read('/tmp/sysinfo/board_name') || '') != 'tplink,archer-xr500v-v1')
+		return { ok: false, error: 'unsupported_board' };
+	if (applying) return { ok: false, error: 'busy' };
+	if (type(args.confirm) != 'bool' || args.confirm != true) return { ok: false, error: 'confirmation_required' };
+	if (type(args.line) != 'int' || index([1, 2], args.line) < 0 || type(args.values) != 'object')
+		return { ok: false, error: 'invalid_account' };
+	let current = profiles_get();
+	if (args.revision != current.revision) return { ok: false, error: 'configuration_changed' };
+	let old = profile(args.line), a = {};
+	for (let key, value in args.values)
+		if (!(key in account_defaults) && key != 'password' && key != 'clear_password') return { ok: false, error: 'invalid_account' };
+	for (let key, value in account_defaults) a[key] = args.values[key];
+	if (type(args.values.password) != 'string' || type(args.values.clear_password) != 'bool' ||
+	    (args.values.clear_password && args.values.password)) return { ok: false, error: 'invalid_account' };
+	a.password = args.values.clear_password ? '' : args.values.password || old.password;
+	let error = account_validate(a, args.line);
+	if (error) return { ok: false, error };
+	// A shared ring group has nothing to share unless phone1 owns an account.
+	if (a.account_mode == 'shared' && option('phone1', 'account_mode', '') == '')
+		return { ok: false, error: 'shared_needs_phone1' };
+	if (a.account_mode == 'custom' && !current.lines[args.line - 1].custom_available)
+		return { ok: false, error: 'custom_missing' };
+	let changed = false;
+	for (let k, v in a) if (v != old[k]) changed = true;
+	if (!changed) return { ok: true, changed: false, restarted: false, config: current };
+	let selected = filter(current.networks, (n) => n.name == a.network);
+	if (!length(selected)) return { ok: false, error: 'network_missing' };
+	let safety = idle_check();
+	if (safety) return { ok: false, error: safety };
+	let raw = read('/etc/config/xr500v-voip');
+	if (raw == null) return { ok: false, error: 'configuration_unavailable' };
+	applying = true;
+	let backup = null, committed = false;
+	try {
+		backup = backup_config(raw);
+		if (!backup) die('backup_failed');
+		safety = idle_check();
+		if (safety) die(safety);
+		if (profiles_get().revision != args.revision) die('configuration_changed');
+		if (!chmod('/etc/config/xr500v-voip', 384)) die('save_failed');
+		for (let k, v in a)
+			if (!config.set('xr500v-voip', 'phone' + args.line, k, v)) die('save_failed');
+		if (!config.commit('xr500v-voip')) die('save_failed');
+		committed = true;
+		if (!chmod('/etc/config/xr500v-voip', 384)) die('save_failed');
+		cached = null;
+		let rc = restart_voice();
+		applying = false;
+		return { ok: rc == 0, changed: true, saved: true, restarted: rc == 0,
+			error: rc == 0 ? null : 'restart_failed', backup, config: profiles_get() };
+	} catch (e) {
+		config.unload('xr500v-voip'); applying = false;
+		let reason = type(e) == 'string' ? e : e?.message;
+		if (index(['backup_failed', 'save_failed', 'line_busy', 'cannot_verify_service',
+		    'cannot_verify_idle', 'configuration_changed'], reason) < 0) reason = 'apply_failed';
+		return { ok: false, saved: committed, error: reason, backup };
+	}
+}
+
+return { 'xr500v.voip': {
+	accounts_get: { args: {}, call: function() { return profiles_get(); } },
+	accounts_apply: { args: { revision: '', line: 0, confirm: false, values: {} },
+		call: function(request) { return apply_profile(request.args); } },
+	status: { args: {}, call: function() { return status(); } },
+	config_get: { args: {}, call: function() { return settings(); } },
+	config_apply: {
+		args: { revision: '', confirm: false, service_enabled: false,
+			phone1_enabled: false, phone2_enabled: false, echo_cancel: false,
+			noise_suppress: false, playback_percent: 0,
+			phone1_idle_feed: '', phone2_idle_feed: '' },
+		call: function(request) { return apply_config(request.args); }
+	}
+} };
