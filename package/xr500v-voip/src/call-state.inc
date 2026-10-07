@@ -175,7 +175,9 @@ static void handle_call_event(int s, const char *payload)
 	id = event_string(obj, "id");
 	direction = event_string(obj, "direction");
 	if (!event_true(obj, "event") || !klass || !type) goto out;
-	if (!strcmp(klass, "register")) {
+	/* Baresip 3.x reports registrations in the "ua" class, older
+	 * versions in "register"; reg_event() ignores the other types. */
+	if (!strcmp(klass, "ua") || !strcmp(klass, "register")) {
 		reg_event(type, event_string(obj, "accountaor"), event_string(obj, "param"));
 		goto out;
 	}
