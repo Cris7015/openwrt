@@ -1,0 +1,152 @@
+#!/bin/sh
+# Move a TP-Link Archer XR500v v1 from the OEM bootloader (tcboot) to
+# OpenWrt's U-Boot, without a serial console. See /lib/upgrade/xr500v-migrate.sh
+# for what is written and in which order.
+
+. /lib/functions.sh
+. /lib/upgrade/common.sh
+. /lib/upgrade/xr500v-migrate.sh
+
+usage() {
+	cat <<EOF
+Usage: $0 check <tcboot.bin> <sysupgrade.bin>
+       $0 run [-n] [-y] <tcboot.bin> <sysupgrade.bin>
+
+Replaces the OEM bootloader with OpenWrt's U-Boot and the OEM flash layout
+with UBI, and installs the U-Boot OpenWrt image, all from the running system.
+Both files come from the same OpenWrt release:
+  tcboot.bin      openwrt-airoha-en751221-tplink_archer-xr500v-v1-tcboot.bin
+  sysupgrade.bin  openwrt-airoha-en751221-tplink_archer-xr500v-v1-squashfs-sysupgrade.bin
+
+check  verifies the router and both files and saves the factory data that the
+       migration keeps (misc.bin, oem-bootloader.bin) in $XR500V_MIGRATE_DIR.
+       Nothing is written to the flash.
+run    does the same checks, asks for confirmation, then migrates and reboots.
+  -n   do not keep the current configuration
+  -y   do not ask for confirmation
+
+The stock TP-Link firmware and the OEM partitions are erased. The OEM
+bootloader is kept in the "tcboot_oem" UBI volume and the factory data in the
+"misc" volume, but copy misc.bin and oem-bootloader.bin off the router before
+you continue: they cannot be recreated.
+EOF
+	exit 1
+}
+
+fail() {
+	xr500v_migrate_msg "$*"
+	exit 1
+}
+
+stage() {
+	local uboot="$1"
+	local image="$2"
+	local d="$XR500V_MIGRATE_DIR"
+	local free
+
+	[ "$(board_name)" = "tplink,archer-xr500v-v1" ] ||
+		fail "this is not a TP-Link Archer XR500v v1"
+	xr500v_migrate_check_layout || exit 1
+	xr500v_migrate_check_bmt || exit 1
+	[ -f "$uboot" ] || fail "$uboot not found"
+	[ -f "$image" ] || fail "$image not found"
+	case "$(readlink -f "$uboot") $(readlink -f "$image")" in
+	*"$d/"*) fail "keep the two files outside $d, which is recreated" ;;
+	esac
+	xr500v_migrate_check_uboot "$uboot" || exit 1
+	xr500v_migrate_check_fit "$image" || exit 1
+
+	free=$(df -k /tmp | awk 'NR == 2 { print $4 }')
+	[ "${free:-0}" -ge 40960 ] ||
+		fail "less than 40 MiB free in /tmp"
+
+	rm -rf "$d"
+	mkdir -p "$d" || fail "cannot create $d"
+	chmod 700 "$d"
+	cp "$uboot" "$d/u-boot.bin" &&
+		cp "$image" "$d/u-boot-sysupgrade.bin" ||
+		fail "cannot copy the files to $d"
+
+	dd if="/dev/mtd$(find_mtd_index misc)" of="$d/misc.bin" bs=131072 \
+		2>/dev/null
+	xr500v_migrate_check_misc "$d/misc.bin" ||
+		fail "the misc partition does not hold the expected MAC address, EN7570 calibration and MT7662 EEPROM"
+	dd if="/dev/mtd$(find_mtd_index bootloader)" of="$d/oem-bootloader.bin" \
+		bs=131072 2>/dev/null
+	xr500v_migrate_check_oemboot "$d/oem-bootloader.bin" ||
+		fail "the bootloader partition does not hold the OEM bootloader"
+	dd if="/dev/mtd$(find_mtd_index migrate_uboot)" of="$d/first-mib.bin" \
+		bs=131072 2>/dev/null
+	[ "$(xr500v_migrate_size "$d/first-mib.bin")" = "$XR500V_MIGRATE_UBOOT_SIZE" ] ||
+		fail "cannot read the first MiB of the flash"
+
+	# The copies must still match the files that were checked.
+	xr500v_migrate_check_uboot "$d/u-boot.bin" &&
+		xr500v_migrate_check_fit "$d/u-boot-sysupgrade.bin" ||
+		fail "the copies in $d do not match the checked files"
+
+	(cd "$d" && md5sum u-boot.bin u-boot-sysupgrade.bin misc.bin \
+		oem-bootloader.bin first-mib.bin > manifest) ||
+		fail "cannot write the manifest"
+
+	cat <<EOF
+
+Router and files checked. Nothing has been written to the flash.
+
+  U-Boot           $(sha256sum "$d/u-boot.bin" | cut -d' ' -f1)
+  OpenWrt image    $(sha256sum "$d/u-boot-sysupgrade.bin" | cut -d' ' -f1)
+  (compare both with SHA256SUMS of the release)
+
+Copy the factory data off the router now, for example from your computer:
+  scp -O root@<router>:$d/misc.bin root@<router>:$d/oem-bootloader.bin .
+
+  misc.bin            $(xr500v_migrate_md5 "$d/misc.bin")  MAC address, EN7570 calibration, MT7662 EEPROM
+  oem-bootloader.bin  $(xr500v_migrate_md5 "$d/oem-bootloader.bin")  OEM bootloader (tcboot)
+
+EOF
+}
+
+cmd="$1"
+[ -n "$cmd" ] && shift
+keep=1
+ask=1
+while getopts "ny" opt; do
+	case "$opt" in
+	n) keep=0 ;;
+	y) ask=0 ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 2 ] || usage
+
+case "$cmd" in
+check)
+	stage "$1" "$2"
+	;;
+run)
+	stage "$1" "$2"
+	if [ $ask -eq 1 ]; then
+		cat <<EOF
+The migration takes about a minute and the router reboots into U-Boot. Do
+not power it off meanwhile. If the first step (writing U-Boot) fails, the
+OEM bootloader is put back and nothing else changes; after it, U-Boot boots
+and starts its TFTP recovery if OpenWrt cannot be installed.
+
+EOF
+		printf 'Type "migrate" once misc.bin and oem-bootloader.bin are safe on another machine: '
+		read -r answer
+		[ "$answer" = "migrate" ] || fail "cancelled; nothing was written"
+	fi
+	xr500v_migrate_md5 "$XR500V_MIGRATE_DIR/u-boot-sysupgrade.bin" \
+		> "$XR500V_MIGRATE_DIR/armed" || fail "cannot arm the migration"
+	if [ $keep -eq 1 ]; then
+		exec sysupgrade "$XR500V_MIGRATE_DIR/u-boot-sysupgrade.bin"
+	else
+		exec sysupgrade -n "$XR500V_MIGRATE_DIR/u-boot-sysupgrade.bin"
+	fi
+	;;
+*)
+	usage
+	;;
+esac

@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# The OEM bad block table is only printed at boot. Keep it for
+# xr500v-migrate-uboot, which must know that the first MiB is not remapped,
+# after the kernel log has moved on.
+xr500v_save_bmt_log() {
+	dmesg | grep -E 'en75_bmt| - BBT factory bad block: | - BMT mapped worn block: ' \
+		> /tmp/xr500v-bmt.log 2>/dev/null
+	[ -s /tmp/xr500v-bmt.log ] || rm -f /tmp/xr500v-bmt.log
+}
+
+boot_hook_add preinit_main xr500v_save_bmt_log
