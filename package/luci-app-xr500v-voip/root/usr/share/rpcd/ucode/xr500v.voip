@@ -61,15 +61,51 @@ function accounts(line) {
 	return { count, mode: !count ? 'unconfigured' : local_count == count ? 'local' : 'registration' };
 }
 
+// "sip:user@host" of an account row or an AOR, without parameters.
+function aor_key(text) {
+	let m = match(text || '', /sips?:[^;>[:space:]]+/);
+	return m ? m[0] : null;
+}
+
+// Registration state the call manager keeps for each account of the line,
+// matched to the account rows by AOR. Returns account numbers, never URIs.
+function registrations(line) {
+	let content = read('/var/run/xr500v-voip/phone' + line + '/registration');
+	if (content == null) return null;
+	let order = [];
+	for (let row in split(read('/var/run/xr500v-voip/phone' + line + '/accounts') || '', '\n')) {
+		row = trim(row);
+		if (!length(row) || substr(row, 0, 1) == '#' || !match(row, /sips?:/)) continue;
+		push(order, aor_key(row));
+	}
+	let result = [];
+	let now = time();
+	for (let row in split(content, '\n')) {
+		let f = {};
+		for (let kv in split(row, '\t')) {
+			let i = index(kv, '=');
+			if (i > 0) f[substr(kv, 0, i)] = substr(kv, i + 1);
+		}
+		if (index(['registering', 'registered', 'failed', 'unregistering'], f.state) < 0) continue;
+		let account = index(order, aor_key(f.aor)) + 1;
+		let code = int(f.code), since = int(f.since);
+		push(result, { account: account > 0 ? account : null, state: f.state,
+			code: code >= 100 && code <= 699 ? code : null,
+			age: since > 0 && now >= since ? now - since : null });
+	}
+	return result;
+}
+
 function status() {
 	let now = time();
 	if (cached && now >= cached_at && now - cached_at < 5) return cached;
 	let board = trim(read('/tmp/sysinfo/board_name') || '');
 	if (board != 'tplink,archer-xr500v-v1')
-		return { available: false, reason: 'unsupported_board', version: '0.4.0' };
+		return { available: false, reason: 'unsupported_board', version: '0.5.0' };
 	config.unload('xr500v-voip');
 	let services = call('service', 'list', { name: 'voip' });
-	let instances = services?.voip?.instances;
+	// A registered service without instances has every port stopped.
+	let instances = services?.voip ? services.voip.instances || {} : null;
 	let wan = call('network.interface.wan', 'status', {});
 	let pcm = read('/sys/kernel/debug/pcm-en751221/dual_status');
 	let lines = [];
@@ -103,7 +139,7 @@ function status() {
 			ringing, audio_open: stream == null ? null : number(stream, 'opened') == 1,
 			sip_running: sip, manager_running: manager,
 			account_mode: acc.mode, account_count: acc.count,
-			registration: 'not_observed',
+			registrations: registrations(id),
 			ec: number(slic, 'ec'), tx_slot: number(slic, 'tx_slot'), rx_slot: number(slic, 'rx_slot'),
 			rx_dma: number(stream, 'rx_dma'), tx_dma: number(stream, 'tx_dma'),
 			capture_bytes: number(stream, 'cap'), playback_bytes: number(stream, 'play'),
@@ -113,7 +149,7 @@ function status() {
 	}
 	let gain = int(option('globals', 'playback_percent', '50'));
 	cached = {
-		available: true, version: '0.4.0', read_only: true, timestamp: now,
+		available: true, version: '0.5.0', read_only: true, timestamp: now,
 		service_enabled: enabled('globals', 'enabled', '1'), service_available: instances != null,
 		// A shared port runs no process of its own; it rides on phone1's.
 		processes_running: running,
@@ -145,8 +181,26 @@ const setting_fields = {
 	phone2_enabled: [ 'phone2', 'enabled' ],
 	echo_cancel: [ 'globals', 'echo_cancel' ],
 	noise_suppress: [ 'globals', 'noise_suppress' ],
-	playback_percent: [ 'globals', 'playback_percent' ]
+	playback_percent: [ 'globals', 'playback_percent' ],
+	call_waiting: [ 'globals', 'call_waiting' ]
 };
+
+// Integer options: [ section, option, default, minimum, maximum ]. The ranges
+// are the ones xr500v-callmgr accepts; it ignores anything outside them.
+const number_fields = {
+	ring_on_ms: [ 'globals', 'ring_on_ms', 1000, 300, 10000 ],
+	ring_off_ms: [ 'globals', 'ring_off_ms', 4000, 300, 10000 ],
+	ring_prefeed_ms: [ 'globals', 'ring_prefeed_ms', 1500, 0, 5000 ],
+	flash_min_ms: [ 'globals', 'flash_min_ms', 80, 40, 1500 ],
+	flash_max_ms: [ 'globals', 'flash_max_ms', 750, 40, 1500 ]
+};
+const caller_id_values = [ 'off', 'v23', 'bell202' ];
+
+// Digits, '*' and '#', separated by blanks, commas or semicolons; what the
+// init script and the call manager accept. Empty is the shipped default.
+function emergency_valid(v) {
+	return type(v) == 'string' && length(v) < 256 && match(v, /^[0-9*# ,;]*$/) != null;
+}
 
 function settings() {
 	config.unload('xr500v-voip');
@@ -162,6 +216,17 @@ function settings() {
 		values[key] = index(feed_values, raw) >= 0 ? raw : 'standby';
 		push(revision, key + '=' + raw);
 	}
+	for (let key, f in number_fields) {
+		let raw = '' + option(f[0], f[1], '' + f[2]);
+		let v = match(raw, /^[0-9]+$/) ? int(raw) : f[2];
+		values[key] = v >= f[3] && v <= f[4] ? v : f[2];
+		push(revision, key + '=' + raw);
+	}
+	let cid = '' + option('globals', 'caller_id', 'off');
+	values.caller_id = index(caller_id_values, cid) >= 0 ? cid : 'off';
+	let emergency = '' + option('globals', 'emergency_numbers', '');
+	values.emergency_numbers = emergency_valid(emergency) ? emergency : '';
+	push(revision, 'caller_id=' + cid, 'emergency_numbers=' + emergency);
 	return { settings: values, revision: join(';', revision) };
 }
 
@@ -219,12 +284,21 @@ function apply_config(args) {
 	for (let key, target in feed_fields)
 		if (type(args[key]) != 'string' || index(feed_values, args[key]) < 0)
 			return { ok: false, error: 'invalid_option' };
+	for (let key, f in number_fields)
+		if (type(args[key]) != 'int' || args[key] < f[3] || args[key] > f[4])
+			return { ok: false, error: 'invalid_' + key };
+	if (args.flash_min_ms >= args.flash_max_ms) return { ok: false, error: 'invalid_flash_window' };
+	if (type(args.caller_id) != 'string' || index(caller_id_values, args.caller_id) < 0)
+		return { ok: false, error: 'invalid_option' };
+	if (!emergency_valid(args.emergency_numbers)) return { ok: false, error: 'invalid_emergency_numbers' };
 	let old = settings();
 	if (type(args.revision) != 'string' || args.revision != old.revision)
 		return { ok: false, error: 'configuration_changed' };
 	let changed = false;
 	for (let key, target in setting_fields) if (args[key] != old.settings[key]) changed = true;
 	for (let key, target in feed_fields) if (args[key] != old.settings[key]) changed = true;
+	for (let key, f in number_fields) if (args[key] != old.settings[key]) changed = true;
+	for (let key in [ 'caller_id', 'emergency_numbers' ]) if (args[key] != old.settings[key]) changed = true;
 	if (!changed) return { ok: true, changed: false, restarted: false, config: old };
 	let safety = idle_check();
 	if (safety) return { ok: false, error: safety };
@@ -246,6 +320,10 @@ function apply_config(args) {
 		}
 		for (let key, target in feed_fields)
 			if (!config.set('xr500v-voip', target[0], target[1], args[key])) die('save_failed');
+		for (let key, f in number_fields)
+			if (!config.set('xr500v-voip', f[0], f[1], '' + args[key])) die('save_failed');
+		if (!config.set('xr500v-voip', 'globals', 'caller_id', args.caller_id)) die('save_failed');
+		if (!config.set('xr500v-voip', 'globals', 'emergency_numbers', args.emergency_numbers)) die('save_failed');
 		if (!config.commit('xr500v-voip')) die('save_failed');
 		committed = true;
 		cached = null;
@@ -378,7 +456,9 @@ return { 'xr500v.voip': {
 		args: { revision: '', confirm: false, service_enabled: false,
 			phone1_enabled: false, phone2_enabled: false, echo_cancel: false,
 			noise_suppress: false, playback_percent: 0,
-			phone1_idle_feed: '', phone2_idle_feed: '' },
+			phone1_idle_feed: '', phone2_idle_feed: '', call_waiting: false,
+			ring_on_ms: 0, ring_off_ms: 0, ring_prefeed_ms: 0,
+			flash_min_ms: 0, flash_max_ms: 0, caller_id: '', emergency_numbers: '' },
 		call: function(request) { return apply_config(request.args); }
 	}
 } };

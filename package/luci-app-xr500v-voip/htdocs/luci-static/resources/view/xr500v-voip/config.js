@@ -6,35 +6,87 @@
 'require dom';
 
 var readConfig = rpc.declare({ object: 'xr500v.voip', method: 'config_get', expect: {} });
+
+var feedValues = { standby: _('Standby'), active: _('Active') };
+var callerIdValues = { off: _('Off'), v23: _('V.23 FSK (ETSI)'), bell202: _('Bell 202 FSK') };
+
+// Order matters: it is the parameter order of config_apply.
+var fields = [
+	{ key: 'service_enabled', tab: 'general', type: 'flag', name: _('Enable telephony') },
+	{ key: 'phone1_enabled', tab: 'general', type: 'flag', name: _('Enable Phone 1') },
+	{ key: 'phone2_enabled', tab: 'general', type: 'flag', name: _('Enable Phone 2') },
+	{ key: 'echo_cancel', tab: 'audio', type: 'flag', name: _('Echo cancellation') },
+	{ key: 'noise_suppress', tab: 'audio', type: 'flag', name: _('Noise suppression') },
+	{ key: 'playback_percent', tab: 'audio', type: 'number', min: 25, max: 100, unit: '%',
+		name: _('Playback level'), description: _('Default: 50 %.') },
+	{ key: 'phone1_idle_feed', tab: 'line', type: 'list', values: feedValues, name: _('Phone 1 idle feed') },
+	{ key: 'phone2_idle_feed', tab: 'line', type: 'list', values: feedValues, name: _('Phone 2 idle feed'),
+		description: _('Standby is silent; the dial tone follows a short delay. Active gives an immediate dial tone, with an audible hiss while idle.') },
+	{ key: 'call_waiting', tab: 'calls', type: 'flag', name: _('Call waiting'),
+		description: _('A second call during a conversation is announced with a tone; the R key (hook flash) answers it.') },
+	{ key: 'ring_on_ms', tab: 'calls', type: 'number', min: 300, max: 10000, unit: 'ms', name: _('Ring on'),
+		description: _('Default: 1000 ms.') },
+	{ key: 'ring_off_ms', tab: 'calls', type: 'number', min: 300, max: 10000, unit: 'ms', name: _('Ring off'),
+		description: _('Default: 4000 ms.') },
+	{ key: 'ring_prefeed_ms', tab: 'calls', type: 'number', min: 0, max: 5000, unit: 'ms', name: _('Ring pre-feed'),
+		description: _('Line power-up before the first ring. Default: 1500 ms.') },
+	{ key: 'flash_min_ms', tab: 'calls', type: 'number', min: 40, max: 1500, unit: 'ms', name: _('Hook flash minimum'),
+		description: _('Shorter breaks are ignored. Default: 80 ms.') },
+	{ key: 'flash_max_ms', tab: 'calls', type: 'number', min: 40, max: 1500, unit: 'ms', name: _('Hook flash maximum'),
+		description: _('Longer breaks hang up. Default: 750 ms.') },
+	{ key: 'emergency_numbers', tab: 'calls', type: 'text', name: _('Emergency numbers'),
+		description: _('Dialed as soon as they are complete. Digits, * and #, separated by spaces. Empty by default.') },
+	{ key: 'caller_id', tab: 'calls', type: 'list', values: callerIdValues, name: _('Caller ID'),
+		description: _('Experimental: sent on hook before the first ring. Not every telephone decodes it.') }
+];
+var byKey = {};
+fields.forEach(f => { byKey[f.key] = f; });
+
 var applyConfig = rpc.declare({
 	object: 'xr500v.voip', method: 'config_apply', expect: {},
-	params: ['revision', 'confirm', 'service_enabled', 'phone1_enabled', 'phone2_enabled',
-		'echo_cancel', 'noise_suppress', 'playback_percent', 'phone1_idle_feed', 'phone2_idle_feed']
+	params: ['revision', 'confirm'].concat(fields.map(f => f.key))
 });
-var keys = ['service_enabled', 'phone1_enabled', 'phone2_enabled', 'echo_cancel', 'noise_suppress', 'playback_percent',
-	'phone1_idle_feed', 'phone2_idle_feed'];
-var feeds = ['phone1_idle_feed', 'phone2_idle_feed'];
-var names = {
-	service_enabled: _('Enable telephony'), phone1_enabled: _('Enable Phone 1'), phone2_enabled: _('Enable Phone 2'),
-	echo_cancel: _('Echo cancellation'), noise_suppress: _('Mild noise suppression'), playback_percent: _('Playback level'),
-	phone1_idle_feed: _('Phone 1 idle line feed'), phone2_idle_feed: _('Phone 2 idle line feed')
-};
-var feedNames = { standby: _('Standby (silent, recommended)'), active: _('Active (instant dial tone, audible hiss)') };
+
 var errors = {
-	line_busy: _('A port is off hook, ringing, or has active audio. Hang up both phones before applying.'),
-	cannot_verify_idle: _('Unable to verify that both ports are idle. No changes were applied.'),
-	cannot_verify_service: _('Unable to query the telephony service. No changes were applied.'),
-	configuration_changed: _('The configuration changed since this page was loaded. Reload it before editing.'),
-	confirmation_required: _('You must confirm the telephony service restart.'),
-	invalid_volume: _('The playback level must be an integer from 25 to 100.'),
-	invalid_option: _('One of the options has an invalid value.'),
-	backup_failed: _('Unable to create a private backup. No changes were applied.'),
+	line_busy: _('A port is off hook, ringing or in a call. Hang up both phones and try again.'),
+	cannot_verify_idle: _('Unable to verify that both ports are idle. Nothing was changed.'),
+	cannot_verify_service: _('Unable to query the telephony service. Nothing was changed.'),
+	configuration_changed: _('The configuration changed since this page was loaded. Reload it and try again.'),
+	confirmation_required: _('The service restart was not confirmed.'),
+	invalid_volume: _('Playback level: enter a value from 25 to 100.'),
+	invalid_option: _('One of the values is invalid.'),
+	invalid_ring_on_ms: _('Ring on: enter a value from 300 to 10000 ms.'),
+	invalid_ring_off_ms: _('Ring off: enter a value from 300 to 10000 ms.'),
+	invalid_ring_prefeed_ms: _('Ring pre-feed: enter a value from 0 to 5000 ms.'),
+	invalid_flash_min_ms: _('Hook flash minimum: enter a value from 40 to 1500 ms.'),
+	invalid_flash_max_ms: _('Hook flash maximum: enter a value from 40 to 1500 ms.'),
+	invalid_flash_window: _('The hook flash minimum must be lower than the maximum.'),
+	invalid_emergency_numbers: _('Emergency numbers: use digits, * and #, separated by spaces.'),
+	backup_failed: _('Unable to back up the configuration. Nothing was changed.'),
 	save_failed: _('Unable to save the configuration.'),
-	restart_failed: _('The configuration was saved, but the service restart failed. Check Status before retrying.'),
-	configuration_unavailable: _('Unable to read the original configuration.'),
-	unsupported_board: _('These settings are only available on the XR500v.'),
-	busy: _('Another configuration update is already in progress.')
+	restart_failed: _('The configuration was saved, but telephony did not restart. Check the status page.'),
+	configuration_unavailable: _('Unable to read the current configuration.'),
+	unsupported_board: _('These settings are only available on the Archer XR500v.'),
+	busy: _('Another change is being applied.')
 };
+
+function toForm(f, value) {
+	if (f.type === 'flag') return value ? '1' : '0';
+	return value == null ? '' : String(value);
+}
+
+function fromForm(f, raw) {
+	if (f.type === 'flag') return raw === '1';
+	if (f.type === 'number') return Number(raw);
+	return raw == null ? '' : String(raw);
+}
+
+function describe(f, value) {
+	if (f.type === 'flag') return value ? _('Yes') : _('No');
+	if (f.type === 'list') return f.values[value] || value;
+	if (f.type === 'number') return '%d %s'.format(value, f.unit);
+	return value === '' ? _('None') : value;
+}
 
 return view.extend({
 	load: function() { return readConfig(); },
@@ -46,48 +98,50 @@ return view.extend({
 	},
 	draw: function() {
 		var values = {};
-		keys.forEach(k => {
-			values[k] = k === 'playback_percent' ? String(this.current.settings[k]) :
-				feeds.includes(k) ? String(this.current.settings[k] || 'standby') :
-				this.current.settings[k] ? '1' : '0';
-		});
-		var m = this.map = new form.JSONMap({ settings: values }, _('Telephony configuration'),
-			_('Persistent local service settings. SIP accounts and electrical SLIC controls are not modified by this page.'));
+		fields.forEach(f => { values[f.key] = toForm(f, this.current.settings[f.key]); });
+		var m = this.map = new form.JSONMap({ settings: values }, _('Telephony'),
+			_('Service, audio and call settings. SIP accounts are configured on the Accounts page.'));
 		m.readonly = !this.editing || !L.hasViewPermission();
-		var s = m.section(form.NamedSection, 'settings', 'settings', _('Service and audio'));
+		var s = m.section(form.NamedSection, 'settings', 'settings');
 		s.anonymous = true;
 		s.addremove = false;
 		s.tab('general', _('General'));
 		s.tab('audio', _('Audio'));
+		s.tab('calls', _('Calls'));
 		s.tab('line', _('Line feed'));
-		keys.forEach(k => {
-			var audio = ['echo_cancel', 'noise_suppress', 'playback_percent'].includes(k);
-			var tab = feeds.includes(k) ? 'line' : audio ? 'audio' : 'general';
-			var o = s.taboption(tab, k === 'playback_percent' ? form.Value :
-				feeds.includes(k) ? form.ListValue : form.Flag, k, names[k]);
+		fields.forEach(f => {
+			var o = s.taboption(f.tab, f.type === 'flag' ? form.Flag : f.type === 'list' ? form.ListValue : form.Value,
+				f.key, f.name, f.description);
 			o.rmempty = false;
-			if (feeds.includes(k)) {
-				o.value('standby', feedNames.standby); o.value('active', feedNames.active);
-				o.description = _('Standby parks the line in low power while the handset is on hook: silent, and the dial tone needs the few milliseconds the line takes to come up. Active keeps the line powered, so the dial tone is immediate, but the router\'s DC-DC converter hiss is audible in the earpiece while idle.');
-			} else if (k === 'playback_percent') {
-				o.datatype = 'and(uinteger,range(25,100))';
-				o.description = _('Digital playback level (25–100%). The validated baseline uses 50%.');
-			} else if (k === 'echo_cancel') o.description = _('Audio echo cancellation; does not change electrical settings.');
-			else if (k === 'noise_suppress') o.description = _('Uses the mild noise suppression already included in the service.');
+			if (f.type === 'list')
+				Object.keys(f.values).forEach(v => o.value(v, f.values[v]));
+			if (f.type === 'number') {
+				o.datatype = 'and(uinteger,range(%d,%d))'.format(f.min, f.max);
+				o.placeholder = f.unit;
+			}
+			if (f.key === 'flash_max_ms')
+				o.validate = function(section_id, value) {
+					var min = Number(this.section.formvalue(section_id, 'flash_min_ms'));
+					return Number(value) > min ? true : _('Must be higher than the minimum.');
+				};
+			if (f.key === 'emergency_numbers')
+				o.validate = function(section_id, value) {
+					return /^[0-9*# ,;]*$/.test(value) && value.length < 256 ? true :
+						_('Use digits, * and #, separated by spaces.');
+				};
 		});
 		return m.render().then(node => {
 			var buttons = [];
 			if (this.editing) {
-				buttons.push(E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-neutral', 'click': () => { this.editing = false; return this.draw(); } }, _('Cancel editing')));
+				buttons.push(E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-neutral', 'click': () => { this.editing = false; return this.draw(); } }, _('Cancel')));
 				buttons.push(' ', E('button', { 'id': 'voip-save-apply', 'type': 'button', 'class': 'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, 'prepareApply') }, _('Save & Apply')));
 			} else if (L.hasViewPermission()) {
 				buttons.push(E('button', { 'id': 'voip-edit', 'type': 'button', 'class': 'cbi-button cbi-button-action', 'click': () => { this.editing = true; return this.draw(); } }, _('Edit')));
 			}
 			buttons.push(' ', E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-neutral', 'click': ui.createHandlerFn(this, 'reloadConfig') }, _('Reload')));
 			dom.content(this.host, [
-				E('p', { 'id': 'voip-config-mode' }, this.editing ? _('Edit mode. Changes are not applied until you confirm.') : _('Read-only mode. Click Edit to change the values.')),
 				node,
-				E('p', {}, _('Applying changes restarts only telephony. Port state is checked and a private backup is saved first. A call arriving during the change may be interrupted.')),
+				E('p', { 'class': 'cbi-section-descr' }, _('Applying restarts the telephony service only. Both phones must be on hook.')),
 				E('div', { 'class': 'cbi-page-actions' }, buttons)
 			]);
 		});
@@ -98,39 +152,36 @@ return view.extend({
 	prepareApply: function() {
 		return this.map.save(null, true).then(() => {
 			var v = {};
-			keys.forEach(k => {
-				var raw = this.map.data.get('json', 'settings', k);
-				v[k] = k === 'playback_percent' ? Number(raw) : feeds.includes(k) ? String(raw) : raw === '1';
-			});
-			var changed = keys.filter(k => v[k] !== this.current.settings[k]);
-			if (!changed.length) { ui.addNotification(null, E('p', {}, _('No changes. No service was restarted.')), 'info'); return; }
-			ui.showModal(_('Apply telephony configuration'), [
-				E('p', {}, _('These changes will be saved and only the telephony service will restart:')),
-				E('ul', {}, changed.map(k => E('li', {}, names[k] + ': ' + (k === 'playback_percent' ? v[k] + ' %' :
-					feeds.includes(k) ? feedNames[v[k]] : v[k] ? _('Yes') : _('No'))))),
-				E('p', {}, _('Hang up both phones. Applying is blocked if a port is busy or its state cannot be verified. A call arriving during the operation may be interrupted.')),
+			fields.forEach(f => { v[f.key] = fromForm(f, this.map.data.get('json', 'settings', f.key)); });
+			var changed = fields.filter(f => v[f.key] !== this.current.settings[f.key]);
+			if (!changed.length) { ui.addNotification(null, E('p', {}, _('No changes.')), 'info'); return; }
+			ui.showModal(_('Apply changes'), [
+				E('ul', {}, changed.map(f => E('li', {}, '%s: %s'.format(f.name, describe(f, v[f.key]))))),
+				E('p', {}, _('The telephony service will restart. A call in progress would be dropped.')),
 				E('div', { 'class': 'right' }, [
 					E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-neutral', 'click': ui.hideModal }, _('Cancel')), ' ',
-					E('button', { 'id': 'voip-confirm-apply', 'type': 'button', 'class': 'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, 'applyValues', v) }, _('Confirm & Apply'))
+					E('button', { 'id': 'voip-confirm-apply', 'type': 'button', 'class': 'cbi-button cbi-button-apply', 'click': ui.createHandlerFn(this, 'applyValues', v) }, _('Apply'))
 				])
 			]);
+		}).catch(() => {
+			ui.addNotification(null, E('p', {}, _('Some values are invalid. Correct the highlighted fields.')), 'warning');
 		});
 	},
 	applyValues: function(v) {
-		return applyConfig(this.current.revision, true, v.service_enabled, v.phone1_enabled, v.phone2_enabled,
-			v.echo_cancel, v.noise_suppress, v.playback_percent, v.phone1_idle_feed, v.phone2_idle_feed).then(result => {
+		var args = [this.current.revision, true].concat(fields.map(f => v[f.key]));
+		return applyConfig.apply(null, args).then(result => {
 			ui.hideModal();
 			if (!result || !result.ok) {
-				ui.addNotification(null, E('p', {}, errors[result?.error] || _('The operation could not be completed. Check Status before retrying.')), 'error');
+				ui.addNotification(null, E('p', {}, errors[result?.error] || _('The changes could not be applied. Check the status page.')), 'error');
 				return;
 			}
-			ui.addNotification(null, E('p', {}, result.changed ? _('Configuration saved. Check Status to verify the service after the restart.') : _('No changes; telephony was not restarted.')), 'info');
+			ui.addNotification(null, E('p', {}, result.changed ? _('Changes applied.') : _('No changes.')), 'info');
 			this.current = result.config;
 			this.editing = false;
 			return this.draw();
 		}).catch(() => {
 			ui.hideModal();
-			ui.addNotification(null, E('p', {}, _('The response was lost, so the outcome is uncertain. Check Status and reload the configuration before trying again.')), 'error');
+			ui.addNotification(null, E('p', {}, _('No response from the router. Reload the page to see the current configuration.')), 'error');
 		});
 	},
 	handleSave: null, handleSaveApply: null, handleReset: null

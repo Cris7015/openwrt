@@ -6,6 +6,13 @@
 
 var getStatus = rpc.declare({ object: 'xr500v.voip', method: 'status', expect: {} });
 
+var sipReasons = {
+	400: _('Bad request'), 401: _('Authentication failed'), 403: _('Forbidden'), 404: _('Account not found'),
+	407: _('Authentication failed'), 408: _('Request timeout'), 423: _('Interval too brief'),
+	480: _('Temporarily unavailable'), 500: _('Server error'), 502: _('Bad gateway'),
+	503: _('Service unavailable'), 504: _('Server timeout')
+};
+
 function text(value) { return value == null ? '-' : String(value); }
 function yesno(value) { return value == null ? _('Unknown') : value ? _('Yes') : _('No'); }
 function bytes(value) {
@@ -13,102 +20,136 @@ function bytes(value) {
 	return value >= 1048576 ? (value / 1048576).toFixed(1) + ' MiB' :
 		value >= 1024 ? (value / 1024).toFixed(1) + ' KiB' : value + ' B';
 }
+function duration(seconds) {
+	if (seconds == null) return null;
+	return seconds < 60 ? _('%d s').format(seconds) :
+		seconds < 3600 ? _('%d min').format(Math.floor(seconds / 60)) :
+		seconds < 86400 ? _('%d h').format(Math.floor(seconds / 3600)) : _('%d d').format(Math.floor(seconds / 86400));
+}
 function row(title, value) {
-	return E('tr', {}, [E('td', { 'class': 'td left', 'width': '42%' }, title), E('td', { 'class': 'td left' }, text(value))]);
+	return E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left', 'width': '33%' }, title), E('td', { 'class': 'td left' }, text(value))]);
 }
 function section(title, rows) {
 	return E('div', { 'class': 'cbi-section' }, [E('h3', {}, title), E('table', { 'class': 'table' }, rows)]);
 }
+
 function portState(line) {
 	if (!line.enabled) return _('Disabled');
 	if (line.configured_mode === 'shared' && line.hook === 'unknown') return _('Shared with Phone 1');
 	if (line.ringing) return _('Ringing');
-	return line.hook === 'on_hook' ? _('On hook') : line.hook === 'off_hook' ? _('Off hook') : _('Unavailable');
+	if (line.hook === 'off_hook') return line.audio_open ? _('In call') : _('Off hook');
+	return line.hook === 'on_hook' ? _('Idle') : _('Unavailable');
 }
-function account(line) {
+
+function registrationText(r) {
+	var since = duration(r.age);
+	switch (r.state) {
+	case 'registered':
+		return since ? _('Registered (%s)').format(since) : _('Registered');
+	case 'registering':
+		return _('Registering…');
+	case 'unregistering':
+		return _('Unregistering…');
+	default:
+		if (!r.code) return _('Failed: no response from the server');
+		return _('Failed: %d %s').format(r.code, sipReasons[r.code] || '');
+	}
+}
+
+function registration(line) {
+	if (!line.enabled) return '-';
 	// A shared port has no account of its own: it rings on Phone 1's.
 	if (line.configured_mode === 'shared') return _('Shared with Phone 1');
-	return line.account_mode === 'local' ? _('Local SIP (no registration)') :
-		line.account_mode === 'registration' ? _('Configured; registration not verified') :
-		line.account_mode === 'unconfigured' ? _('No account') : _('Unknown');
+	// The configured mode decides while the port is not running; the
+	// generated accounts (custom files, legacy setups) once it is.
+	if (line.configured_mode === 'local') return _('Not required (local SIP)');
+	if (line.sip_running !== true) {
+		if (line.network_managed && line.network_ready === false)
+			return _('Waiting for %s').format(line.configured_network);
+		return _('SIP service stopped');
+	}
+	if (line.account_mode === 'unconfigured') return _('No account');
+	if (line.account_mode === 'local') return _('Not required (local SIP)');
+	var regs = line.registrations;
+	if (!regs || !regs.length) return _('Waiting for the first attempt');
+	if (regs.length === 1) return registrationText(regs[0]);
+	return E([], regs.map((r, i) => E('div', {}, _('Account %d: %s').format(r.account || i + 1, registrationText(r)))));
 }
-function ports(lines) {
-	var fields = [
-		[_('Port state'), portState],
-		[_('Enabled in configuration'), l => yesno(l.enabled)],
-		[_('Baresip process running'), l => l.configured_mode === 'shared' ? _('Shared with Phone 1') : yesno(l.sip_running)],
-		[_('Call manager running'), l => l.configured_mode === 'shared' ? _('Shared with Phone 1') : yesno(l.manager_running)],
-		[_('SIP account'), account],
-		[_('Configured network'), l => text(l.configured_network)],
-		[_('Selected network ready'), l => l.network_managed ? yesno(l.network_ready) : _('Legacy configuration')],
-		[_('Outgoing dialing'), l => l.configured_mode === 'shared' ? _('Dialed on the Phone 1 line') :
-			l.dial_mode === 'keypad' ? _('Telephone keypad') : l.dial_mode === 'hotline' ? _('Fixed destination') : l.dial_mode === 'none' ? _('Incoming calls only') : _('Legacy configuration')],
-		[_('Idle line feed'), l => l.idle_feed === 'active' ? _('Active (instant dial tone, audible hiss)') : _('Standby (silent, recommended)')],
-		[_('Audio stream open'), l => yesno(l.audio_open)],
-		[_('SLIC channel'), l => l.ec == null ? '-' : 'EC' + l.ec],
-		[_('RX / TX slot'), l => text(l.rx_slot) + ' / ' + text(l.tx_slot)],
-		[_('RX / TX DMA'), l => text(l.rx_dma) + ' / ' + text(l.tx_dma)],
-		[_('Capture / playback queue'), l => bytes(l.capture_bytes) + ' / ' + bytes(l.playback_bytes)],
-		[_('Audio received / sent'), l => bytes(l.read_bytes) + ' / ' + bytes(l.write_bytes)],
-		[_('Capture drops'), l => text(l.capture_drops)],
-		[_('Short TX frames'), l => text(l.tx_short_frames)]
-	];
-	var head = E('tr', { 'class': 'tr table-titles' }, [E('th', { 'class': 'th left' }, _('Parameter'))].concat(
-		lines.map(l => E('th', { 'class': 'th left', 'data-phone': l.id }, _('Phone %s').format(l.id)))));
-	return section(_('FXS ports'), [head].concat(fields.map(f =>
-		E('tr', {}, [E('td', { 'class': 'td left', 'width': '42%' }, f[0])].concat(
+
+function service(line) {
+	if (line.configured_mode === 'shared') return _('Shared with Phone 1');
+	if (line.sip_running == null && line.manager_running == null) return _('Unknown');
+	return line.sip_running && line.manager_running ? _('Running') : _('Stopped');
+}
+
+function dialing(line) {
+	if (line.configured_mode === 'shared') return _('Through Phone 1');
+	return line.dial_mode === 'keypad' ? _('Keypad') : line.dial_mode === 'hotline' ? _('Hotline') :
+		line.dial_mode === 'none' ? _('Incoming only') : _('Default');
+}
+
+function table(title, lines, fields) {
+	var head = E('tr', { 'class': 'tr table-titles' }, [E('th', { 'class': 'th left' }, '')].concat(
+		lines.map(l => E('th', { 'class': 'th left', 'data-phone': l.id }, _('Phone %d').format(l.id)))));
+	return section(title, [head].concat(fields.map(f =>
+		E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td left', 'width': '33%' }, f[0])].concat(
 			lines.map(l => E('td', { 'class': 'td left' }, f[1](l))))))));
 }
+
 function content(data) {
 	if (!data || !data.available)
 		return E('p', {}, _('Telephony status is not available on this device.'));
+	var lines = data.lines || [];
 	return E([], [
-		section(_('Service and drivers'), [
-			row(_('Service enabled in configuration'), yesno(data.service_enabled)),
-			row(_('Running / expected processes'), text(data.processes_running) + ' / ' + text(data.expected_processes)),
-			row(_('PCM driver present'), yesno(data.drivers.pcm)),
-			row(_('SLIC driver present'), yesno(data.drivers.slic)),
-			row(_('PCM engine running'), yesno(data.pcm.running)),
-			row(_('WAN connection available'), yesno(data.wan_up))
+		section(_('Service'), [
+			row(_('Telephony'), data.service_enabled ? _('Enabled') : _('Disabled')),
+			row(_('Processes'), _('%s of %s running').format(text(data.processes_running), text(data.expected_processes))),
+			row(_('Drivers'), data.drivers.pcm && data.drivers.slic ? _('Loaded') : _('Missing')),
+			row(_('WAN'), data.wan_up == null ? _('Unknown') : data.wan_up ? _('Connected') : _('Disconnected'))
 		]),
-		data.wan_up === false ? E('p', {}, _('No WAN connection. This page and local SIP calls can work without fiber.')) : '',
-		ports(data.lines || []),
-		section(_('Audio: saved configuration'), [
-			row(_('Echo cancellation'), yesno(data.audio.echo_cancel)),
-			row(_('Mild noise suppression'), yesno(data.audio.noise_suppress)),
-			row(_('Playback level'), data.audio.playback_percent == null ? '-' : data.audio.playback_percent + '%')
+		table(_('Phones'), lines, [
+			[_('State'), portState],
+			[_('Registration'), registration],
+			[_('SIP service'), service],
+			[_('Network'), l => l.network_managed ? '%s (%s)'.format(text(l.configured_network), l.network_ready ? _('up') : _('down')) : text(l.configured_network)],
+			[_('Dialing'), dialing],
+			[_('Idle feed'), l => l.idle_feed === 'active' ? _('Active') : _('Standby')]
 		]),
-		E('p', {}, _('A running SIP process does not confirm provider registration. On-hook state does not prove a phone is connected, and an open audio stream does not by itself confirm an established call.')),
-		E('p', {}, _('Counters belong to the audio stream and may reset when it closes. This view is read-only.'))
+		table(_('Diagnostics'), lines, [
+			[_('Audio stream'), l => l.audio_open == null ? _('Unknown') : l.audio_open ? _('Open') : _('Closed')],
+			[_('SLIC channel'), l => l.ec == null ? '-' : 'EC' + l.ec],
+			[_('RX / TX slot'), l => text(l.rx_slot) + ' / ' + text(l.tx_slot)],
+			[_('RX / TX DMA'), l => text(l.rx_dma) + ' / ' + text(l.tx_dma)],
+			[_('Capture / playback queue'), l => bytes(l.capture_bytes) + ' / ' + bytes(l.playback_bytes)],
+			[_('Audio received / sent'), l => bytes(l.read_bytes) + ' / ' + bytes(l.write_bytes)],
+			[_('Capture drops'), l => text(l.capture_drops)],
+			[_('Short TX frames'), l => text(l.tx_short_frames)]
+		])
 	]);
 }
+
 return view.extend({
 	load: function() { return getStatus(); },
 	render: function(data) {
 		this.node = E('div', { 'id': 'voip-status-content' }, [content(data)]);
 		this.error = E('p', { 'id': 'voip-status-error', 'class': 'alert-message warning', 'hidden': true, 'role': 'alert' });
-		this.updated = E('span', {}, '');
-		this.button = E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-action', 'click': this.refresh.bind(this) }, _('Refresh'));
-		this.updated.textContent = _('Last query: ') + new Date().toLocaleTimeString();
 		poll.add(() => document.hidden ? Promise.resolve() : this.refresh(), 10);
 		return E('div', { 'id': 'voip-status-page' }, [
-			E('h2', {}, _('Telephony status')),
-			E('p', {}, _('Local FXS port and telephony service status. Updated every 10 seconds.')),
-			this.error, this.node,
-			E('div', { 'class': 'cbi-page-actions' }, [this.updated, ' ', this.button])
+			E('h2', {}, _('Telephony')),
+			E('div', { 'class': 'cbi-map-descr' }, _('Phone ports and SIP registration, refreshed every 10 seconds.')),
+			this.error, this.node
 		]);
 	},
 	refresh: function() {
 		if (this.busy) return Promise.resolve();
-		this.busy = true; this.button.disabled = true;
+		this.busy = true;
 		return getStatus().then(data => {
 			dom.content(this.node, content(data));
 			this.error.hidden = true;
-			this.updated.textContent = _('Last query: ') + new Date().toLocaleTimeString();
 		}).catch(() => {
-			this.error.textContent = _('Unable to refresh. The last successful reading is still shown; telephony was not changed.');
+			this.error.textContent = _('Unable to refresh the status.');
 			this.error.hidden = false;
-		}).finally(() => { this.busy = false; this.button.disabled = false; });
+		}).finally(() => { this.busy = false; });
 	},
 	handleSave: null, handleSaveApply: null, handleReset: null
 });
