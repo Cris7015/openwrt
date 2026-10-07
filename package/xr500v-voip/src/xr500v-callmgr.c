@@ -77,11 +77,11 @@ static long long ring_started_ms;	/* wall clock of the cadence start; 0 = not ru
 static int ring_on, answered_ec = 2;
 static int ring_stop_pending;
 static long long hook_not_before;
-static char active_callid[381];
+static char active_callid[1024];
 /* Call waiting (call-state.inc): the line's second dialog, if any. */
 enum { OTHER_NONE, OTHER_WAITING, OTHER_ANSWERING, OTHER_HELD };
 static int call_waiting;			/* XR500V_CALL_WAITING=1 */
-static char other_callid[381];
+static char other_callid[1024];
 static int other_kind;
 static long long other_since;			/* when the waiting call rang in */
 static int recall_pending;			/* ringing for a held call: lifting resumes it */
@@ -467,12 +467,13 @@ static int ctrl_connect(void)
 /* send a baresip ctrl_tcp command as a netstring-framed JSON object */
 static int ctrl_cmd(int s, const char *cmd, const char *params)
 {
-	char json[1200], msg[1240], escaped[800];
+	char json[2304], msg[2320], escaped[2 * sizeof(active_callid)];
 	const char *token = !strcmp(cmd, "dial") ? "callmgr-dial" : command_token;
 	int jl, ml, pos = 0;
 	size_t i;
 	if (params) {
-		if (strlen(params) > 380) return -1;
+		/* Any Call-ID the call manager can track must be addressable. */
+		if (strlen(params) >= sizeof(active_callid)) return -1;
 		for (i = 0; params[i]; i++) {
 			unsigned char c = params[i];
 			if (c < 32 || c == 127) return -1;
@@ -676,6 +677,7 @@ static int keypad_key(char c)
 }
 
 #include "cid.inc"
+#include "registration.inc"
 #include "call-state.inc"
 
 /* One tick of the ring cadence. Returns 1 while the bell is energized and
@@ -856,6 +858,8 @@ int main(void)
 		snprintf(speeddial_path, sizeof(speeddial_path), "%s/phone%d/speeddial", runtime, line);
 		snprintf(diagnostic_path, sizeof(diagnostic_path), "%s/phone%d/control", runtime, line);
 		snprintf(dialing_path, sizeof(dialing_path), "%s/phone%d/dialing", runtime, line);
+		snprintf(registration_path, sizeof(registration_path), "%s/phone%d/registration", runtime, line);
+		reg_reset();	/* a previous instance's state is stale */
 		snprintf(keypad_device, sizeof(keypad_device), "/dev/xr500v-voice%s", line == 2 ? "1" : "");
 	}
 	if (*diagnostic_path) {
@@ -889,6 +893,10 @@ int main(void)
 			blen = 0;
 			ctrl_s = s;
 			logmsg("connected to ctrl_tcp");
+			/* The accounts may have registered before we connected. */
+			command_token = "callmgr-reginfo";
+			ctrl_cmd(s, "reginfo", NULL);
+			command_token = "x";
 		}
 
 		pfd[0].fd = s;
