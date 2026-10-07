@@ -1,790 +1,882 @@
 msgid ""
 msgstr "Content-Type: text/plain; charset=UTF-8"
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:73
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:27
+msgid "%d d"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:27
+msgid "%d h"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:26
+msgid "%d min"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:25
+msgid "%d s"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:99
+msgid "%s of %s running"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:79
+msgid "60–3600 s."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:25
+msgid "A SIP provider account needs a user and a domain."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:73
+msgid "A password is stored. Leave empty to keep it."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:18
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:51
 msgid ""
-"A password is stored. Leave blank to keep it. The saved password is never "
-"sent to this page."
+"A port is off hook, ringing or in a call. Hang up both phones and try again."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:18
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:24
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:26
 msgid ""
-"A port is off hook, ringing, or has active audio. Hang up both phones "
-"before applying."
+"A second call during a conversation is announced with a tone; the R key "
+"(hook flash) answers it."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:81
-msgid ""
-"A running SIP process does not confirm provider registration. On-hook "
-"state does not prove a phone is connected, and an open audio stream does "
-"not by itself confirm an established call."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:29
+msgid "A shared port dials through Phone 1: set Dialing to Incoming only."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
-msgid "Account mode"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:69
+msgid "Account %d: %s"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:124
-msgid ""
-"Account saved. Check Status; a running process does not prove SIP "
-"registration."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+msgid "Account not found"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:14
+#: root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:14
 msgid "Accounts"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:22
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:46
-msgid "Active (instant dial tone, audible hiss)"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:10
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:109
+msgid "Active"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:36
-msgid "Another configuration update is already in progress."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:70
+msgid "Another change is being applied."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:112
-msgid "Apply account settings"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:114
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:163
+msgid "Apply"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:107
-msgid "Apply telephony configuration"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:111
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:158
+msgid "Apply changes"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:90
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:144
 msgid ""
-"Applying changes restarts only telephony. Port state is checked and a "
-"private backup is saved first. A call arriving during the change may be "
-"interrupted."
+"Applying restarts the telephony service only. Both phones must be on hook."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:61
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:109
 msgid "Audio"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:75
-msgid "Audio echo cancellation; does not change electrical settings."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:52
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:117
 msgid "Audio received / sent"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:47
-msgid "Audio stream open"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:112
+msgid "Audio stream"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:76
-msgid "Audio: saved configuration"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:11
+msgid "Authentication failed"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
 msgid "Authentication user"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:81
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:81
 msgid "Automatic"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:39
-msgid "Baresip process running"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:12
+msgid "Bad gateway"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:80
-msgid ""
-"Baresip signaling preference. Analog keypad detection during an "
-"established call is not implemented yet; this does not promise IVR "
-"support."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+msgid "Bad request"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:40
-msgid "Call manager running"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:11
+msgid "Bell 202 FSK"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:115
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:113
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:25
+msgid "Call waiting"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:39
+msgid "Caller ID"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:110
+msgid "Calls"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:91
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:113
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:136
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:162
 msgid "Cancel"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:91
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:81
-msgid "Cancel editing"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:51
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:116
 msgid "Capture / playback queue"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:53
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:118
 msgid "Capture drops"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:55
-msgid "Clear saved password"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:178
+msgid "Changes applied."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:19
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:122
+msgid "Changes applied. The status page shows the registration."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:112
+msgid "Closed"
+msgstr ""
+
+#: root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:19
 msgid "Configuration"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:127
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:30
+msgid "Configure an account on Phone 1 first."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:101
+msgid "Connected"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:61
+msgid "Custom accounts file"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:96
+msgid "Custom accounts files are never modified."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
+msgid "DTMF"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:81
+msgid "Default"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:28
+msgid "Default: 1000 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:30
+msgid "Default: 4000 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:21
+msgid "Default: 50 %."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:111
+msgid "Diagnostics"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:38
 msgid ""
-"Configuration saved. Check Status to verify the service after the restart."
+"Dialed as soon as they are complete. Digits, * and #, separated by spaces. "
+"Empty by default."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:42
-msgid "Configured network"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:32
-msgid "Configured; registration not verified"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:116
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:114
-msgid "Confirm & Apply"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:35
-msgid "Confirm the telephony restart before applying."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:82
-msgid ""
-"Counters belong to the audio stream and may reset when it closes. This "
-"view is read-only."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:63
-msgid ""
-"Create VLANs and configure addressing, DNS, routes and firewall under "
-"Network. This page never changes them. If the selected interface is down, "
-"this port waits; it does not fall back to another network. IPv4 is "
-"required in this version."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:97
-msgid ""
-"Custom account files are kept untouched. Switching to a managed profile "
-"changes which account is used. Network events may restart telephony when "
-"its address changes."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:61
-msgid "Custom accounts file (preserved)"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:44
-msgid "Dialed on the Phone 1 line"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:108
 msgid "Dialing"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:74
-msgid "Digital playback level (25–100%). The validated baseline uses 50%."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:23
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:37
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:98
 msgid "Disabled"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:65
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:101
+msgid "Disconnected"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
+msgid "Domain"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:65
 msgid "Down"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:19
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:77
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:100
+msgid "Drivers"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:18
 msgid "Echo cancellation"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:93
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:84
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:93
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:139
 msgid "Edit"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:88
-msgid "Edit mode. Changes are not applied until you confirm."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:37
+msgid "Emergency numbers"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:95
-msgid "Edit mode. Nothing is applied until you confirm."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:64
+msgid "Emergency numbers: use digits, * and #, separated by spaces."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:18
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:16
 msgid "Enable Phone 1"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:18
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:17
 msgid "Enable Phone 2"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:18
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:15
 msgid "Enable telephony"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:38
-msgid "Enabled in configuration"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:98
+msgid "Enabled"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:26
-msgid "Enter a complete SIP URI, for example sip:phone2@192.168.1.1:5062."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:26
+msgid "Enter a full SIP URI, for example sip:phone2@192.168.1.1:5062."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:85
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:23
+msgid "Enter a hostname or IPv4 address, optionally with :port, without sip:."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:85
 msgid "Example: sip:phone2@192.168.1.1:5062"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:45
-msgid "Fixed destination"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:40
+msgid ""
+"Experimental: sent on hook before the first ring. Not every telephone "
+"decodes it."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
-msgid "Fixed destination on off-hook"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:55
+msgid "Failed: %d %s"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:58
-msgid "FXS ports"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:54
+msgid "Failed: no response from the server"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:60
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+msgid "Forbidden"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:108
 msgid "General"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:111
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:35
+msgid "Hook flash maximum"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:62
+msgid "Hook flash maximum: enter a value from 40 to 1500 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:33
+msgid "Hook flash minimum"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:61
+msgid "Hook flash minimum: enter a value from 40 to 1500 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:80
+msgid "Hotline"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
+msgid "Hotline (on off-hook)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
+msgid "Hotline URI"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:80
+msgid "How keys pressed during a call are sent."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:41
+msgid "Idle"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:109
+msgid "Idle feed"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:40
+msgid "In call"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:81
+msgid "Incoming only"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
+msgid "Interface"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:63
 msgid ""
-"Hang up both phones. Applying is blocked if a port is busy or its state "
-"cannot be verified. A call arriving during the operation may be "
-"interrupted."
+"Interface used for SIP and audio, configured under Network (IPv4). If it is "
+"down, the port waits for it."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:68
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:11
+msgid "Interval too brief"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:80
+msgid "Keypad"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:27
+msgid "Keypad dialing needs a Local or SIP provider account."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:82
 msgid ""
-"Hostname or IPv4, optionally :port. This is the SIP address domain and "
-"registration target. Use Outbound proxy when the provider supplies a "
-"separate next-hop server."
+"Keypad: dial, then press # or wait 4 s. In Local mode, 1# calls Phone 1 and "
+"2# calls Phone 2. Not a certified emergency telephone service."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
-msgid "Hotline SIP URI"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:46
-msgid "Idle line feed"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:29
-msgid ""
-"In Shared mode Phone 2 has no dial plan of its own: set Outgoing dialing "
-"to \"Incoming calls only\" and clear the hotline. Dialing is configured on "
-"Phone 1."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
-msgid "In-call DTMF method"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:45
-msgid "Incoming calls only"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:22
-msgid "Invalid account settings. Check the field values."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:27
-msgid "Keypad dialing requires a managed Local or SIP provider account."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:82
-msgid ""
-"Keypad: lift the handset, dial, then press # to send (or wait 4 seconds). "
-"In Local mode, 1# calls Phone 1 and 2# calls Phone 2. Hardware validation "
-"is required. This is not a replacement for a tested emergency telephone "
-"service."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:107
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:92
-msgid "Last query: "
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:43
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:45
-msgid "Legacy configuration"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:62
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:111
 msgid "Line feed"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:60
-msgid "Local (no registration)"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:32
+msgid "Line power-up before the first ring. Default: 1500 ms."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:96
-msgid "Local FXS port and telephony service status. Updated every 10 seconds."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:100
+msgid "Loaded"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:31
-msgid "Local SIP (no registration)"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:60
+msgid "Local"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:19
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:78
-msgid "Mild noise suppression"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:36
+msgid "Longer breaks hang up. Default: 750 ms."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
-msgid "Network interface"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:100
+msgid "Missing"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:55
-msgid "New password"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
+msgid "Mode"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:110
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:125
+msgid "Must be higher than the minimum."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:107
+msgid "Network"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:85
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:17
 msgid "No"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:33
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:63
 msgid "No account"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:106
-msgid "No changes. No service was restarted."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:122
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:157
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:178
+msgid "No changes."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:124
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:127
-msgid "No changes; telephony was not restarted."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:73
+msgid "No password is stored."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:73
-msgid "No managed password is stored."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:114
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:124
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:184
 msgid ""
-"No VLAN, route or firewall changes will be made. Provider registration "
-"requires a working provider network."
+"No response from the router. Reload the page to see the current "
+"configuration."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:74
-msgid ""
-"No WAN connection. This page and local SIP calls can work without fiber."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:19
+msgid "Noise suppression"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:26
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:88
+msgid "None"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:64
+msgid "Not required (local SIP)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:11
+msgid "Off"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:40
 msgid "Off hook"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:26
-msgid "On hook"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:49
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:49
 msgid ""
-"One account per FXS port. Local mode works without an ISP. SIP provider "
-"mode uses your provider credentials and an existing network interface."
+"One account per phone port. Local works without a provider; SIP provider "
+"registers with your operator over the selected interface."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:30
-msgid "One of the options has an invalid value."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:22
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:57
+msgid "One of the values is invalid."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:69
-msgid "Optional hostname or IPv4, optionally :port. No sip: prefix."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:112
+msgid "Open"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:69
-msgid "Optional; defaults to the SIP user."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:69
+msgid "Optional. Defaults to the user."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:69
+msgid "Optional. Hostname or IPv4 address, optionally with :port."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
 msgid "Outbound proxy"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:15
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:44
-msgid "Outgoing dialing"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:55
+msgid "Password"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:56
-msgid "Parameter"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:69
-msgid "PCM driver present"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:71
-msgid "PCM engine running"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:55
-msgid ""
-"Persistent local service settings. SIP accounts and electrical SLIC "
-"controls are not modified by this page."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:51
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:88
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:51
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:88
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:86
 msgid "Phone %d"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:57
-msgid "Phone %s"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:22
+msgid "Phone 1 idle feed"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:20
-msgid "Phone 1 idle line feed"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:23
+msgid "Phone 2 idle feed"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:20
-msgid "Phone 2 idle line feed"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:132
+msgid "Phone ports and SIP registration, refreshed every 10 seconds."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:19
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:79
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:103
+msgid "Phones"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:21
 msgid "Playback level"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:96
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:56
+msgid "Playback level: enter a value from 25 to 100."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:95
 msgid "Port"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:37
-msgid "Port state"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:99
+msgid "Processes"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:25
-msgid "Provider mode requires a SIP user and domain."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:81
+msgid "RTP events (RFC 4733)"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:95
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:88
-msgid "Read-only mode. Click Edit to change the values."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:91
-msgid "Refresh"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
-msgid "Register with provider"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
-msgid "Registration interval"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:94
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:86
-msgid "Reload"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:126
-msgid ""
-"Response lost. The outcome is uncertain; reload and check Status before "
-"retrying."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:25
-msgid "Ringing"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:81
-msgid "RTP events"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:68
-msgid "Running / expected processes"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:50
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:115
 msgid "RX / TX DMA"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:49
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:114
 msgid "RX / TX slot"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:92
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:82
-msgid "Save & Apply"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
+msgid "Register"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:113
-msgid ""
-"Save this port and restart telephony? Hang up both phones first. A private "
-"backup is made, and applying is blocked while a port is busy. A call "
-"arriving during the change may be interrupted."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:48
+msgid "Registered"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:79
-msgid "Seconds (60–3600)."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:48
+msgid "Registered (%s)"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:31
-msgid ""
-"Select an existing OpenWrt interface. Create the provider VLAN in Network "
-"first."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:50
+msgid "Registering…"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:43
-msgid "Selected network ready"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:68
+msgid "Registrar hostname or IPv4 address, optionally with :port."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:57
-msgid "Service and audio"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:105
+msgid "Registration"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:66
-msgid "Service and drivers"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
+msgid "Registration interval"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:67
-msgid "Service enabled in configuration"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:94
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:141
+msgid "Reload"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:33
-msgid ""
-"Settings were saved, but the restart failed. Check Status before retrying."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:55
+msgid "Remove the stored password"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:59
-msgid ""
-"Shared makes this jack ring and dial with the Phone 1 account: both phones "
-"ring, the first one lifted takes the call, and Phone 2 gets no SIP account "
-"or process of its own. The 1# / 2# local intercom does not exist in Shared "
-"mode."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:11
+msgid "Request timeout"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:30
-msgid ""
-"Shared mode requires a managed account on Phone 1. Configure Phone 1 "
-"first."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:29
+msgid "Ring off"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:24
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:30
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:39
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:40
-msgid "Shared with Phone 1"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:59
+msgid "Ring off: enter a value from 300 to 10000 ms."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:62
-msgid "Shared with Phone 1 (rings and dials on the Phone 1 line)"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:27
+msgid "Ring on"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:54
-msgid "Short TX frames"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:58
+msgid "Ring on: enter a value from 300 to 10000 ms."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:41
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:31
+msgid "Ring pre-feed"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:60
+msgid "Ring pre-feed: enter a value from 0 to 5000 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:39
+msgid "Ringing"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:75
+msgid "Running"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:53
 msgid "SIP account"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:13
-msgid "SIP domain / registrar"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:60
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:60
 msgid "SIP provider"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
-msgid "SIP transport"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:65
+msgid "SIP service stopped"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
-msgid "SIP user / telephone number"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:48
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:113
 msgid "SLIC channel"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:70
-msgid "SLIC driver present"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:92
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:137
+msgid "Save & Apply"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:22
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:46
-msgid "Standby (silent, recommended)"
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:31
+msgid "Select an existing interface."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:71
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:12
+msgid "Server error"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:13
+msgid "Server timeout"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:97
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:106
+msgid "Service"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:13
+msgid "Service unavailable"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:103
 msgid ""
-"Standby parks the line in low power while the handset is on hook: silent, "
-"and the dial tone needs the few milliseconds the line takes to come up. "
-"Active keeps the line powered, so the dial tone is immediate, but the "
-"router's DC-DC converter hiss is audible in the earpiece while idle."
+"Service, audio and call settings. SIP accounts are configured on the "
+"Accounts page."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:9
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:62
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:38
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:62
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:73
+msgid "Shared with Phone 1"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:59
+msgid ""
+"Shared: both phones ring and dial on the Phone 1 account, and the first one "
+"lifted answers. The 1#/2# intercom is not available."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:119
+msgid "Short TX frames"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:34
+msgid "Shorter breaks are ignored. Default: 80 ms."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:167
+msgid "Some values are invalid. Correct the highlighted fields."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:24
+msgid ""
+"Spaces, semicolons, quotes, backslashes and angle brackets are not supported "
+"in credentials. Nothing was changed."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:10
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:109
+msgid "Standby"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:24
+msgid ""
+"Standby is silent; the dial tone follows a short delay. Active gives an "
+"immediate dial tone, with an audible hiss while idle."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:104
+msgid "State"
+msgstr ""
+
+#: root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:9
 msgid "Status"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:83
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:45
-msgid "Telephone keypad"
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:75
+msgid "Stopped"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:3
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:102
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:98
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:131
+#: root/usr/share/luci/menu.d/luci-app-xr500v-voip.json:3
 msgid "Telephony"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:48
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:48
 msgid "Telephony accounts"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:54
-msgid "Telephony configuration"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:95
-msgid "Telephony status"
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:64
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:94
 msgid "Telephony status is not available on this device."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:27
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:12
+msgid "Temporarily unavailable"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:121
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:175
+msgid "The changes could not be applied. Check the status page."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:21
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:54
 msgid ""
-"The configuration changed since this page was loaded. Reload it before "
-"editing."
+"The configuration changed since this page was loaded. Reload it and try "
+"again."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:21
-msgid "The configuration changed. Reload before editing again."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:33
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:33
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:67
 msgid ""
-"The configuration was saved, but the service restart failed. Check Status "
-"before retrying."
+"The configuration was saved, but telephony did not restart. Check the status "
+"page."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:28
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:28
 msgid "The custom accounts file does not exist."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:124
-msgid "The operation could not be completed. Check Status before retrying."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:63
+msgid "The hook flash minimum must be lower than the maximum."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:123
-msgid "The operation failed. Reload and check Status before retrying."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:35
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:55
+msgid "The service restart was not confirmed."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:29
-msgid "The playback level must be an integer from 25 to 100."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:133
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:112
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:160
 msgid ""
-"The response was lost, so the outcome is uncertain. Check Status and "
-"reload the configuration before trying again."
+"The telephony service will restart. A call in progress would be dropped."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:108
-msgid ""
-"These changes will be saved and only the telephony service will restart:"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:69
+msgid "These settings are only available on the Archer XR500v."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:35
-msgid "These settings are only available on the XR500v."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:79
+msgid "Through Phone 1"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:24
-msgid ""
-"This Baresip version cannot safely read spaces, semicolons, quotes, "
-"backslashes or angle brackets in authentication fields. The credentials "
-"were not changed."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:14
+msgid "Transport"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:76
-msgid ""
-"UDP and TCP are not encrypted. TLS/SRTP and automatic NAT traversal are "
-"not configured by this version."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:32
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:65
+msgid "Unable to back up the configuration. Nothing was changed."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:32
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:31
-msgid "Unable to create a private backup. No changes were applied."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:20
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:53
+msgid "Unable to query the telephony service. Nothing was changed."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:20
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:26
-msgid "Unable to query the telephony service. No changes were applied."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:68
+msgid "Unable to read the current configuration."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:34
-msgid "Unable to read the original configuration."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:143
+msgid "Unable to refresh the status."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:109
-msgid ""
-"Unable to refresh. The last successful reading is still shown; telephony "
-"was not changed."
-msgstr ""
-
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:34
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:32
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:34
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:66
 msgid "Unable to save the configuration."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:19
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:25
-msgid "Unable to verify that both ports are idle. No changes were applied."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:19
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:52
+msgid "Unable to verify that both ports are idle. Nothing was changed."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:66
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:26
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:66
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:41
 msgid "Unavailable"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:10
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:33
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:76
+msgid "Unencrypted. TLS is not supported."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:17
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:67
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:74
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:101
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:112
 msgid "Unknown"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:65
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:52
+msgid "Unregistering…"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:65
 msgid "Up"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/accounts.js:23
-msgid ""
-"Use a hostname or IPv4 address, optionally followed by :port. Do not "
-"include sip: or a URL path."
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:130
+msgid "Use digits, * and #, separated by spaces."
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:76
-msgid "Uses the mild noise suppression already included in the service."
+#: htdocs/luci-static/resources/view/xr500v-voip/accounts.js:12
+msgid "User"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:72
-msgid "WAN connection available"
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:11
+msgid "V.23 FSK (ETSI)"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/root/usr/share/rpcd/acl.d/luci-app-xr500v-voip.json:3
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:101
+msgid "WAN"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:67
+msgid "Waiting for the first attempt"
+msgstr ""
+
+#: root/usr/share/rpcd/acl.d/luci-app-xr500v-voip.json:3
 msgid "XR500v telephony status and validated audio configuration"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:110
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/status.js:10
+#: htdocs/luci-static/resources/view/xr500v-voip/config.js:85
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:17
 msgid "Yes"
 msgstr ""
 
-#: matheus-openwrt-airoha-en7523-econet-bootdiag/package/luci-app-xr500v-voip/htdocs/luci-static/resources/view/xr500v-voip/config.js:28
-msgid "You must confirm the telephony service restart."
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:107
+msgid "down"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-voip/status.js:107
+msgid "up"
 msgstr ""

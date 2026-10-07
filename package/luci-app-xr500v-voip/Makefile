@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 include $(TOPDIR)/rules.mk
 
-PKG_VERSION:=0.4.0
+PKG_VERSION:=0.5.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 LUCI_TITLE:=XR500v dual-FXS telephony status and accounts
