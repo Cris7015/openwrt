@@ -1005,8 +1005,15 @@ static int pcm_voice_thread(void *data)
 		while (!(READ_ONCE(p->rx_ring[rx_head].status) & PCM_DESC_OWN)) {
 			dma_rmb();
 			if (kfifo_avail(&vs.cap) >= VOICE_FB) {
-				s16 *src = (s16 *)((u8 *)vs.rxb +
-					(rx_head * VOICE_CHANS + voice_rx_ch) * VOICE_FB);
+				/* The parameter is writable at run time: never index
+				 * past the descriptor's channels. */
+				int ch = READ_ONCE(voice_rx_ch);
+				s16 *src;
+
+				if (ch < 0 || ch >= VOICE_CHANS)
+					ch = VOICE_RX_CH;
+				src = (s16 *)((u8 *)vs.rxb +
+					(rx_head * VOICE_CHANS + ch) * VOICE_FB);
 				s16 tmp[PCM_SAMP_PER_FRAME];
 				int i;
 
@@ -1957,8 +1964,13 @@ static void pcm_remove(struct platform_device *pdev)
 {
 	struct pcm_dev *p = platform_get_drvdata(pdev);
 
+	/* Stop the DMA and the voice threads before devres frees what they
+	 * use, and leave nothing that would reach the freed device. */
+	pcm_en751221_dual_stop();
+	pcm_en751221_voice_stop();
 	debugfs_remove_recursive(p->dbg);
 	pcm_wr(p, PCM_IMR, 0);
+	g_pcm = NULL;
 }
 
 static const struct of_device_id pcm_of_match[] = {
