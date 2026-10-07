@@ -376,13 +376,9 @@
 	status = "okay";
 };
 
-/* PCIe port 0 carries the MT7603 (2.4 GHz). It only enumerates with the
- * vendor config-TLP format and a second reset after the PHY comes up, both
- * opt-in in pcie-mediatek (airoha/kernel). Port 1 carries the MT7662 (5 GHz).
- */
+/* PCIe port 0 carries the MT7603 (2.4 GHz), port 1 the MT7662 (5 GHz). */
 &pcie0 {
 	status = "okay";
-	econet,en751221-port0-quirks;
 };
 
 &slot0 {

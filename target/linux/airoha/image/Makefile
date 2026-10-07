@@ -24,6 +24,12 @@ define Device/Default
 endef
 
 # tclinux-trx is the image format used by the EN751221 vendor bootloader.
+# TrendChip header of the XR500v's OEM slot B (kernel1 + rootfs1), built and
+# validated fail-closed by the script.
+define Build/xr500v-trendchip-header
+	python3 ./xr500v-trendchip-header.py $@
+endef
+
 define Build/tclinux-trx
 	./tclinux-trx.sh --kernel $@ --rootfs $(IMAGE_ROOTFS) \
 		--version $(VERSION_DIST)-$(REVISION) --endian $(TRX_ENDIAN) \
