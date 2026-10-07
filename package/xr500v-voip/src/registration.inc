@@ -119,7 +119,9 @@ static void reg_event(const char *type, const char *aor, const char *param)
 
 /* reginfo: "<n> - <aor> <status>..." per account, each registration of it
  * printing "OK " (200), "ERR" (any other status) or "zzz" (none yet) between
- * colour escapes. An account that does not register prints no status. */
+ * colour escapes. An account that does not register prints no status. Right
+ * after start "ERR" is usually the authentication challenge of a registration
+ * still in progress: show it as registering, the next event settles it. */
 static void reg_reginfo(const char *data)
 {
 	char line[512], aor[256];
@@ -139,9 +141,7 @@ static void reg_reginfo(const char *data)
 				rest += strlen(aor);
 				if (strstr(rest, "OK "))
 					reg_set(aor, "registered", 200);
-				else if (strstr(rest, "ERR"))
-					reg_set(aor, "failed", 0);
-				else if (strstr(rest, "zzz"))
+				else if (strstr(rest, "ERR") || strstr(rest, "zzz"))
 					reg_set(aor, "registering", 0);
 			}
 		}
