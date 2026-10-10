@@ -77,6 +77,7 @@ static struct {
 } g_dtmf;
 
 #include "xr500v-cw.h"
+#include "xr500v-omci.h"
 
 static void dtmf_mq_handler(int id, void *data, void *arg)
 {
@@ -720,6 +721,10 @@ static int module_init(void)
 		return err;
 	info("xr500v: call waiting tone %s\n", g_cw_enabled ? "on" : "off");
 
+	err = voice_calls_init();
+	if (err)
+		return err;
+
 	err  = ausrc_register(&ausrc, baresip_ausrcl(), "xr500v", xr_src_alloc);
 	err |= auplay_register(&auplay, baresip_auplayl(), "xr500v",
 			       xr_play_alloc);
@@ -729,6 +734,7 @@ static int module_init(void)
 static int module_close(void)
 {
 	bevent_unregister(call_event_handler);
+	voice_calls_close();
 	ausrc  = mem_deref(ausrc);
 	auplay = mem_deref(auplay);
 	g_dtmf_mq = mem_deref(g_dtmf_mq);
