@@ -1,0 +1,82 @@
+mt76x2e: refuse odd A-MSDU buffer layouts by default on the XR500v
+
+With linear_tx=0 the XR500v's BE TX DMA stalled on A-MSDUs whose buffers
+started at an odd address (3 of 3 watchdog snapshots, 9 Oct 2026). The
+amsdu_no_odd guard of patch 171 removes every such layout without copying
+data and without a measurable throughput cost (two same-boot A/B runs of
+30 phases per arm; mode A in daily use since 9 Oct with no reset). The
+config backups taken before 9 Oct carry only "options mt76x2e linear_tx=0",
+so restoring one of them would bring the unguarded layouts back.
+
+Make amsdu_no_odd default to Y on this board unless it is given at load
+time, so that linear_tx=0 alone selects the validated mode A. An explicit
+amsdu_no_odd=0 still selects the unguarded behaviour, other boards keep N,
+and linear_tx keeps its default (Y: no software A-MSDU). The parameter
+keeps its "bool" parmtype, so modinfo still lists it once OpenWrt has
+stripped the descriptions out of the module.
+
+--- a/mt76x2/mt76x2.h
++++ b/mt76x2/mt76x2.h
+@@ -86,5 +86,6 @@
+ 			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ 			   struct ieee80211_sta *sta,
+ 			   struct mt76_tx_info *tx_info);
++void mt76x2e_amsdu_board_defaults(void);
+ 
+ #endif
+--- a/mt76x2/pci_amsdu.c
++++ b/mt76x2/pci_amsdu.c
+@@ -30,12 +30,41 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/sizes.h>
+ #include "mt76x2.h"
+ 
++/* Y by default on the Archer XR500v (the profile validated on 9 Oct 2026),
++ * unless amsdu_no_odd is given at load time; N on every other board.
++ */
+ static bool amsdu_no_odd;
+-module_param(amsdu_no_odd, bool, 0644);
+-MODULE_PARM_DESC(amsdu_no_odd, "XR500v lab: keep A-MSDU buffer addresses and inner lengths even");
++static bool amsdu_no_odd_given;
++
++static int amsdu_no_odd_set(const char *val, const struct kernel_param *kp)
++{
++	int ret = param_set_bool(val, kp);
++
++	if (!ret)
++		amsdu_no_odd_given = true;
++	return ret;
++}
++
++static const struct kernel_param_ops amsdu_no_odd_ops = {
++	.flags = KERNEL_PARAM_OPS_FL_NOARG,
++	.set = amsdu_no_odd_set,
++	.get = param_get_bool,
++};
++module_param_cb(amsdu_no_odd, &amsdu_no_odd_ops, &amsdu_no_odd, 0644);
++__MODULE_PARM_TYPE(amsdu_no_odd, "bool");
++MODULE_PARM_DESC(amsdu_no_odd, "XR500v: keep A-MSDU buffer addresses and inner lengths even (default Y on the Archer XR500v)");
++
++/* Called once from mt76x2_register_device(), before the first frame. */
++void mt76x2e_amsdu_board_defaults(void)
++{
++	if (!amsdu_no_odd_given &&
++	    of_machine_is_compatible("tplink,archer-xr500v-v1"))
++		WRITE_ONCE(amsdu_no_odd, true);
++}
+ 
+ static unsigned int amsdu_max_subframes;
+ module_param(amsdu_max_subframes, uint, 0644);
+--- a/mt76x2/pci_init.c
++++ b/mt76x2/pci_init.c
+@@ -310,6 +310,7 @@
+ 	mt76x02_config_mac_addr_list(dev);
+ 	if (linear_tx && of_machine_is_compatible("tplink,archer-xr500v-v1"))
+ 		mt76_hw(dev)->max_tx_fragments = 1;
++	mt76x2e_amsdu_board_defaults();
+ 
+ 	ret = mt76_register_device(&dev->mt76, true, mt76x02_rates,
+ 				   ARRAY_SIZE(mt76x02_rates));

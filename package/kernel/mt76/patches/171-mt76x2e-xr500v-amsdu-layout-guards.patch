@@ -1,0 +1,291 @@
+mt76x2e: XR500v lab guards and counters for software TX A-MSDU layouts
+
+With linear_tx=0 mac80211 builds A-MSDUs as frag_list skbs and mt76 hands
+each skb of the list to the PDMA as a buffer of its own. mac80211 ends each
+subframe on a multiple of 4 by pushing the 0-3 byte pad in front of the NEXT
+skb, so after an odd-length subframe that buffer starts at an odd address.
+Both BE TX DMA stalls captured on 9 Oct 2026 stopped inside such a frame, on
+its last descriptor (LAST_SEC1), whose second buffer started at ...9 right
+after an odd-length one. linear_tx=1 gave 0 resets in 12 phases but costs
+~80 Mbit/s of download. The trigger is not isolated (odd address, odd
+boundary, LAST_SEC1 on a later TXD, MPDU length), so this adds run-time
+guards that remove those layouts without copying data, plus counters of
+what the PDMA is actually handed. Replaces the 170 lab patch: no queue_ops
+wrapper and no skb copies.
+
+Everything is in mt76x2e.ko; mt76.ko and mt76x02-lib.ko are not touched by
+this patch. Every knob defaults to the current behaviour and is writable at
+run time in /sys/module/mt76x2e/parameters/:
+
+  amsdu_no_odd=Y         refuse a subframe that would give the PDMA an odd
+                         buffer address or an odd non-final buffer length
+                         (mac80211 can_aggregate_in_amsdu, zero copy)
+  amsdu_max_subframes=N  refuse growth past N subframes (1 = no A-MSDU)
+  amsdu_max_len=N        refuse growth past an MPDU of N bytes
+  amsdu_drop_odd=Y       in tx_prepare_skb, drop a multi-buffer frame that
+                         still has one of those layouts, before the TXWI,
+                         the packet id or the ring are touched
+  amsdu_stats            read-only counters: frames by data buffers, buffer
+                         start address mod 4 and 4 KiB crossings (single-
+                         and multi-buffer frames), odd non-final lengths,
+                         the captured shape, MPDU > 3840, refusals, drops
+
+Proposed profile: linear_tx=0 amsdu_no_odd=1 amsdu_max_subframes=2.
+Lab only, not for upstream as is.
+
+--- a/mt76x2/Makefile
++++ b/mt76x2/Makefile
+@@ -8,7 +8,7 @@
+ 
+ mt76x2e-y := \
+ 	pci.o pci_main.o pci_init.o pci_mcu.o \
+-	pci_phy.o
++	pci_phy.o pci_amsdu.o
+ 
+ mt76x2u-y := \
+ 	usb.o usb_init.o usb_main.o usb_mac.o usb_mcu.o \
+--- a/mt76x2/mt76x2.h
++++ b/mt76x2/mt76x2.h
+@@ -79,4 +79,12 @@
+ void mt76x2_apply_gain_adj(struct mt76x02_dev *dev);
+ void mt76x2_phy_update_channel_gain(struct mt76x02_dev *dev);
+ 
++/* XR500v lab: TX A-MSDU layout guards and counters (pci_amsdu.c) */
++bool mt76x2e_can_aggregate_in_amsdu(struct ieee80211_hw *hw,
++				    struct sk_buff *head, struct sk_buff *skb);
++int mt76x2e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
++			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
++			   struct ieee80211_sta *sta,
++			   struct mt76_tx_info *tx_info);
++
+ #endif
+--- a/mt76x2/pci.c
++++ b/mt76x2/pci.c
+@@ -27,7 +27,7 @@
+ 		.survey_flags = SURVEY_INFO_TIME_TX,
+ 		.update_survey = mt76x02_update_channel,
+ 		.set_channel = mt76x2e_set_channel,
+-		.tx_prepare_skb = mt76x02_tx_prepare_skb,
++		.tx_prepare_skb = mt76x2e_tx_prepare_skb,
+ 		.tx_complete_skb = mt76x02_tx_complete_skb,
+ 		.rx_skb = mt76x02_queue_rx_skb,
+ 		.rx_poll_complete = mt76x02_rx_poll_complete,
+--- a/mt76x2/pci_main.c
++++ b/mt76x2/pci_main.c
+@@ -153,5 +153,6 @@
+ 	.set_rts_threshold = mt76x02_set_rts_threshold,
+ 	.reconfig_complete = mt76x02_reconfig_complete,
+ 	.set_sar_specs = mt76x2_set_sar_specs,
++	.can_aggregate_in_amsdu = mt76x2e_can_aggregate_in_amsdu,
+ };
+ 
+--- /dev/null
++++ b/mt76x2/pci_amsdu.c
+@@ -0,0 +1,207 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * XR500v lab, not for upstream as is: run-time guards and counters for the
++ * software TX A-MSDUs that mac80211 builds when linear_tx=0.
++ *
++ * mac80211 chains each new subframe to the head skb's frag_list and mt76
++ * hands every skb of the chain to the PDMA as a buffer of its own. To end a
++ * subframe on a multiple of 4 it pushes the 0-3 byte pad in front of the
++ * NEXT skb, so after an odd-length subframe that buffer starts at an odd
++ * address. Both BE TX DMA stalls captured on 9 Oct 2026 stopped inside such
++ * a frame, on the last buffer, which started at ...9.
++ *
++ * Every knob defaults to the current behaviour and can be changed at run time
++ * in /sys/module/mt76x2e/parameters/:
++ *
++ *  amsdu_no_odd=Y         do not append a subframe that would give the PDMA
++ *                         an odd buffer address, or an odd-length buffer
++ *                         that is not the last one of the frame
++ *  amsdu_max_subframes=N  do not grow an A-MSDU past N subframes (2: one
++ *                         frag, the frame ends in LAST_SEC0 of TXD 1;
++ *                         1: no A-MSDU, single-buffer frames as with
++ *                         linear_tx=1, without a reload)
++ *  amsdu_max_len=N        do not grow an A-MSDU past an MPDU of N bytes
++ *  amsdu_drop_odd=Y       drop a multi-buffer frame that still has one of
++ *                         those layouts before it reaches the PDMA
++ *  amsdu_stats            read-only counters since the module was loaded
++ *
++ * The counters are global, like the watchdog snapshots: this board has a
++ * single MT76x2 radio.
++ */
++
++#include <linux/module.h>
++#include <linux/sizes.h>
++#include "mt76x2.h"
++
++static bool amsdu_no_odd;
++module_param(amsdu_no_odd, bool, 0644);
++MODULE_PARM_DESC(amsdu_no_odd, "XR500v lab: keep A-MSDU buffer addresses and inner lengths even");
++
++static unsigned int amsdu_max_subframes;
++module_param(amsdu_max_subframes, uint, 0644);
++MODULE_PARM_DESC(amsdu_max_subframes, "XR500v lab: A-MSDU subframe limit (0 = mac80211's)");
++
++static unsigned int amsdu_max_len;
++module_param(amsdu_max_len, uint, 0644);
++MODULE_PARM_DESC(amsdu_max_len, "XR500v lab: A-MSDU MPDU length limit (0 = mac80211's)");
++
++static bool amsdu_drop_odd;
++module_param(amsdu_drop_odd, bool, 0644);
++MODULE_PARM_DESC(amsdu_drop_odd, "XR500v lab: drop multi-buffer frames with an odd buffer");
++
++/* Append attempts; mac80211 calls the hook under its fq->lock. */
++static struct {
++	u32 tries, odd, ref_odd, ref_sub, ref_len;
++} agg;
++
++/* Data buffers by start address modulo 4, and those crossing 4 KiB. */
++struct mt76x2e_buf_stats {
++	atomic_t start[4];
++	atomic_t x4k;
++};
++
++/* Every frame mapped for the PDMA (any queue, amsdu_drop_odd drops too). */
++static struct {
++	atomic_t bufs[6];		/* frames with 1..5, 6+ data buffers */
++	struct mt76x2e_buf_stats lin;	/* buffer of single-buffer frames */
++	struct mt76x2e_buf_stats msdu;	/* buffers of multi-buffer frames */
++	atomic_t odd_len;		/* non-final buffers of odd length */
++	atomic_t odd_ls1;		/* last buffer odd, in SDP1 of TXD >= 1 */
++	atomic_t gt3840;		/* MPDU longer than MT_MAX_LEN_CFG */
++	atomic_t drop;			/* frames dropped by amsdu_drop_odd */
++} txl;
++
++/* mac80211 asks before ieee80211_amsdu_prepare_head() and before it pads,
++ * so redo its arithmetic (net/mac80211/tx.c, ieee80211_amsdu_aggregate()).
++ */
++bool mt76x2e_can_aggregate_in_amsdu(struct ieee80211_hw *hw,
++				    struct sk_buff *head, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)head->data;
++	unsigned int len = head->len, max_sub, max_len, pad, nsub = 2;
++	unsigned long start;
++	struct sk_buff *iter;
++
++	/* prepare_head() still has to add the first subframe header */
++	if (!(IEEE80211_SKB_CB(head)->control.flags & IEEE80211_TX_CTRL_AMSDU))
++		len += ETH_HLEN;
++
++	/* The pad that ends the previous subframe on a multiple of 4. IV space,
++	 * if any, is a multiple of 4 and does not change it.
++	 */
++	pad = (len - ieee80211_hdrlen(hdr->frame_control)) & 3;
++	if (pad)
++		pad = 4 - pad;
++
++	/* The new skb gets 8 bytes (DA/SA/length + RFC 1042 over its Ethernet
++	 * header) and the pad in front. Without that much headroom
++	 * ieee80211_amsdu_realloc_pad() first moves it to an aligned buffer.
++	 */
++	if (skb_headroom(skb) < 8 + pad)
++		start = skb_headroom(skb);
++	else
++		start = (unsigned long)skb->data - 8 - pad;
++
++	/* An odd pad means the buffer it follows ends at an odd offset. */
++	agg.tries++;
++	if ((start | pad | (unsigned long)head->data) & 1) {
++		agg.odd++;
++		if (READ_ONCE(amsdu_no_odd)) {
++			agg.ref_odd++;
++			return false;
++		}
++	}
++
++	max_sub = READ_ONCE(amsdu_max_subframes);
++	if (max_sub) {
++		skb_walk_frags(head, iter)
++			nsub++;
++		if (nsub > max_sub) {
++			agg.ref_sub++;
++			return false;
++		}
++	}
++
++	max_len = READ_ONCE(amsdu_max_len);
++	if (max_len && len + pad + 8 + skb->len > max_len) {
++		agg.ref_len++;
++		return false;
++	}
++
++	return true;
++}
++
++/* mt76_dma_tx_queue_skb() has mapped buf[0] = TXWI, buf[1] = skb head (after
++ * the 2-byte header pad) and buf[2...] = frag_list skbs; mt76_dma_add_buf()
++ * puts buf[2k] in SDP0 and buf[2k + 1] in SDP1 of TXD k, so the last buffer
++ * sits in SDP1 (LAST_SEC1) when nbuf is even. A drop here goes through the
++ * caller's unmap/free path before anything is written to the ring.
++ */
++int mt76x2e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
++			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
++			   struct ieee80211_sta *sta,
++			   struct mt76_tx_info *tx_info)
++{
++	struct mt76x2e_buf_stats *s;
++	int i, nbuf = tx_info->nbuf;
++	bool odd = false;
++
++	atomic_inc(&txl.bufs[min(nbuf, 7) - 2]);
++	s = nbuf > 2 ? &txl.msdu : &txl.lin;
++	for (i = 1; i < nbuf; i++) {
++		dma_addr_t addr = tx_info->buf[i].addr;
++		u32 len = tx_info->buf[i].len;
++
++		atomic_inc(&s->start[addr & 3]);
++		if ((addr & (SZ_4K - 1)) + len > SZ_4K)
++			atomic_inc(&s->x4k);
++		if (addr & 1)
++			odd = true;
++		if ((len & 1) && i < nbuf - 1) {
++			atomic_inc(&txl.odd_len);
++			odd = true;
++		}
++	}
++
++	if (nbuf > 2) {
++		struct sk_buff *skb = tx_info->skb;
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++		/* Same MPDU length mt76x02_tx_prepare_skb() writes to the TXWI */
++		if (skb->len - (ieee80211_hdrlen(hdr->frame_control) & 2) > 3840)
++			atomic_inc(&txl.gt3840);
++		if (!(nbuf & 1) && (tx_info->buf[nbuf - 1].addr & 1))
++			atomic_inc(&txl.odd_ls1);
++		if (odd && READ_ONCE(amsdu_drop_odd)) {
++			atomic_inc(&txl.drop);
++			return -EINVAL;
++		}
++	}
++
++	return mt76x02_tx_prepare_skb(mdev, txwi_ptr, qid, wcid, sta, tx_info);
++}
++
++static int mt76x2e_amsdu_stats_get(char *buf, const struct kernel_param *kp)
++{
++#define C(x)	((u32)atomic_read(&txl.x))
++	return scnprintf(buf, PAGE_SIZE,
++		"agg_try=%u agg_odd=%u ref_odd=%u ref_sub=%u ref_len=%u\n"
++		"bufs1=%u bufs2=%u bufs3=%u bufs4=%u bufs5=%u bufs6p=%u\n"
++		"lin_a0=%u lin_a1=%u lin_a2=%u lin_a3=%u lin_x4k=%u\n"
++		"msdu_a0=%u msdu_a1=%u msdu_a2=%u msdu_a3=%u msdu_x4k=%u\n"
++		"odd_len=%u odd_ls1=%u gt3840=%u drop_odd=%u\n",
++		agg.tries, agg.odd, agg.ref_odd, agg.ref_sub, agg.ref_len,
++		C(bufs[0]), C(bufs[1]), C(bufs[2]), C(bufs[3]), C(bufs[4]), C(bufs[5]),
++		C(lin.start[0]), C(lin.start[1]), C(lin.start[2]), C(lin.start[3]),
++		C(lin.x4k),
++		C(msdu.start[0]), C(msdu.start[1]), C(msdu.start[2]), C(msdu.start[3]),
++		C(msdu.x4k),
++		C(odd_len), C(odd_ls1), C(gt3840), C(drop));
++#undef C
++}
++
++static const struct kernel_param_ops mt76x2e_amsdu_stats_ops = {
++	.get = mt76x2e_amsdu_stats_get,
++};
++module_param_cb(amsdu_stats, &mt76x2e_amsdu_stats_ops, NULL, 0444);
++MODULE_PARM_DESC(amsdu_stats, "XR500v lab: A-MSDU layout counters since the module was loaded");

@@ -1,0 +1,39 @@
+mt76x02: let the XR500v lab re-arm the watchdog snapshot slots
+
+The observer (166, 169) keeps only the first four events per module load,
+and reloading mt76 is not an option on this board, so every test block cost
+a reboot, which also drops fibre and VoIP. Writing anything to
+/sys/module/mt76x02_lib/parameters/watchdog_snapshot_rearm (0200) clears the
+four slots and their frame dumps under the snapshot lock and lets the next
+events use them again. Applies on top of 169; only mt76x02-lib.ko changes.
+
+--- a/mt76x02_watchdog_snapshot.h
++++ b/mt76x02_watchdog_snapshot.h
+@@ -295,4 +295,27 @@
+ module_param_cb(watchdog_snapshot2, &mt76x02_snapshot_ops, &watchdog_snapshots[2], 0400);
+ module_param_cb(watchdog_snapshot3, &mt76x02_snapshot_ops, &watchdog_snapshots[3], 0400);
+ 
++/* Writing anything frees the four slots for the next events, so a test block
++ * does not need a reboot (which on the XR500v also drops fibre and VoIP).
++ * Use it between blocks, not while a reset is being captured: the frame dump
++ * is filled outside the lock.
++ */
++static int mt76x02_snapshot_rearm(const char *val, const struct kernel_param *kp)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&watchdog_snapshot_lock, flags);
++	memset(watchdog_snapshots, 0, sizeof(watchdog_snapshots));
++	memset(watchdog_frames, 0, sizeof(watchdog_frames));
++	atomic_set(&watchdog_snapshot_next, 0);
++	spin_unlock_irqrestore(&watchdog_snapshot_lock, flags);
++	return 0;
++}
++
++static const struct kernel_param_ops mt76x02_snapshot_rearm_ops = {
++	.set = mt76x02_snapshot_rearm,
++};
++module_param_cb(watchdog_snapshot_rearm, &mt76x02_snapshot_rearm_ops, NULL, 0200);
++MODULE_PARM_DESC(watchdog_snapshot_rearm, "XR500v lab: write to clear the four snapshot slots");
++
+ #endif

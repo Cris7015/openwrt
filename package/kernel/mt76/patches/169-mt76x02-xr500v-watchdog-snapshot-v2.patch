@@ -1,0 +1,379 @@
+mt76x02: XR500v lab watchdog snapshots (v2: whole stuck TX frame)
+
+Squash of the lab patches 166 (snapshot v1) and 169 (v2 frame dump), which
+were applied as a pair; 169 only extends the header 166 creates.
+
+Capture the first four watchdog events before recovery, without changing
+the TX detector, its thresholds or the reset itself. Each snapshot holds the
+interrupt/DMA/MAC status registers and, for the four AC queues, the MCU
+queue and both RX queues, the ring indexes and the tail/dma descriptors.
+Read them in /sys/module/mt76x02_lib/parameters/watchdog_snapshot0..3
+(0400). No payloads, skb pointers or full DMA addresses are recorded.
+
+v2: for the AC queue that tripped the detector, every descriptor of the
+frame dma_idx stopped in (ctrl and the low 12 bits of both buffer
+addresses, never a full address), TXWI words 0, 1 and 4 of that frame
+(flags/rate, MPDU length, packet id; not the IV words) and the PBF page
+counters. irq_coherent (0444) counts the RX/TX/ANY coherent DMA error
+sources, which are acked with any other interrupt and cannot be seen in a
+later snapshot. Output is version=2.
+
+The txwi read is safe: the frame's last entry is not reaped while the
+hardware has not passed it (mt76_dma_tx_cleanup stops at dma_idx) and txwi
+cache memory is only freed at teardown (mt76_free_pending_txwi).
+Only mt76x02-lib.ko changes.
+
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -10,8 +10,18 @@
+ #include "mt76x02.h"
+ #include "mt76x02_mcu.h"
+ #include "mt76x02_irq_ack.h"
++#include "mt76x02_watchdog_snapshot.h"
+ #include "trace.h"
+ 
++/* XR500v lab: coherence-error sources latched in MT_INT_SOURCE_CSR. They are
++ * never enabled in the mask and the handler acks them together with any
++ * other interrupt, so a later snapshot cannot see them. [0] RX, [1] TX,
++ * [2] ANY. Counted in the interrupt handler only.
++ */
++static unsigned int irq_coherent[3];
++module_param_array(irq_coherent, uint, NULL, 0444);
++MODULE_PARM_DESC(irq_coherent, "XR500v lab: latched RX/TX/ANY coherent DMA error sources");
++
+ static void mt76x02_pre_tbtt_tasklet(struct tasklet_struct *t)
+ {
+ 	struct mt76x02_dev *dev = from_tasklet(dev, t, mt76.pre_tbtt_tasklet);
+@@ -268,6 +278,12 @@
+ 	enabled = dev->mt76.mmio.irqmask;
+ 	mt76_wr(dev, MT_INT_SOURCE_CSR, mt76x02_irq_ack_sources(pending, enabled));
+ 	intr = pending & enabled;
++	if (unlikely(pending & (MT_INT_RX_COHERENT | MT_INT_TX_COHERENT |
++				MT_INT_ANY_COHERENT))) {
++		irq_coherent[0] += !!(pending & MT_INT_RX_COHERENT);
++		irq_coherent[1] += !!(pending & MT_INT_TX_COHERENT);
++		irq_coherent[2] += !!(pending & MT_INT_ANY_COHERENT);
++	}
+ 	spin_unlock_irqrestore(&dev->mt76.mmio.irq_lock, flags);
+ 
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+@@ -546,12 +562,17 @@
+ 
+ static void mt76x02_check_tx_hang(struct mt76x02_dev *dev)
+ {
++	bool tx_hang, mcu_timeout;
++
+ 	if (test_bit(MT76_RESTART, &dev->mphy.state))
+ 		return;
+ 
+-	if (!mt76x02_tx_hang(dev) && !dev->mcu_timeout)
++	tx_hang = mt76x02_tx_hang(dev);
++	mcu_timeout = READ_ONCE(dev->mcu_timeout);
++	if (!tx_hang && !mcu_timeout)
+ 		return;
+ 
++	mt76x02_capture_watchdog(dev, tx_hang, mcu_timeout);
+ 	mt76x02_watchdog_reset(dev);
+ 
+ 	dev->tx_hang_reset++;
+--- /dev/null
++++ b/mt76x02_watchdog_snapshot.h
+@@ -0,0 +1,298 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++#ifndef __MT76X02_WATCHDOG_SNAPSHOT_H
++#define __MT76X02_WATCHDOG_SNAPSHOT_H
++
++#include "dma.h"
++
++#define MT76X02_SNAPSHOT_COUNT 4
++#define MT76X02_SNAPSHOT_QUEUES 7
++
++struct mt76x02_diag_desc {
++	u32 idx, ctrl, info, align;
++};
++
++struct mt76x02_diag_queue {
++	u32 present, hw, ndesc, queued, head, tail, cpu, dma;
++	u32 stopped, blocked, last_checked_dma, hang_check;
++	struct mt76x02_diag_desc tail_desc, dma_desc;
++};
++
++struct mt76x02_diag_snapshot {
++	u32 valid, sequence, uptime_ms, tx_trigger, mcu_trigger;
++	u32 irq_source, irq_hw_mask, irq_sw_mask, dma_glo;
++	u32 mac_sys, mac_status, txop, retry, auto_rsp;
++	struct mt76x02_diag_queue q[MT76X02_SNAPSHOT_QUEUES];
++};
++
++/* v2: every descriptor of the frame the hung AC queue stopped in (ctrl and
++ * the page offset of both buffers, never a full address), the TXWI words
++ * that carry its flags/rate, MPDU length and packet id (not the IV words),
++ * and the PBF page counters.
++ */
++#define MT76X02_SNAPSHOT_FRAME_DESC 10
++
++struct mt76x02_diag_frame {
++	u32 valid, queue, first, last, ndesc, ended;
++	u32 ctrl[MT76X02_SNAPSHOT_FRAME_DESC];
++	u16 off0[MT76X02_SNAPSHOT_FRAME_DESC], off1[MT76X02_SNAPSHOT_FRAME_DESC];
++	u32 txwi_valid, txwi_w0, txwi_w1, txwi_w4;
++	u32 pbf_pcnt, pbf_a30, pbf_a34, txq_sta, rxq_sta;
++};
++
++static struct mt76x02_diag_snapshot watchdog_snapshots[MT76X02_SNAPSHOT_COUNT];
++static struct mt76x02_diag_frame watchdog_frames[MT76X02_SNAPSHOT_COUNT];
++static atomic_t watchdog_snapshot_next = ATOMIC_INIT(0);
++static DEFINE_SPINLOCK(watchdog_snapshot_lock);
++
++static void mt76x02_snapshot_desc(struct mt76x02_diag_desc *out,
++				struct mt76_queue *q, u32 idx, u32 ndesc)
++{
++	struct mt76_desc *d;
++
++	out->idx = idx;
++	if (!q->desc || idx >= ndesc) {
++		out->ctrl = out->info = out->align = U32_MAX;
++		return;
++	}
++	/* Only the coherent descriptor is read. Never dereference its DMA
++	 * buffer addresses or a concurrently freed skb/txwi pointer.
++	 */
++	d = &q->desc[idx];
++	dma_rmb();
++	out->ctrl = le32_to_cpu(READ_ONCE(d->ctrl));
++	out->info = le32_to_cpu(READ_ONCE(d->info));
++	out->align = (le32_to_cpu(READ_ONCE(d->buf0)) & 0xf) |
++		((le32_to_cpu(READ_ONCE(d->buf1)) & 0xf) << 4);
++}
++
++static void mt76x02_snapshot_queue(struct mt76x02_diag_queue *out,
++				 struct mt76_queue *q)
++{
++	if (!q || !q->regs || q->ndesc <= 0)
++		return;
++	out->present = 1;
++	out->hw = q->hw_idx;
++	out->ndesc = q->ndesc;
++	out->queued = READ_ONCE(q->queued);
++	out->head = READ_ONCE(q->head);
++	out->tail = READ_ONCE(q->tail);
++	out->stopped = READ_ONCE(q->stopped);
++	out->blocked = READ_ONCE(q->blocked);
++	out->cpu = readl(&q->regs->cpu_idx);
++	out->dma = readl(&q->regs->dma_idx);
++	mt76x02_snapshot_desc(&out->tail_desc, q, out->tail, out->ndesc);
++	mt76x02_snapshot_desc(&out->dma_desc, q, out->dma, out->ndesc);
++}
++
++/* Written into the claimed slot before the main snapshot is published; a
++ * reader only looks at it once that slot reads valid. Kept out of line so
++ * the capture stack frame does not grow.
++ */
++static noinline void mt76x02_snapshot_frame(struct mt76x02_dev *dev,
++					    struct mt76x02_diag_frame *out)
++{
++	struct mt76_txwi_cache *t;
++	struct mt76_queue *q = NULL;
++	u32 n, dma, cpu, idx, prev, ctrl, k;
++	int i;
++
++	/* PBF page counts and queue status: plain status registers, the same
++	 * ones mt76x0_mac_stop() polls in a loop. No read-to-clear counters.
++	 */
++	out->pbf_pcnt = mt76_rr(dev, 0x0438);
++	out->pbf_a30 = mt76_rr(dev, 0x0a30);
++	out->pbf_a34 = mt76_rr(dev, 0x0a34);
++	out->txq_sta = mt76_rr(dev, MT_TXQ_STA);
++	out->rxq_sta = mt76_rr(dev, MT_RXQ_STA);
++
++	for (i = 0; i < 4; i++) {
++		if (dev->tx_hang_check[i] >= MT_TX_HANG_TH) {
++			q = dev->mphy.q_tx[i];
++			break;
++		}
++	}
++	if (!q || !q->desc || !q->regs || q->ndesc <= 0)
++		return;
++
++	n = q->ndesc;
++	dma = readl(&q->regs->dma_idx);
++	cpu = readl(&q->regs->cpu_idx);
++	if (dma >= n || cpu >= n || dma == cpu)
++		return;
++
++	/* Walk back to the descriptor after the previous frame's last one.
++	 * Reaped descriptors keep their contents until the ring wraps, and a
++	 * frame spans at most (32 + 1) / 2 descriptors (mt76_tx_info).
++	 */
++	idx = dma;
++	for (k = 1; k < MT76X02_SNAPSHOT_FRAME_DESC; k++) {
++		prev = (idx + n - 1) % n;
++		if (prev == cpu)
++			break;
++		dma_rmb();
++		ctrl = le32_to_cpu(READ_ONCE(q->desc[prev].ctrl));
++		if (ctrl & (MT_DMA_CTL_LAST_SEC0 | MT_DMA_CTL_LAST_SEC1 |
++			    MT_DMA_CTL_DMA_DONE))
++			break;
++		idx = prev;
++	}
++
++	out->queue = i;
++	out->first = idx;
++	for (k = 0; k < MT76X02_SNAPSHOT_FRAME_DESC; ) {
++		struct mt76_desc *d = &q->desc[idx];
++
++		dma_rmb();
++		ctrl = le32_to_cpu(READ_ONCE(d->ctrl));
++		out->ctrl[k] = ctrl;
++		out->off0[k] = le32_to_cpu(READ_ONCE(d->buf0)) & 0xfff;
++		out->off1[k] = le32_to_cpu(READ_ONCE(d->buf1)) & 0xfff;
++		out->last = idx;
++		k++;
++		if (ctrl & (MT_DMA_CTL_LAST_SEC0 | MT_DMA_CTL_LAST_SEC1)) {
++			out->ended = 1;
++			break;
++		}
++		idx = (idx + 1) % n;
++		if (idx == cpu)
++			break;
++	}
++	out->ndesc = k;
++
++	/* The frame's txwi sits in the entry of its last descriptor. That entry
++	 * is not reaped while the hardware has not passed it (the cleanup stops
++	 * at dma_idx), and txwi cache memory is only freed at teardown.
++	 */
++	if (out->ended) {
++		t = READ_ONCE(q->entry[out->last].txwi);
++		if (t && t != DMA_DUMMY_DATA) {
++			__le32 *w = (__le32 *)mt76_get_txwi_ptr(&dev->mt76, t);
++
++			out->txwi_w0 = le32_to_cpu(READ_ONCE(w[0]));
++			out->txwi_w1 = le32_to_cpu(READ_ONCE(w[1]));
++			out->txwi_w4 = le32_to_cpu(READ_ONCE(w[4]));
++			out->txwi_valid = 1;
++		}
++	}
++	out->valid = 1;
++}
++
++static void mt76x02_capture_watchdog(struct mt76x02_dev *dev,
++				   bool tx_trigger, bool mcu_trigger)
++{
++	struct mt76x02_diag_snapshot snap = {};
++	unsigned long flags;
++	int slot, i;
++
++	/* Freeze the first events, not a ring that could overwrite the cause. */
++	if (atomic_read(&watchdog_snapshot_next) >= MT76X02_SNAPSHOT_COUNT)
++		return;
++	slot = atomic_inc_return(&watchdog_snapshot_next) - 1;
++	if (slot >= MT76X02_SNAPSHOT_COUNT)
++		return;
++	snap.sequence = slot + 1;
++	snap.uptime_ms = div_u64(ktime_get_boottime_ns(), NSEC_PER_MSEC);
++	snap.tx_trigger = tx_trigger;
++	snap.mcu_trigger = mcu_trigger;
++	/* Status/configuration reads only; no read-to-clear traffic counters. */
++	snap.irq_source = mt76_rr(dev, MT_INT_SOURCE_CSR);
++	snap.irq_hw_mask = mt76_rr(dev, MT_INT_MASK_CSR);
++	snap.irq_sw_mask = READ_ONCE(dev->mt76.mmio.irqmask);
++	snap.dma_glo = mt76_rr(dev, MT_WPDMA_GLO_CFG);
++	snap.mac_sys = mt76_rr(dev, MT_MAC_SYS_CTRL);
++	snap.mac_status = mt76_rr(dev, MT_MAC_STATUS);
++	snap.txop = mt76_rr(dev, MT_TXOP_CTRL_CFG);
++	snap.retry = mt76_rr(dev, MT_TX_RETRY_CFG);
++	snap.auto_rsp = mt76_rr(dev, MT_AUTO_RSP_CFG);
++	for (i = 0; i < 4; i++) {
++		mt76x02_snapshot_queue(&snap.q[i], dev->mphy.q_tx[i]);
++		/* The detector updates visited queues before returning. This is
++		 * its last checked value per queue, not an independent history.
++		 */
++		snap.q[i].last_checked_dma = dev->mt76.tx_dma_idx[i];
++		snap.q[i].hang_check = dev->tx_hang_check[i];
++	}
++	mt76x02_snapshot_queue(&snap.q[4], dev->mt76.q_mcu[MT_MCUQ_WM]);
++	mt76x02_snapshot_queue(&snap.q[5], &dev->mt76.q_rx[MT_RXQ_MAIN]);
++	mt76x02_snapshot_queue(&snap.q[6], &dev->mt76.q_rx[MT_RXQ_MCU]);
++	mt76x02_snapshot_frame(dev, &watchdog_frames[slot]);
++	snap.valid = 1;
++	/* Publishing is coherent, hardware reads themselves are sequential.
++	 * Do not hold queue/IRQ locks or delay the recovery during capture.
++	 */
++	spin_lock_irqsave(&watchdog_snapshot_lock, flags);
++	watchdog_snapshots[slot] = snap;
++	spin_unlock_irqrestore(&watchdog_snapshot_lock, flags);
++}
++
++static noinline int mt76x02_snapshot_frame_get(char *buf, int n, int slot)
++{
++	struct mt76x02_diag_frame fr;
++	unsigned long flags;
++	u32 k;
++
++	spin_lock_irqsave(&watchdog_snapshot_lock, flags);
++	fr = watchdog_frames[slot];
++	spin_unlock_irqrestore(&watchdog_snapshot_lock, flags);
++
++	n += scnprintf(buf+n, PAGE_SIZE-n,
++		"pbf pcnt=%08x a30=%08x a34=%08x txq_sta=%08x rxq_sta=%08x\n",
++		fr.pbf_pcnt, fr.pbf_a30, fr.pbf_a34, fr.txq_sta, fr.rxq_sta);
++	if (!fr.valid)
++		return n;
++	/* w1[31:16] is the TXWI len_ctl, the MPDU length the MAC is told. */
++	n += scnprintf(buf+n, PAGE_SIZE-n,
++		"frame q=%u first=%u last=%u ndesc=%u ended=%u txwi=%u w0=%08x w1=%08x w4=%08x mpdu_len=%u\n",
++		fr.queue, fr.first, fr.last, fr.ndesc, fr.ended, fr.txwi_valid,
++		fr.txwi_w0, fr.txwi_w1, fr.txwi_w4, fr.txwi_w1 >> 16);
++	for (k = 0; k < fr.ndesc && k < MT76X02_SNAPSHOT_FRAME_DESC; k++)
++		n += scnprintf(buf+n, PAGE_SIZE-n, " fd%u=%08x/%03x/%03x",
++			       k, fr.ctrl[k], fr.off0[k], fr.off1[k]);
++	n += scnprintf(buf+n, PAGE_SIZE-n, "\n");
++	return n;
++}
++
++static int mt76x02_snapshot_get(char *buf, const struct kernel_param *kp)
++{
++	struct mt76x02_diag_snapshot snap;
++	unsigned long flags;
++	int n = 0, i, slot;
++
++	slot = (struct mt76x02_diag_snapshot *)kp->arg - watchdog_snapshots;
++	spin_lock_irqsave(&watchdog_snapshot_lock, flags);
++	snap = *(struct mt76x02_diag_snapshot *)kp->arg;
++	spin_unlock_irqrestore(&watchdog_snapshot_lock, flags);
++	n += scnprintf(buf+n, PAGE_SIZE-n,
++		"version=2 valid=%u seq=%u uptime_ms=%u tx=%u mcu=%u\n"
++		"irq_source=%08x irq_hw_mask=%08x irq_sw_mask=%08x dma_glo=%08x\n"
++		"mac_sys=%08x mac_status=%08x txop=%08x retry=%08x auto_rsp=%08x\n",
++		snap.valid, snap.sequence, snap.uptime_ms, snap.tx_trigger, snap.mcu_trigger,
++		snap.irq_source, snap.irq_hw_mask, snap.irq_sw_mask, snap.dma_glo,
++		snap.mac_sys, snap.mac_status, snap.txop, snap.retry, snap.auto_rsp);
++	if (!snap.valid)
++		return n;
++	for (i = 0; i < MT76X02_SNAPSHOT_QUEUES; i++) {
++		struct mt76x02_diag_queue *q = &snap.q[i];
++
++		n += scnprintf(buf+n, PAGE_SIZE-n,
++			"q=%d present=%u hw=%u n=%u queued=%u head=%u tail=%u cpu=%u dma=%u stop=%u block=%u last_checked_dma=%u hang=%u\n"
++			" tail_desc=%u/%08x/%08x/%02x dma_desc=%u/%08x/%08x/%02x\n",
++			i, q->present, q->hw, q->ndesc, q->queued, q->head, q->tail,
++			q->cpu, q->dma, q->stopped, q->blocked, q->last_checked_dma, q->hang_check,
++			q->tail_desc.idx, q->tail_desc.ctrl, q->tail_desc.info, q->tail_desc.align,
++			q->dma_desc.idx, q->dma_desc.ctrl, q->dma_desc.info, q->dma_desc.align);
++	}
++	if (slot >= 0 && slot < MT76X02_SNAPSHOT_COUNT)
++		n = mt76x02_snapshot_frame_get(buf, n, slot);
++	return n;
++}
++
++static const struct kernel_param_ops mt76x02_snapshot_ops = {
++	.get = mt76x02_snapshot_get,
++};
++module_param_cb(watchdog_snapshot0, &mt76x02_snapshot_ops, &watchdog_snapshots[0], 0400);
++module_param_cb(watchdog_snapshot1, &mt76x02_snapshot_ops, &watchdog_snapshots[1], 0400);
++module_param_cb(watchdog_snapshot2, &mt76x02_snapshot_ops, &watchdog_snapshots[2], 0400);
++module_param_cb(watchdog_snapshot3, &mt76x02_snapshot_ops, &watchdog_snapshots[3], 0400);
++
++#endif
