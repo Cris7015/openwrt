@@ -1,4 +1,4 @@
-From f2c0662a56039a629e8db7a97c846b4d1e0edfb0 Mon Sep 17 00:00:00 2001
+From 55a9dfe13312ee4d13f5165f5c3f30065b355d04 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sun, 27 Sep 2026 01:12:00 -0300
 Subject: [PATCH] net: omci: never let the identity NVMEM cells keep the PON

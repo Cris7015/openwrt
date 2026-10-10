@@ -1,4 +1,4 @@
-From 536a457019e4af9d49a19ea38498c084187ef24a Mon Sep 17 00:00:00 2001
+From ae14f0ffb9dc1f79f6997fc1aa33f16211839b2b Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 3 Oct 2026 19:05:20 -0300
 Subject: [PATCH] net: airoha: whnat: send a batch as a list only when no qdisc
@@ -15,13 +15,12 @@ Check the qdisc of every TX queue of the vif instead.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit 5bc09f8cd15f78525dae489680798b624d9f6359)
 ---
  drivers/net/ethernet/airoha/airoha_whnat.c | 24 +++++++++++++++++++++-
  1 file changed, 23 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_whnat.c b/drivers/net/ethernet/airoha/airoha_whnat.c
-index bd92d4d87..aa42e0988 100644
+index 13528a783..b9df89b55 100644
 --- a/drivers/net/ethernet/airoha/airoha_whnat.c
 +++ b/drivers/net/ethernet/airoha/airoha_whnat.c
 @@ -27,6 +27,7 @@
@@ -32,7 +31,7 @@ index bd92d4d87..aa42e0988 100644
  
  #include "airoha_eth.h"
  #include "airoha_whnat.h"
-@@ -275,6 +276,27 @@ void airoha_whnat_batch_init(struct airoha_whnat_batch *batch)
+@@ -263,6 +264,27 @@ void airoha_whnat_batch_init(struct airoha_whnat_batch *batch)
  	}
  }
  
@@ -60,7 +59,7 @@ index bd92d4d87..aa42e0988 100644
  void airoha_whnat_batch_flush(struct airoha_whnat_batch *batch)
  {
  	int i;
-@@ -290,7 +312,7 @@ void airoha_whnat_batch_flush(struct airoha_whnat_batch *batch)
+@@ -278,7 +300,7 @@ void airoha_whnat_batch_flush(struct airoha_whnat_batch *batch)
  		/* A queueless vif with no taps takes the whole batch as one
  		 * list; anything else goes through the qdisc frame by frame.
  		 */

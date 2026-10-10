@@ -1,4 +1,4 @@
-From 267eb4a33ee865852fbf557f14a445bb2c85a473 Mon Sep 17 00:00:00 2001
+From 7add9ef80b6fa8650a44430fbabca6d3b487dd17 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 3 Oct 2026 19:55:44 -0300
 Subject: [PATCH] net: airoha: xpon: restart the GPON session when the OMCI
@@ -21,13 +21,12 @@ WAN session up 5 seconds later.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit ed022edc8c462628a693ec1e0d2774515286132e)
 ---
  drivers/net/ethernet/airoha/airoha_xpon.c | 7 +++++++
  1 file changed, 7 insertions(+)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
-index 2c6dc89e2..2eb42c4ff 100644
+index 63d881bcd..bf56f7ff4 100644
 --- a/drivers/net/ethernet/airoha/airoha_xpon.c
 +++ b/drivers/net/ethernet/airoha/airoha_xpon.c
 @@ -1848,6 +1848,13 @@ void airoha_gpon_omci_hw_set_operational(void *hw_priv, bool operational)

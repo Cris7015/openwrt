@@ -1,4 +1,4 @@
-From 29f498b625ff7a9a0900ab6cf0e66640d3403786 Mon Sep 17 00:00:00 2001
+From b2c984f5b15ed6cfe3484a6d566d8d540bcd46f2 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Wed, 7 Oct 2026 01:22:00 -0300
 Subject: [PATCH] PCI: mediatek: repeat EN751221 reset after PHY setup
@@ -17,7 +17,7 @@ Signed-off-by: Cristian Papa <pcristian292@gmail.com>
  1 file changed, 68 insertions(+)
 
 diff --git a/drivers/pci/controller/pcie-mediatek.c b/drivers/pci/controller/pcie-mediatek.c
-index 0b27c0aa2..73c93e5ae 100644
+index f1fbde423..dd8e3effc 100644
 --- a/drivers/pci/controller/pcie-mediatek.c
 +++ b/drivers/pci/controller/pcie-mediatek.c
 @@ -118,6 +118,12 @@

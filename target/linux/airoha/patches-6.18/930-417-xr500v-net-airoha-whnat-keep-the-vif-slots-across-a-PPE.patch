@@ -1,4 +1,4 @@
-From 518b2939c343d1952c20232c1625c35c8d75353f Mon Sep 17 00:00:00 2001
+From c967b9a332447501be55d5f9ec8b659d63d1407c Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Fri, 2 Oct 2026 05:09:48 -0300
 Subject: [PATCH] net: airoha: whnat: keep the vif slots across a PPE
@@ -27,10 +27,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  1 file changed, 15 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_whnat.c b/drivers/net/ethernet/airoha/airoha_whnat.c
-index 13528a783..bd92d4d87 100644
+index b9df89b55..aa42e0988 100644
 --- a/drivers/net/ethernet/airoha/airoha_whnat.c
 +++ b/drivers/net/ethernet/airoha/airoha_whnat.c
-@@ -110,7 +110,15 @@ void airoha_whnat_clear_ppe(struct airoha_ppe *ppe)
+@@ -111,7 +111,15 @@ void airoha_whnat_clear_ppe(struct airoha_ppe *ppe)
  	RCU_INIT_POINTER(active_ppe, NULL);
  	synchronize_net();
  
@@ -47,7 +47,7 @@ index 13528a783..bd92d4d87 100644
  	mutex_lock(&vif_lock);
  	for (i = 0; i < AIROHA_WHNAT_VIFS; i++)
  		airoha_whnat_release_slot(i, false);
-@@ -131,12 +139,16 @@ void airoha_whnat_clear_qdma(struct airoha_qdma *qdma)
+@@ -132,12 +140,16 @@ void airoha_whnat_clear_qdma(struct airoha_qdma *qdma)
  	synchronize_net();
  }
  

@@ -1,4 +1,4 @@
-From 83c664c39394eac95978d85b2829f52e560ed9c5 Mon Sep 17 00:00:00 2001
+From 1855fc237f67595864d326336e1a0707cd919ca8 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Wed, 7 Oct 2026 01:21:41 -0300
 Subject: [PATCH] mtd: nand: en75_bmt: support the Archer XR500v OEM bootloader

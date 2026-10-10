@@ -1,4 +1,4 @@
-From c69e2fd08024cbfb8f5539de7934e2e2609d96a0 Mon Sep 17 00:00:00 2001
+From 323a1fc6b76d9cbb515fc146055a4eb18a7c4cb6 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Wed, 7 Oct 2026 01:22:00 -0300
 Subject: [PATCH] PCI: mediatek: add opt-in EN751221 port0 config quirks
@@ -19,7 +19,7 @@ Signed-off-by: Cristian Papa <pcristian292@gmail.com>
  1 file changed, 57 insertions(+), 9 deletions(-)
 
 diff --git a/drivers/pci/controller/pcie-mediatek.c b/drivers/pci/controller/pcie-mediatek.c
-index 232969d2c..0b27c0aa2 100644
+index bfc3e4367..f1fbde423 100644
 --- a/drivers/pci/controller/pcie-mediatek.c
 +++ b/drivers/pci/controller/pcie-mediatek.c
 @@ -115,6 +115,13 @@

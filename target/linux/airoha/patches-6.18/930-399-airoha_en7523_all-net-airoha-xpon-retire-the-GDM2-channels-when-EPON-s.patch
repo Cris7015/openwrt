@@ -1,4 +1,4 @@
-From 865cf2fb6e57d937535f5f6ddae4ee6831960e3a Mon Sep 17 00:00:00 2001
+From 157ef14850456ea815f6564571c81926fa65b0cd Mon Sep 17 00:00:00 2001
 From: Ifran Ali <khanu.i.i.k.2000@gmail.com>
 Date: Wed, 30 Sep 2026 11:50:12 +0530
 Subject: [PATCH] net: airoha: xpon: retire the GDM2 channels when EPON stops
@@ -31,17 +31,16 @@ Vendor sources (airoha/airoha_sdk 04eeabf3e906):
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Ifran Ali <khanu.i.i.k.2000@gmail.com>
-(cherry picked from commit 057ddd40af0c61a85e1579bf1e03600af533e96c)
 ---
  drivers/net/ethernet/airoha/airoha_xpon.c | 30 +++++++++++++++++++++++
  drivers/net/ethernet/airoha/airoha_xpon.h |  3 +++
  2 files changed, 33 insertions(+)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
-index bb354af31..5c4536b8e 100644
+index 5c7f8c0a2..2eb42c4ff 100644
 --- a/drivers/net/ethernet/airoha/airoha_xpon.c
 +++ b/drivers/net/ethernet/airoha/airoha_xpon.c
-@@ -3382,12 +3382,31 @@ static void epon_report_registration(struct xpon_priv *priv)
+@@ -3398,12 +3398,31 @@ static void epon_report_registration(struct xpon_priv *priv)
  		XPON_REGISTRATION_REGISTERING);
  }
  
@@ -73,7 +72,7 @@ index bb354af31..5c4536b8e 100644
  	}
  	if (priv->oam)
  		xpon_oam_llid_unregistered(priv->oam, idx);
-@@ -3848,6 +3867,15 @@ static void epon_disable(struct xpon_priv *priv)
+@@ -3864,6 +3883,15 @@ static void epon_disable(struct xpon_priv *priv)
  	if (ret)
  		dev_warn(priv->dev, "failed to disable EPON datapath: %d\n", ret);
  
@@ -89,7 +88,7 @@ index bb354af31..5c4536b8e 100644
  	airoha_xpon_phy_stop(priv->dev, priv->phy,
  			      AIROHA_XPON_MODE_EPON,
  			      &priv->phy_initialized,
-@@ -4180,6 +4208,7 @@ static int airoha_xpon_init_epon(struct platform_device *pdev,
+@@ -4196,6 +4224,7 @@ static int airoha_xpon_init_epon(struct platform_device *pdev,
  	/* Keep the Linux IRQ line enabled and quiesce the MAC at its source. */
  	epon_write(priv, EPON_INT_EN, 0);
  	epon_write(priv, EPON_INT_STATUS, ~0U);
@@ -97,7 +96,7 @@ index bb354af31..5c4536b8e 100644
  	ret = airoha_xpon_request_mac_irq(pdev, priv, epon_isr);
  	if (ret) {
  		destroy_workqueue(priv->fsm_wq);
-@@ -4193,6 +4222,7 @@ static void airoha_xpon_cleanup_epon(struct xpon_priv *priv)
+@@ -4209,6 +4238,7 @@ static void airoha_xpon_cleanup_epon(struct xpon_priv *priv)
  {
  	if (!priv->fsm_wq)
  		return;
@@ -106,10 +105,10 @@ index bb354af31..5c4536b8e 100644
  	priv->fsm_wq = NULL;
  }
 diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
-index a62e40c49..7769ce03d 100644
+index b4542bef7..b9115fb4f 100644
 --- a/drivers/net/ethernet/airoha/airoha_xpon.h
 +++ b/drivers/net/ethernet/airoha/airoha_xpon.h
-@@ -397,6 +397,9 @@ struct xpon_priv {
+@@ -401,6 +401,9 @@ struct xpon_priv {
  
  	struct ploam_priv	*ploam;
  	int			registered_llids;

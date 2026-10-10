@@ -1,4 +1,4 @@
-From 056bce3b384e1fcfda2125c7da63107117bc42e5 Mon Sep 17 00:00:00 2001
+From 009b507e6f4278f697dac7eaceaa07fda564a8c2 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 3 Oct 2026 18:20:00 -0300
 Subject: [PATCH] net: airoha: ppe: free the v1 flows of a flow block when it
@@ -30,17 +30,16 @@ or by a full flush, instead of only by the DESTROY.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit 8e76bce60998457f029a7ef82c12b80b438721f1)
 ---
  drivers/net/ethernet/airoha/airoha_eth.h |  4 ++
  drivers/net/ethernet/airoha/airoha_ppe.c | 91 +++++++++++++++++++++---
  2 files changed, 84 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index 9d8b0d243..8af319ad3 100644
+index 84630648a..59f28a829 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
-@@ -802,6 +802,10 @@ struct airoha_flow_table_entry {
+@@ -796,6 +796,10 @@ struct airoha_flow_table_entry {
  	struct list_head v1_list;
  	/* v1: last real activity (RX bind or hardware BIND timestamp). */
  	unsigned long v1_lastused;

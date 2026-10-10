@@ -1,4 +1,4 @@
-From b63c6e9cce0e126ba79080035f495c3605cfb466 Mon Sep 17 00:00:00 2001
+From 588f21cd2cb04470b3fa90e9c540ed595c306c5f Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 3 Oct 2026 19:00:03 -0300
 Subject: [PATCH] net: airoha: econet: account BQL under the TX ring lock
@@ -25,7 +25,6 @@ from either path, is accounted under the same lock as its completion.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit fd25b9faaad3c72f847509a4b8e106a450a5d298)
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 35 ++++++++++--------------
  1 file changed, 15 insertions(+), 20 deletions(-)

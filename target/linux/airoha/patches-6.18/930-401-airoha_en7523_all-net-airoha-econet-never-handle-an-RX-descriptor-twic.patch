@@ -1,4 +1,4 @@
-From 1a1a17d084f7e1b4b83933e3aa118c63cee6d111 Mon Sep 17 00:00:00 2001
+From 75f81d82865c98223e8884b05f848a7a453b3e23 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 3 Oct 2026 19:02:18 -0300
 Subject: [PATCH] net: airoha: econet: never handle an RX descriptor twice
@@ -24,7 +24,6 @@ descriptors are missing.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit 78e4a155f709ec1ad347daba3700273a71feaf7f)
 ---
  drivers/net/ethernet/airoha/airoha_eth.c | 18 +++++++++++++++---
  drivers/net/ethernet/airoha/airoha_eth.h |  3 +++

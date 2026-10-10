@@ -1,4 +1,4 @@
-From d252dcbe879170a59aaf6d875580c450fd80f621 Mon Sep 17 00:00:00 2001
+From 9dc6c9eca2c93a49316e92c95ec3ac4bee858304 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sun, 27 Sep 2026 01:10:00 -0300
 Subject: [PATCH] nvmem: core: do not defer cells missing from a bound layout

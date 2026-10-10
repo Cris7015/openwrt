@@ -1,4 +1,4 @@
-From 7464e21c95dc389228b8fde415f8b1a0f87f25ba Mon Sep 17 00:00:00 2001
+From b4c3076af1025189b885165fe0d3a9987e0edbc6 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 26 Sep 2026 05:37:19 -0300
 Subject: [PATCH] net: dsa: mt7530: quiesce EN751221 hardware PHY polling
@@ -33,7 +33,6 @@ trained directly, where the failure used to hit about 3 % of them.
 
 Assisted-by: Codex:gpt-6-astra
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit 2f39faae88b3bb90916ca6f145d2c8e3bd855535)
 ---
  drivers/net/dsa/mt7530-mmio.c | 25 +++++++++++++++++++++++++
  drivers/net/dsa/mt7530.h      |  4 ++++

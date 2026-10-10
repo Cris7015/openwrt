@@ -1,4 +1,4 @@
-From a6b21c7a950521f6276923fb7989ee09099f0b4e Mon Sep 17 00:00:00 2001
+From 0ac158093a17bd60eb9b7fb9402556b771afe5ca Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sat, 26 Sep 2026 05:37:19 -0300
 Subject: [PATCH] net: dsa: mt7530: finish the EN751221 TRGMII setup
@@ -21,7 +21,6 @@ first patch stops.
 
 Assisted-by: Codex:gpt-6-astra
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
-(cherry picked from commit de077676832e26c72b67350bcc919002692d2dd1)
 ---
  drivers/net/dsa/mt7530.c | 40 ++++++++++++++++++++++++++++++----------
  1 file changed, 30 insertions(+), 10 deletions(-)

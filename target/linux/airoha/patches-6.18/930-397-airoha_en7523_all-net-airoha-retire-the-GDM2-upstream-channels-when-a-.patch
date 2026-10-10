@@ -1,4 +1,4 @@
-From f3cd1416dd2dc0c1a1792e3cecc775d64728b793 Mon Sep 17 00:00:00 2001
+From b0f16e6f4c32bc276fe46094400856a1632ddfdc Mon Sep 17 00:00:00 2001
 From: Ifran Ali <khanu.i.i.k.2000@gmail.com>
 Date: Tue, 29 Sep 2026 19:24:26 +0530
 Subject: [PATCH] net: airoha: retire the GDM2 upstream channels when a GPON
@@ -48,7 +48,6 @@ Vendor sources (airoha/airoha_sdk 04eeabf3e906):
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Signed-off-by: Ifran Ali <khanu.i.i.k.2000@gmail.com>
-(cherry picked from commit 3f25b6a95a51ee16b14ee3a640c6bbbfc3e877de)
 ---
  drivers/net/ethernet/airoha/airoha_eth.c  | 138 ++++++++++++++++++++++
  drivers/net/ethernet/airoha/airoha_eth.h  |   8 ++
@@ -255,7 +254,7 @@ index 82b761288..17a33f95d 100644
  	{ .compatible = "econet,en751221-eth", .data = &econet_en751221_soc_data },
  	{ .compatible = "econet,en7528-eth", .data = &econet_en7528_soc_data },
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
-index 84630648a..3c0aa9dd6 100644
+index 59f28a829..4abe1faee 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.h
 +++ b/drivers/net/ethernet/airoha/airoha_eth.h
 @@ -46,6 +46,10 @@ struct gdm;
@@ -269,7 +268,7 @@ index 84630648a..3c0aa9dd6 100644
  
  #define EN751221_DSA_SPORT_BASE		8
  #define EN751221_DSA_NUM_PORTS		5
-@@ -1044,6 +1048,8 @@ struct airoha_gdm_dev {
+@@ -1048,6 +1052,8 @@ struct airoha_gdm_dev {
  	const struct airoha_xpon_link_ops *xpon_ops;
  	void *xpon_priv;
  	enum airoha_xpon_mode xpon_mode;
@@ -278,7 +277,7 @@ index 84630648a..3c0aa9dd6 100644
  	bool xpon_started;
  	bool xpon_control_started;
  	/* Protects the xPON state consumed by netdev and ethtool callbacks. */
-@@ -1190,6 +1196,7 @@ struct airoha_eth_xpon_ops {
+@@ -1194,6 +1200,7 @@ struct airoha_eth_xpon_ops {
  	bool (*del_service)(struct net_device *netdev, u32 cookie, u16 *gem_port_id);
  	bool (*has_gem_service)(struct net_device *netdev, u16 gem_port_id);
  	void (*flush_services)(struct net_device *netdev);
@@ -286,7 +285,7 @@ index 84630648a..3c0aa9dd6 100644
  };
  
  enum airoha_mac_addr_mode {
-@@ -1387,6 +1394,7 @@ bool airoha_eth_xpon_del_service(struct net_device *netdev, u32 cookie,
+@@ -1391,6 +1398,7 @@ bool airoha_eth_xpon_del_service(struct net_device *netdev, u32 cookie,
  bool airoha_eth_xpon_has_gem_service(struct net_device *netdev,
  				     u16 gem_port_id);
  void airoha_eth_xpon_flush_services(struct net_device *netdev);
@@ -319,10 +318,10 @@ index 40194e6c1..e76038173 100644
  /* GPON downstream traffic uses GDM2 receive channels 0 and 1. */
  #define EN7523_GDM2_GPON_RX_CHN_MASK	GENMASK(1, 0)
 diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
-index be6023ca4..bb354af31 100644
+index bf56f7ff4..5c7f8c0a2 100644
 --- a/drivers/net/ethernet/airoha/airoha_xpon.c
 +++ b/drivers/net/ethernet/airoha/airoha_xpon.c
-@@ -2600,6 +2600,8 @@ static void gpon_disable(struct xpon_priv *priv)
+@@ -2607,6 +2607,8 @@ static void gpon_disable(struct xpon_priv *priv)
  				 "failed to stop GPON MPI: %d\n", ret);
  		dev_dbg(priv->dev, "GPON MBI/MPI stopped: %#08x\n",
  			gpon_read(priv, GPON_MBI_MPI_STOP));

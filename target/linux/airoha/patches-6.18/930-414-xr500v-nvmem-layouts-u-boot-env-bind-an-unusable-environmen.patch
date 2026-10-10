@@ -1,4 +1,4 @@
-From 6eede0006b183f6b0d6de0eaa6f314d5e62f2351 Mon Sep 17 00:00:00 2001
+From aa9e12b17f3f988f223a1b6aa5df413f94676030 Mon Sep 17 00:00:00 2001
 From: Cristian Papa <pcristian292@gmail.com>
 Date: Sun, 27 Sep 2026 00:40:00 -0300
 Subject: [PATCH] nvmem: layouts: u-boot-env: bind an unusable environment
