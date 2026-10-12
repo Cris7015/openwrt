@@ -1,0 +1,49 @@
+Subject: [PATCH] wifi: mt76: reject writes to XR500v diagnostic parameters
+
+The read-only watchdog snapshots and A-MSDU statistics only provide get
+callbacks. Their sysfs permissions prevent writes after loading, but the
+module parameter parser also accepts values supplied during module load
+and calls the set callback without checking for NULL.
+
+Provide setters that return -EPERM for these diagnostic outputs. Keep the
+existing readers, parameter arguments and permissions unchanged. Invalid
+load-time assignments now fail parsing instead of calling a NULL pointer.
+
+Assisted-by: LLM
+---
+diff --git a/mt76x02_watchdog_snapshot.h b/mt76x02_watchdog_snapshot.h
+--- a/mt76x02_watchdog_snapshot.h
++++ b/mt76x02_watchdog_snapshot.h
+@@ -287,7 +287,14 @@
+ 	return n;
+ }
+ 
++static int mt76x02_snapshot_set(const char *val,
++				const struct kernel_param *kp)
++{
++	return -EPERM;
++}
++
+ static const struct kernel_param_ops mt76x02_snapshot_ops = {
++	.set = mt76x02_snapshot_set,
+ 	.get = mt76x02_snapshot_get,
+ };
+ module_param_cb(watchdog_snapshot0, &mt76x02_snapshot_ops, &watchdog_snapshots[0], 0400);
+diff --git a/mt76x2/pci_amsdu.c b/mt76x2/pci_amsdu.c
+--- a/mt76x2/pci_amsdu.c
++++ b/mt76x2/pci_amsdu.c
+@@ -229,7 +229,14 @@
+ #undef C
+ }
+ 
++static int mt76x2e_amsdu_stats_set(const char *val,
++				const struct kernel_param *kp)
++{
++	return -EPERM;
++}
++
+ static const struct kernel_param_ops mt76x2e_amsdu_stats_ops = {
++	.set = mt76x2e_amsdu_stats_set,
+ 	.get = mt76x2e_amsdu_stats_get,
+ };
+ module_param_cb(amsdu_stats, &mt76x2e_amsdu_stats_ops, NULL, 0444);
