@@ -1,0 +1,38 @@
+Subject: [PATCH] wifi: mt76: mt76x02: preserve a published group WCID on re-add
+
+The MMIO restart path removes station WCIDs but leaves the
+interface group WCIDs published. The TX worker resumes before
+mac80211 adds the interfaces back, so a group WCID can still own
+pending packets or be linked into the TX status list at that
+point.
+
+Reinitializing the interface private data overwrites those live
+list links, packet IDs and queue state. Preserve a group WCID if
+the interface's slot still points to that same object. Normal
+remove/add still initializes it, since remove_interface
+unpublishes and cleans up the old WCID.
+
+Keeping the live object avoids a teardown racing with workers or
+RCU readers. Reconfiguration restores the hardware state and keys
+separately.
+
+Assisted-by: LLM
+
+---
+diff --git a/mt76x02_util.c b/mt76x02_util.c
+--- a/mt76x02_util.c
++++ b/mt76x02_util.c
+@@ -294,6 +294,13 @@
+ {
+ 	struct mt76x02_vif *mvif = (struct mt76x02_vif *)vif->drv_priv;
+ 	struct mt76_txq *mtxq;
++
++	/* The restart path leaves the group WCID published. Keep its queues
++	 * and list links intact while mac80211 adds the interface back.
++	 */
++	if (rcu_access_pointer(dev->mt76.wcid[MT_VIF_WCID(idx)]) ==
++	    &mvif->group_wcid)
++		return;
+ 
+ 	memset(mvif, 0, sizeof(*mvif));
+ 
