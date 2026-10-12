@@ -1,0 +1,87 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] wifi: mt76: mt76x02: remove the stations after the tx flush in a restart
+
+mt76x02_watchdog_reset() removes the stations, unpublishing their WCIDs,
+before it flushes the hardware tx queues and the tx status entries. The
+frames still queued are then completed with no station, and
+ieee80211_tx_status_ext() returns their airtime (AQL) to the global
+counters only, leaving it pending on the station. The station survives the
+restart, so that airtime is never returned; once it reaches the AQL high
+limit, mac80211 stops handing the station's frames on that AC to the
+driver, while the station stays associated.
+
+After a restart caused by a stuck tx queue, the stuck frames are completed
+this way. On an MT7612E AP with a phone uploading, the phone's pending BE
+airtime was 4736 us after one restart and 12004 us (the high limit is
+12000 us) after two more, with the global pending at 0 and the hardware
+queues empty; its BE queue was no longer dequeued until it reassociated.
+
+Remove the stations only after the flush. The key PN sync and the
+interface masks stay before the hardware reset. On mt76x2e, frames
+completed during the flush are untracked ones, reported without tx info,
+or tracked ones, reported as acked (MT_DRV_IGNORE_TXS_FAILED), so they do
+not feed the low-ack detection.
+
+In a subsequent MT7612E AP comparison, pending BE airtime drained to
+0-4 us after five resets with station removal after the flush. With
+station removal before the flush, it remained at 12004 us after three
+resets, with the global pending counter and hardware queues empty and
+the station BE queue no longer dequeued. This was one sequential phase
+per ordering, not independent trials for each reset.
+
+Fixes: 0fe88644c060 ("mt76: improve tx status codepath")
+Assisted-by: LLM
+---
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -415,8 +415,6 @@
+ 
+ static void mt76x02_reset_state(struct mt76x02_dev *dev)
+ {
+-	int i;
+-
+ 	lockdep_assert_held(&dev->mt76.mutex);
+ 
+ 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+@@ -425,6 +423,21 @@
+ 	ieee80211_iter_keys_rcu(dev->mt76.hw, NULL, mt76x02_key_sync, NULL);
+ 	rcu_read_unlock();
+ 
++	dev->mt76.vif_mask = 0;
++	dev->mt76.beacon_mask = 0;
++}
++
++/* Only after the frames left in the hardware queues have been completed:
++ * mac80211 returns their airtime (AQL) to the station given in the tx
++ * status. Without one it stays pending on the station for good, and after
++ * a few restarts under load the station's tx queues are no longer served.
++ */
++static void mt76x02_reset_stations(struct mt76x02_dev *dev)
++{
++	int i;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++
+ 	for (i = 0; i < MT76x02_N_WCIDS; i++) {
+ 		struct ieee80211_sta *sta;
+ 		struct ieee80211_vif *vif;
+@@ -456,9 +469,6 @@
+ 		if (ps)
+ 			set_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
+ 	}
+-
+-	dev->mt76.vif_mask = 0;
+-	dev->mt76.beacon_mask = 0;
+ }
+ 
+ static void mt76x02_watchdog_reset(struct mt76x02_dev *dev)
+@@ -515,6 +525,9 @@
+ 
+ 	mt76_tx_status_check(&dev->mt76, true);
+ 
++	if (restart)
++		mt76x02_reset_stations(dev);
++
+ 	mt76x02_mac_start(dev);
+ 
+ 	if (dev->ed_monitor)
