@@ -1,0 +1,81 @@
+From 5803a3050b479393013fde46314f706868226db7 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 11 Oct 2026 03:48:22 -0300
+Subject: [PATCH] wifi: mt76: mt76x02: sync the group key PN before a restart
+
+mt76x02_key_sync() skips keys without a station, including the GTK of
+an AP. The hardware advances its TX packet number without updating
+key->tx_pn. When mac80211 reinstalls the key after a watchdog restart,
+mt76x02_mac_wcid_set_key() writes that stale software value back to the
+hardware IV table. Peers retaining the GTK can then reject group frames
+as replays.
+
+On an MT7612E AP, saved snapshots show the hardware PN of the same active
+CCMP GTK falling from 6412 to 0 across two watchdog restarts, while its
+software PN remained zero. The PMF pairwise keys continued to advance
+their software counters.
+
+Use the interface's group WCID for keys without a station. Keep the
+key-index check so that, when two GTKs are installed, only the key
+programmed into that WCID is synchronized. Also retain the sw_iv check
+to avoid overwriting software-generated packet numbers, including those
+used by PMF pairwise keys.
+
+Fixes: 004960423fe1 ("mt76: mt76x2: implement full device restart on watchdog reset")
+Assisted-by: LLM
+
+---
+Reproduction: MT7612E in AP mode on an XR500v, using a locally patched
+OpenWrt kernel 6.18.44 and mac80211 backports 7.2. The key-sync callback
+has the same omission in the upstream base used here.
+
+Validation:
+- MIPS build against that kernel/backports: W=1 and the mt76 Makefile's
+  -Werror, 11 modules built, no warnings or errors.
+- Host tests compile the actual key-sync, key-install and PN helpers
+  with emulated registers under ASan/UBSan. The baseline fails the
+  captured 6412-PN regression; the candidate passes it and 12 test
+  groups with 363 assertions, including two GTKs, PMF, two interfaces,
+  repeated resets and rekey.
+- This fix has not been run on the router. The hardware observations
+  above reproduce the bug, not a successful test of the patched driver.
+
+This change only includes the group key in the existing PN snapshot.
+It does not change the watchdog's snapshot-before-MAC-stop ordering;
+whether hardware can still advance PN in that interval is a separate
+follow-up. It also does not change group-key selection or power save.
+
+AI assistance was used to review the captures and source, draft the
+change and message, and develop the host regression tests. No key
+material or raw packet payload is included.
+
+ mt76x02_mmio.c |    9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index dc7c03d2..ce4e0086 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -377,12 +377,13 @@ static void mt76x02_key_sync(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			     struct ieee80211_key_conf *key, void *data)
+ {
+ 	struct mt76x02_dev *dev = hw->priv;
++	struct mt76x02_vif *mvif = (struct mt76x02_vif *)vif->drv_priv;
+ 	struct mt76_wcid *wcid;
+ 
+-	if (!sta)
+-		return;
+-
+-	wcid = (struct mt76_wcid *)sta->drv_priv;
++	if (sta)
++		wcid = (struct mt76_wcid *)sta->drv_priv;
++	else
++		wcid = &mvif->group_wcid;
+ 
+ 	if (wcid->hw_key_idx != key->keyidx || wcid->sw_iv)
+ 		return;
+
+base-commit: 467ae2e3f190baf737e15e318906da0dc7d0ab91
+-- 
+2.47.3
+
