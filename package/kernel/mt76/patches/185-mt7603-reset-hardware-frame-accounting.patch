@@ -7,9 +7,11 @@ keep stale hw_pending counts and can remain on TX_HOLD until the fallback
 resynchronization releases them.
 
 Clear each station's pending count after the reset has discarded TX and
-RX rings, before restarting DMA. Release its hold through the existing
-helper so its TX queues are scheduled again. The TX worker, RX/TX NAPI
-and pre-TBTT tasklet are still disabled at this point.
+RX rings, only when recovery will resume the datapath. Release its hold
+through the existing helper immediately before restarting DMA. The TX
+worker, RX/TX NAPI and pre-TBTT tasklet are still disabled at this point.
+Keep the holds on failed recovery attempts, so queues are not scheduled
+while MT76_RESET remains active.
 
 Keep host power-save queues intact. Their frames have already left the
 hardware and are counted again when submitted, independently of the old
@@ -47,13 +49,12 @@ diff --git a/mt7603/mac.c b/mt7603/mac.c
  static void mt7603_mac_watchdog_reset(struct mt7603_dev *dev)
  {
  	int beacon_int = dev->mt76.beacon_int;
-@@ -1494,6 +1514,9 @@
- 	    (dev->cur_reset_cause == RESET_CAUSE_BEACON_STUCK &&
- 	     dev->reset_cause[RESET_CAUSE_BEACON_STUCK] >= 2))
+@@ -1496,6 +1516,8 @@
  		mt7603_pse_reset(dev);
-+
-+	/* TX and RX rings are discarded before the accounting is reset. */
-+	mt7603_hw_pending_reset(dev);
  
  	if (!dev->reset_cause[RESET_CAUSE_RESET_FAILED]) {
++		/* Release held TXQs only when the datapath will resume. */
++		mt7603_hw_pending_reset(dev);
  		mt7603_mac_dma_start(dev);
+ 
+ 		mt7603_irq_enable(dev, mask);
