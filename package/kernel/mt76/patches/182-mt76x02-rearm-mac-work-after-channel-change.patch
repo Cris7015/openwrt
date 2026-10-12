@@ -1,0 +1,56 @@
+Subject: [PATCH] wifi: mt76: mt76x02: rearm MAC work after channel changes
+
+mt76_set_channel() cancels the PHY's MAC work before invoking the
+driver's channel callback. The mt76x0 and mt76x2 callbacks do not
+requeue it. This leaves the periodic MAC error check, TX status
+timeout sweep and statistics updates inactive after the first
+channel change.
+
+Requeue the work in the three channel callbacks, covering mt76x0
+PCI/USB and mt76x2 PCI/USB. Also requeue it if the mt76x2 USB
+channel command fails, as the callback resumes the MAC in that
+case as well.
+
+Fixes: f4fdd7716290 ("wifi: mt76: partially move channel change code to core")
+Assisted-by: LLM
+
+---
+diff --git a/mt76x0/main.c b/mt76x0/main.c
+--- a/mt76x0/main.c
++++ b/mt76x0/main.c
+@@ -26,6 +26,9 @@
+ 		tasklet_enable(&dev->dfs_pd.dfs_tasklet);
+ 	}
+ 	mt76x02_pre_tbtt_enable(dev, true);
++
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
++				     MT_MAC_WORK_INTERVAL);
+ 
+ 	return 0;
+ }
+diff --git a/mt76x2/pci_main.c b/mt76x2/pci_main.c
+--- a/mt76x2/pci_main.c
++++ b/mt76x2/pci_main.c
+@@ -49,6 +49,9 @@
+ 
+ 	tasklet_enable(&dev->dfs_pd.dfs_tasklet);
+ 	tasklet_enable(&dev->mt76.pre_tbtt_tasklet);
++
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
++				     MT_MAC_WORK_INTERVAL);
+ 
+ 	return 0;
+ }
+diff --git a/mt76x2/usb_main.c b/mt76x2/usb_main.c
+--- a/mt76x2/usb_main.c
++++ b/mt76x2/usb_main.c
+@@ -45,6 +45,9 @@
+ 	mt76x2_mac_resume(dev);
+ 
+ 	mt76x02_pre_tbtt_enable(dev, true);
++
++	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
++				     MT_MAC_WORK_INTERVAL);
+ 
+ 	return err;
+ }
