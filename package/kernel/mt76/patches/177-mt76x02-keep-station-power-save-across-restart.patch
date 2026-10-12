@@ -1,0 +1,87 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] wifi: mt76: mt76x02: keep the station power save state across a restart
+
+mt76x02_reset_state() clears the private data of every station before a
+full restart, MT_WCID_FLAG_PS included, and mt76x02_sta_add() clears it
+again when mac80211 adds the station back. mac80211 keeps
+WLAN_STA_PS_STA across the restart, so a station that was asleep is
+still in power save for mac80211 but awake for the driver.
+mt76_check_sta() reports a power save change only when the PM bit of a
+frame differs from MT_WCID_FLAG_PS, so the station's next frames with PM
+cleared are not reported, and mac80211 keeps buffering its frames until
+the station goes to sleep and wakes up again.
+
+Keep MT_WCID_FLAG_PS across the restart and, on MMIO, set the WCID drop
+bit again, as mt76x02_sta_ps() had left them.
+
+Tests of the power save preservation logic on an MT7612E AP used 36
+forced restarts with an idle sleeping client. The first post-restart
+sample showed mac80211 in power save with the drop bit clear in 0/18
+restarts with preservation and 12/18 without it. The drop bit is only
+a proxy for the driver flag. These observations support state consistency,
+not a demonstrated improvement in packet delivery latency.
+
+Fixes: 004960423fe1 ("mt76: mt76x2: implement full device restart on watchdog reset")
+Assisted-by: LLM
+---
+The hardware observations above used the earlier PS-preservation revision.
+They are not a new hardware validation of the revised station-add error
+path or of the complete series with the TX-flush ordering change.
+
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -431,6 +431,7 @@
+ 		struct mt76x02_sta *msta;
+ 		struct mt76_wcid *wcid;
+ 		void *priv;
++		bool ps;
+ 
+ 		wcid = rcu_dereference_protected(dev->mt76.wcid[i],
+ 					lockdep_is_held(&dev->mt76.mutex));
+@@ -445,8 +446,15 @@
+ 		priv = msta->vif;
+ 		vif = container_of(priv, struct ieee80211_vif, drv_priv);
+ 
++		ps = test_bit(MT_WCID_FLAG_PS, &wcid->flags);
+ 		__mt76_sta_remove(&dev->mphy, vif, sta);
+ 		memset(msta, 0, sizeof(*msta));
++
++		/* mac80211 keeps the station in power save across the
++		 * restart, so mt76x02_sta_add() must restore it as well.
++		 */
++		if (ps)
++			set_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
+ 	}
+ 
+ 	dev->mt76.vif_mask = 0;
+--- a/mt76x02_util.c
++++ b/mt76x02_util.c
+@@ -241,9 +241,15 @@
+ 	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+ 	struct mt76x02_sta *msta = (struct mt76x02_sta *)sta->drv_priv;
+ 	struct mt76x02_vif *mvif = (struct mt76x02_vif *)vif->drv_priv;
++	/* mac80211 keeps the power save state of a station it adds back, as
++	 * after a restart, so keep ours as well when rebuilding the station.
++	 */
++	bool ps = test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
+ 	int idx = 0;
+ 
+ 	memset(msta, 0, sizeof(*msta));
++	if (ps)
++		set_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
+ 
+ 	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT76x02_N_WCIDS);
+ 	if (idx < 0)
+@@ -260,6 +266,12 @@
+ 	if (vif->type == NL80211_IFTYPE_AP)
+ 		set_bit(MT_WCID_FLAG_CHECK_PS, &msta->wcid.flags);
+ 
++	/* As mt76x02_sta_ps() left it; USB does not use the drop bit for
++	 * power save.
++	 */
++	if (ps && mt76_is_mmio(mdev))
++		mt76x02_mac_wcid_set_drop(dev, idx, true);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_sta_add);
