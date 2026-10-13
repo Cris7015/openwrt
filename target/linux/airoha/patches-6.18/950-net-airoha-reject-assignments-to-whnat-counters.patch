@@ -1,0 +1,29 @@
+Subject: [PATCH] net: airoha: reject assignments to WHNAT counters
+
+WHNAT exposes read-only atomic counters through custom module parameter
+operations with only a get callback. The permissions prevent sysfs writes,
+but a value supplied during parameter parsing still calls the missing
+set callback.
+
+Reject assignments with -EPERM while keeping counter reads, arguments and
+permissions unchanged. This applies to the local WHNAT extension and does
+not change packet forwarding or the writable whnat_enable parameter.
+
+Assisted-by: LLM
+---
+--- a/drivers/net/ethernet/airoha/airoha_whnat.c
++++ b/drivers/net/ethernet/airoha/airoha_whnat.c
+@@ -52,7 +52,13 @@
+ 	return sysfs_emit(buf, "%u\n", (unsigned int)atomic_read(kp->arg));
+ }
+ 
++static int counter_set(const char *val, const struct kernel_param *kp)
++{
++	return -EPERM;
++}
++
+ static const struct kernel_param_ops counter_ops = {
++	.set = counter_set,
+ 	.get = counter_get,
+ };
+ 
