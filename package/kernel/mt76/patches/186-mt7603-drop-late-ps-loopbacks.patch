@@ -1,0 +1,45 @@
+Subject: [PATCH] wifi: mt76: mt7603: discard power-save loopbacks after wakeup
+
+A station wakeup drains its power-save queue once, while the frames
+redirected by the PSE can still be waiting on a different RX ring. If
+those loopbacks are processed after the wakeup, they are queued for an
+already awake station and set the driver's buffered indication again.
+
+Check ps_sleeping under ps_lock before buffering a loopback, and keep
+the buffered notification in the same critical section. The wakeup's
+state change and queue drain use that lock too, so a late frame cannot
+repopulate the queue or publish a stale buffered indication after them.
+
+Discard late frames instead of retransmitting their old sequence and
+packet numbers after newer traffic or a wakeup BAR. The hardware pending
+count is already settled when the loopback is received. Sleeping stations
+still retain the existing frame parsing, queue limit and service-period
+handling, including temporary hardware PS bypass during U-APSD.
+
+Assisted-by: LLM
+---
+diff --git a/mt7603/dma.c b/mt7603/dma.c
+--- a/mt7603/dma.c
++++ b/mt7603/dma.c
+@@ -93,7 +93,6 @@
+ 	}
+ 
+ 	skb->priority = tid;
+-	ieee80211_sta_set_buffered(sta, tid, true);
+ 
+ 	val = le32_to_cpu(txd[0]);
+ 	val &= ~(MT_TXD0_P_IDX | MT_TXD0_Q_IDX);
+@@ -101,6 +100,13 @@
+ 	txd[0] = cpu_to_le32(val);
+ 
+ 	spin_lock_bh(&dev->ps_lock);
++	/* The wake-up may have drained psq before this loopback arrived. */
++	if (!msta->ps_sleeping) {
++		spin_unlock_bh(&dev->ps_lock);
++		goto free;
++	}
++
++	ieee80211_sta_set_buffered(sta, tid, true);
+ 	__skb_queue_tail(&msta->psq, skb);
+ 	if (skb_queue_len(&msta->psq) >= MT7603_PSQ_MAX) {
+ 		skb = __skb_dequeue(&msta->psq);
