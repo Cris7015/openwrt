@@ -1,0 +1,46 @@
+From 05fc7fb18f098483979b624806cca74554217c86 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 1 Aug 2026 21:15:26 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: clear the wcid drop mask for all
+ powersave responses
+
+Only frames that the driver has buffered in an ieee80211_txq are released
+through mt76_release_buffered_frames() and end up on the PSD queue. Frames
+that mac80211 buffered itself are handed back through the regular tx path
+and go out on the access category queue of the frame. Clearing the drop
+mask for MT_TXQ_PSD alone therefore misses them, and the hardware keeps
+discarding PS-Poll and U-APSD responses for a station that is still marked
+as sleeping. The client polls again on the next TIM and never receives
+anything, so its traffic stalls until it leaves powersave.
+
+Key off the tx info flags instead, the same way mt7603_tx_prepare_skb()
+does. This covers both release paths and any other frame that mac80211
+marks as exempt from powersave buffering.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ mt76x02_txrx.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/mt76x02_txrx.c b/mt76x02_txrx.c
+index 301b4318..b27c389f 100644
+--- a/mt76x02_txrx.c
++++ b/mt76x02_txrx.c
+@@ -141,11 +141,15 @@ int mt76x02_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ {
+ 	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)tx_info->skb->data;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx_info->skb);
+ 	struct mt76x02_txwi *txwi = txwi_ptr;
+-	bool ampdu = IEEE80211_SKB_CB(tx_info->skb)->flags & IEEE80211_TX_CTL_AMPDU;
++	bool ampdu = info->flags & IEEE80211_TX_CTL_AMPDU;
+ 	int hdrlen, len, pid, qsel = MT_QSEL_EDCA;
+ 
+-	if (qid == MT_TXQ_PSD && wcid && wcid->idx < 128)
++	if (wcid && wcid->idx < MT76x02_N_WCIDS &&
++	    ((info->flags & (IEEE80211_TX_CTL_NO_PS_BUFFER |
++			     IEEE80211_TX_CTL_CLEAR_PS_FILT)) ||
++	     (info->control.flags & IEEE80211_TX_CTRL_PS_RESPONSE)))
+ 		mt76x02_mac_wcid_set_drop(dev, wcid->idx, false);
+ 
+ 	hdrlen = ieee80211_hdrlen(hdr->frame_control);
