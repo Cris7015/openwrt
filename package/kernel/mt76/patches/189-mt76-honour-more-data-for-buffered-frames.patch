@@ -1,0 +1,93 @@
+From 2b7be52496ac0a418dd80bcb921adf963ccbffe3 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 1 Aug 2026 21:17:51 +0200
+Subject: [PATCH] wifi: mt76: honour the more-data flag when releasing buffered
+ frames
+
+The last frame of a service period was always sent with MORE_DATA clear,
+regardless of what mac80211 asked for and regardless of what is left in
+the released TIDs. mac80211 sets @more_data when other TIDs still hold
+buffered frames, and it expects the driver to set the bit itself when the
+released TIDs hold more than the requested number of frames. Neither was
+done, so a client that trusts MORE_DATA stops polling and its remaining
+traffic sits in the queues until the next TIM or until the client leaves
+powersave.
+
+Pass the flag down to the last frame and add what is still queued for the
+released TIDs.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ tx.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/tx.c b/tx.c
+index 6bcad275..e78e807b 100644
+--- a/tx.c
++++ b/tx.c
+@@ -412,7 +412,7 @@ mt76_txq_dequeue(struct mt76_phy *phy, struct mt76_txq *mtxq)
+ 
+ static void
+ mt76_queue_ps_skb(struct mt76_phy *phy, struct ieee80211_sta *sta,
+-		  struct sk_buff *skb, bool last,
++		  struct sk_buff *skb, bool last, bool more_data,
+ 		  enum ieee80211_frame_release_type reason)
+ {
+ 	struct mt76_wcid *wcid = (struct mt76_wcid *)sta->drv_priv;
+@@ -429,10 +429,29 @@ mt76_queue_ps_skb(struct mt76_phy *phy, struct ieee80211_sta *sta,
+ 			*ieee80211_get_qos_ctl(hdr) |= IEEE80211_QOS_CTL_EOSP;
+ 	}
+ 
+-	mt76_skb_set_moredata(skb, !last);
++	mt76_skb_set_moredata(skb, !last || more_data);
+ 	__mt76_tx_queue_skb(phy, MT_TXQ_PSD, skb, wcid, sta, NULL);
+ }
+ 
++static bool
++mt76_ps_tids_pending(struct ieee80211_sta *sta, u16 tids)
++{
++	int i;
++
++	for (i = 0; tids; i++, tids >>= 1) {
++		unsigned long frames, bytes;
++
++		if (!(tids & 1) || !sta->txq[i])
++			continue;
++
++		ieee80211_txq_get_depth(sta->txq[i], &frames, &bytes);
++		if (frames)
++			return true;
++	}
++
++	return false;
++}
++
+ void
+ mt76_release_buffered_frames(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
+ 			     u16 tids, int nframes,
+@@ -443,6 +462,7 @@ mt76_release_buffered_frames(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
+ 	struct mt76_dev *dev = phy->dev;
+ 	struct sk_buff *last_skb = NULL;
+ 	struct mt76_queue *hwq = phy->q_tx[MT_TXQ_PSD];
++	u16 release_tids = tids;
+ 	int i;
+ 
+ 	spin_lock_bh(&hwq->lock);
+@@ -462,14 +482,15 @@ mt76_release_buffered_frames(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
+ 			nframes--;
+ 			if (last_skb)
+ 				mt76_queue_ps_skb(phy, sta, last_skb, false,
+-						  reason);
++						  false, reason);
+ 
+ 			last_skb = skb;
+ 		} while (nframes);
+ 	}
+ 
+ 	if (last_skb) {
+-		mt76_queue_ps_skb(phy, sta, last_skb, true, reason);
++		more_data |= mt76_ps_tids_pending(sta, release_tids);
++		mt76_queue_ps_skb(phy, sta, last_skb, true, more_data, reason);
+ 		dev->queue_ops->kick(dev, hwq);
+ 	} else {
+ 		ieee80211_sta_eosp(sta);
