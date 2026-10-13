@@ -1,0 +1,61 @@
+From 56b11080436163adf71baed3898ee4748dfcfa43 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 1 Aug 2026 21:16:41 +0200
+Subject: [PATCH] wifi: mt76: mt76x02: serialise wcid drop mask updates
+
+One MT_WCID_DROP register word holds the drop bits of 32 stations, and the
+read-modify-write that flips a single bit is not serialised against
+anything. On MMIO devices mt76x02_sta_ps() runs it from the rx path while
+mt76x02_tx_prepare_skb() runs it from the tx path, so an update for one
+station can be lost, or an old value can be written back over it. A
+station whose drop bit is restored that way has all of its traffic
+discarded by the hardware until its next powersave transition.
+
+Take mt76.lock around the update. USB devices can only reach this from
+station setup, where register access may sleep and mt76.mutex already
+serialises the only two callers.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ mt76x02_mac.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+index 21f8b1e6..b34c56ed 100644
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -166,7 +166,8 @@ void mt76x02_mac_wcid_setup(struct mt76x02_dev *dev, u8 idx,
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_mac_wcid_setup);
+ 
+-void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
++static void
++__mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
+ {
+ 	u32 val = mt76_rr(dev, MT_WCID_DROP(idx));
+ 	u32 bit = MT_WCID_DROP_MASK(idx);
+@@ -176,6 +177,24 @@ void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
+ 		mt76_wr(dev, MT_WCID_DROP(idx), (val & ~bit) | (bit * drop));
+ }
+ 
++void mt76x02_mac_wcid_set_drop(struct mt76x02_dev *dev, u8 idx, bool drop)
++{
++	/*
++	 * On MMIO devices the mask is updated from the rx and tx paths in
++	 * parallel. USB devices only get here from station setup, where
++	 * mt76.mutex already serialises the two callers and where register
++	 * access can sleep.
++	 */
++	if (!mt76_is_mmio(&dev->mt76)) {
++		__mt76x02_mac_wcid_set_drop(dev, idx, drop);
++		return;
++	}
++
++	spin_lock_bh(&dev->mt76.lock);
++	__mt76x02_mac_wcid_set_drop(dev, idx, drop);
++	spin_unlock_bh(&dev->mt76.lock);
++}
++
+ static u16
+ mt76x02_mac_tx_rate_val(struct mt76x02_dev *dev,
+ 			const struct ieee80211_tx_rate *rate, u8 *nss_val)
