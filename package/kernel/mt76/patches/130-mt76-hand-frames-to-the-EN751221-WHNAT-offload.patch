@@ -1,0 +1,53 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] mt76: retain only the pre-GRO RX hook for EN751221 WHNAT
+
+The airoha netdevice notifier owns WiFi vif slots. Keep only the existing
+pre-GRO receive hook for the EN751221 radios without WED, so received
+frames can reach the PPE before aggregation without mt76 managing slots.
+
+Look up the RX hook once per poll with symbol_get() and release it after
+processing the list. Frames not consumed continue to napi_gro_receive().
+The airoha driver must use whnat_auto_vifs=1 and whnat_rx_hook=mt76.
+---
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1530,6 +1530,7 @@ mt76_check_sta(struct mt76_dev *dev, struct sk_buff *skb)
+ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 		      struct napi_struct *napi)
+ {
++	bool (*whnat_early)(struct sk_buff *skb) = NULL;
+ 	struct ieee80211_sta *sta;
+ 	struct ieee80211_hw *hw;
+ 	struct sk_buff *skb, *tmp;
+@@ -1561,10 +1562,20 @@ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 		return;
+ 	}
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
++	/* Looked up once per poll; the hook keeps the frames it takes. */
++	whnat_early = symbol_get(en75_whnat_upstream_early);
++#endif
+ 	list_for_each_entry_safe(skb, tmp, &list, list) {
+ 		skb_list_del_init(skb);
++		if (whnat_early && whnat_early(skb))
++			continue;
+ 		napi_gro_receive(napi, skb);
+ 	}
++#if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
++	if (whnat_early)
++		symbol_put(en75_whnat_upstream_early);
++#endif
+ }
+ 
+ void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,
+--- a/mt76.h
++++ b/mt76.h
+@@ -2179,4 +2179,8 @@ mt76_vif_link_phy(struct mt76_vif_link *mlink)
+ 	return ctx->phy;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
++bool en75_whnat_upstream_early(struct sk_buff *skb);
++#endif
++
+ #endif

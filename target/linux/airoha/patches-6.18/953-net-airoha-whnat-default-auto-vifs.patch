@@ -1,0 +1,40 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: default WHNAT to automatic vif slots
+
+The RX-only mt76 integration no longer registers or unregisters interfaces.
+Use the netdevice notifier by default while retaining mt76 as the default
+pre-GRO receive path. Keep ingress available as an explicit experiment.
+
+Legacy lifecycle exports remain for compatibility with older mt76 modules.
+The whnat_enable parameter and its userspace policy are unchanged.
+---
+--- a/drivers/net/ethernet/airoha/airoha_whnat.c
++++ b/drivers/net/ethernet/airoha/airoha_whnat.c
+@@ -73,7 +73,7 @@
+ module_param_cb(whnat_rx_hook, &rx_hook_ops, &whnat_ingress, 0444);
+ MODULE_PARM_DESC(whnat_rx_hook, "Receive path: mt76 or ingress (requires auto_vifs)");
+ 
+-static bool whnat_auto_vifs;
++static bool whnat_auto_vifs = true;
+ module_param(whnat_auto_vifs, bool, 0444);
+ MODULE_PARM_DESC(whnat_auto_vifs, "Manage WiFi slots through netdevice events");
+ 
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -69,11 +69,11 @@
+ 	  WHNAT driver: received frames are handed to the PPE through the LAN
+ 	  QDMA, and the PPE returns frames of flows bound towards a WiFi
+ 	  interface to the CPU, which queues them straight to that interface.
+-	  By default mt76 registers interfaces and offers RX frames through
+-	  exported hooks. Set whnat_auto_vifs=1 and whnat_rx_hook=ingress at
+-	  boot or module load to use standard netdevice and netfilter hooks
+-	  instead. The ingress path requires NETFILTER_INGRESS and disables
+-	  GRO on participating interfaces until their slots are released.
++	  By default netdevice events manage WiFi slots and mt76 offers RX
++	  frames through its pre-GRO hook. Set whnat_rx_hook=ingress at boot
++	  or module load to try the netfilter path instead. It requires
++	  NETFILTER_INGRESS and disables GRO until the slots are released.
++	  whnat_auto_vifs=0 requires the older mt76 lifecycle hooks.
+ 	  The whnat_enable parameter controls offering new frames to the PPE.
+ 
+ 	  If unsure, say N.
