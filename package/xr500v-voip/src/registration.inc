@@ -42,6 +42,25 @@ static void reg_write(void)
 		unlink(tmp);
 }
 
+/* The tone at off-hook for a provider account (keypad.inc). Nothing reported
+ * yet, as right after baresip starts, is not a failure: dial tone. */
+static int reg_dial_tone(void)
+{
+	int i, registering = 0, failed = 0;
+
+	for (i = 0; i < nregs; i++) {
+		if (!regs[i].state)
+			continue;
+		if (!strcmp(regs[i].state, "registered"))
+			return TONE_DIAL;
+		if (!strcmp(regs[i].state, "registering"))
+			registering = 1;
+		else
+			failed = 1;
+	}
+	return registering ? TONE_SIT : failed ? TONE_BUSY : TONE_DIAL;
+}
+
 static void reg_reset(void)
 {
 	nregs = 0;

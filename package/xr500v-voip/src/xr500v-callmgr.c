@@ -871,6 +871,7 @@ int main(void)
 			if ((mkfifo(diagnostic_path, 0600) == 0 || errno == EEXIST) &&
 			    lstat(diagnostic_path, &st) == 0 && S_ISFIFO(st.st_mode) && st.st_uid == getuid())
 				diagnostic_fd = open(diagnostic_path, O_RDWR | O_NONBLOCK);
+			worker_diag_fd = diagnostic_fd;
 		}
 	}
 
@@ -983,7 +984,11 @@ int main(void)
 			}
 			if (pfd[2].revents & (POLLHUP | POLLERR)) { abort = 1; reason = "collector_closed"; }
 			if (!finish && digit_count && clock_ms() - digit_at >= 4000) { finish = 1; logmsg("keypad interdigit timeout"); }
-			if (clock_ms() - dial_started >= 30000) { abort = 1; reason = "collection_timeout"; }
+			if (!abort) {
+				const char *why = keypad_expired(clock_ms());
+
+				if (why) { abort = 1; reason = why; }
+			}
 			if (finish || abort) keypad_finish(s, answered_ec, reason);
 		}
 

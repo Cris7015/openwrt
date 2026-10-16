@@ -39,6 +39,8 @@ static void enter_offhook(int ec)
 	leds_answer(ec);
 	hook_not_before = clock_ms() + 450;
 	stable_cnt = 0; stable_hk = -1;
+	/* Busy until the handset goes down, as after a call on the PSTN. */
+	tone_start(TONE_BUSY, OFFHOOK_BUSY_MS);
 }
 
 static void finish_owned_call(void)
@@ -390,7 +392,12 @@ static void handle_hook_sample(int s, int hk, int which, int diagnostic_fd)
 			int collect;
 			answered_ec = which; line_active(which); leds_answer(which);
 			collect = keypad_start(s, diagnostic_fd);
-			if (collect > 0) { state = COLLECTING; logmsg("KEYPAD -> collecting (30 s maximum)"); }
+			if (collect > 0) {
+				state = COLLECTING;
+				logmsg(keypad_tone == TONE_SIT ? "KEYPAD -> collecting, registering tone" :
+				       keypad_tone == TONE_BUSY ? "KEYPAD -> collecting, busy tone (account not registered)" :
+				       "KEYPAD -> collecting (20 s of dial tone)");
+			}
 			else {
 				state = OFFHOOK;
 				if (!collect) speeddial(s);
