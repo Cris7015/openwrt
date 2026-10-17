@@ -1,0 +1,73 @@
+From: Cris <tuputamadre7015@gmail.com>
+Subject: [PATCH] net: airoha: xpon: count GEM delineation losses instead of warning
+
+The loss-of-GEM-delineation interrupt does not change the activation state
+(see "do not treat GEM delineation loss as optical LOS"). A handful per hour
+is normal on a healthy link, yet each one printed a kern.warn line that looks
+like an alarm and, in bursts, floods the log.
+
+Count them in priv->gem_delin_events, expose the count as the gpon_gem_delin
+sysfs attribute next to gpon_bip, and keep the message at debug level.
+
+Assisted-by: Claude:claude-sonnet-5-5
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 800bc09..1cf4995 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1658,8 +1658,21 @@ static ssize_t gpon_bip_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RO(gpon_bip);
+ 
++static ssize_t gpon_gem_delin_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++
++	if (!priv)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(priv->gem_delin_events));
++}
++static DEVICE_ATTR_RO(gpon_gem_delin);
++
+ static struct attribute *gpon_bip_attrs[] = {
+ 	&dev_attr_gpon_bip.attr,
++	&dev_attr_gpon_gem_delin.attr,
+ 	NULL
+ };
+ 
+@@ -3097,9 +3110,17 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 					 ret);
+ 		}
+ 
+-		if (active & INT_LOSS_GEM_DEL)
+-			dev_warn_ratelimited(priv->dev,
+-					     "GPON loss of GEM delineation interrupt\n");
++		if (active & INT_LOSS_GEM_DEL) {
++			/*
++			 * A few of these per hour are normal on a healthy link
++			 * and do not change the activation state: count them
++			 * (gpon_gem_delin in sysfs) instead of warning.
++			 */
++			WRITE_ONCE(priv->gem_delin_events,
++				   priv->gem_delin_events + 1);
++			dev_dbg_ratelimited(priv->dev,
++					    "GPON loss of GEM delineation interrupt\n");
++		}
+ 
+ 		if (active & GPON_INT_ERROR_MASK)
+ 			gpon_dump_error_counters(priv, active &
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 80485d4..a3f7f5a 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -451,6 +451,8 @@ struct xpon_priv {
+ 	u64			bip_session_total;
+ 	u64			bip_pending;
+ 	unsigned long		bip_next;
++	/* GEM delineation losses seen by the ISR (counted, not logged) */
++	u32			gem_delin_events;
+ 
+ 	/* Protects the hardware T-CONT table and its software allocation maps. */
+ 	struct mutex		tcont_lock;
