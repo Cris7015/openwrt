@@ -1,0 +1,173 @@
+From: Cris <tuputamadre7015@gmail.com>
+Subject: [PATCH] net: airoha: offload IPv6 flows of WiFi clients through WHNAT
+
+Lab port of kernel-whnat-ipv6 70591a0a1 to the Plan C kernel: offer
+routed IPv6 TCP/UDP unicast frames (not link-local) to the PPE and let
+IPv6 5T routes target a vif. Off by default in this lab image, so a boot
+is exactly Plan C; echo 1 > /sys/module/airoha_eth/parameters/whnat_ipv6
+turns it on.
+
+Assisted-by: Claude:claude-opus-5-5
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3489,10 +3489,12 @@
+ 	if (wifi_idx >= 0) {
+ 		/*
+ 		 * Vendor WHNAT recipe: the CPU as PSE port, without QoS, and
+-		 * the vif index in an 802.1Q tag. Only IPv4 has been tested.
++		 * the vif index in an 802.1Q tag. IPv6 5T routes take the
++		 * same tag; whnat_ipv6 can keep them on the CPU.
+ 		 */
+ 		if (vlan_valid ||
+-		    airoha_foe_v1_packet_type(entry) == PPE_PKT_TYPE_IPV6_ROUTE_5T)
++		    (airoha_foe_v1_packet_type(entry) == PPE_PKT_TYPE_IPV6_ROUTE_5T &&
++		     !airoha_whnat_ipv6()))
+ 			return -EOPNOTSUPP;
+ 
+ 		airoha_foe_v1_entry_set_pse_port(entry, FE_PSE_PORT_CDM1);
+--- a/drivers/net/ethernet/airoha/airoha_whnat.c
++++ b/drivers/net/ethernet/airoha/airoha_whnat.c
+@@ -23,12 +23,14 @@
+ #include <linux/etherdevice.h>
+ #include <linux/if_arp.h>
+ #include <linux/if_vlan.h>
++#include <linux/ipv6.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/netfilter.h>
+ #include <linux/rcupdate.h>
+ #include <linux/unaligned.h>
+ #include <net/dsa.h>
++#include <net/ipv6.h>
+ #include <net/netdev_lock.h>
+ #include <net/sch_generic.h>
+ 
+@@ -88,11 +90,17 @@
+ module_param(whnat_enable, bool, 0644);
+ MODULE_PARM_DESC(whnat_enable, "Hand WiFi frames to the EN751221 PPE");
+ 
++static bool whnat_ipv6;
++module_param(whnat_ipv6, bool, 0644);
++MODULE_PARM_DESC(whnat_ipv6, "Also offload routed IPv6 TCP/UDP flows (lab: off by default)");
++
+ static atomic_t handed = ATOMIC_INIT(0);
+ static atomic_t completed = ATOMIC_INIT(0);
+ static atomic_t returned = ATOMIC_INIT(0);
+ static atomic_t downstream = ATOMIC_INIT(0);
+ static atomic_t fallback = ATOMIC_INIT(0);
++static atomic_t handed6 = ATOMIC_INIT(0);
++static atomic_t downstream6 = ATOMIC_INIT(0);
+ static atomic_t ingress_redirected = ATOMIC_INIT(0);
+ static atomic_t ingress_gso = ATOMIC_INIT(0);
+ static atomic_t ingress_tc = ATOMIC_INIT(0);
+@@ -117,6 +125,8 @@
+ module_param_cb(whnat_returned, &counter_ops, &returned, 0444);
+ module_param_cb(whnat_downstream, &counter_ops, &downstream, 0444);
+ module_param_cb(whnat_fallback, &counter_ops, &fallback, 0444);
++module_param_cb(whnat_handed6, &counter_ops, &handed6, 0444);
++module_param_cb(whnat_downstream6, &counter_ops, &downstream6, 0444);
+ module_param_cb(whnat_ingress_redirected, &counter_ops, &ingress_redirected, 0444);
+ module_param_cb(whnat_ingress_gso, &counter_ops, &ingress_gso, 0444);
+ module_param_cb(whnat_ingress_tc, &counter_ops, &ingress_tc, 0444);
+@@ -232,6 +242,11 @@
+ 	return READ_ONCE(whnat_enable) && rcu_access_pointer(active_ppe);
+ }
+ 
++bool airoha_whnat_ipv6(void)
++{
++	return READ_ONCE(whnat_ipv6);
++}
++
+ void airoha_whnat_complete(void)
+ {
+ 	atomic_inc(&completed);
+@@ -443,17 +458,46 @@
+ 	return idx;
+ }
+ 
++/*
++ * FoE v1 routes IPv6 TCP/UDP 5-tuples without extension headers. Offer only
++ * those, towards a unicast address beyond the link: neighbour discovery,
++ * multicast and link-local traffic always ends up on the CPU.
++ */
++static bool airoha_whnat_ipv6_offerable(const struct sk_buff *skb)
++{
++	const struct ipv6hdr *ip6h;
++	struct ipv6hdr _ip6h;
++	int type;
++
++	if (!READ_ONCE(whnat_ipv6))
++		return false;
++
++	ip6h = skb_header_pointer(skb, 0, sizeof(_ip6h), &_ip6h);
++	if (!ip6h || ip6h->version != 6 ||
++	    (ip6h->nexthdr != IPPROTO_TCP && ip6h->nexthdr != IPPROTO_UDP))
++		return false;
++
++	type = ipv6_addr_type(&ip6h->daddr);
++	return (type & IPV6_ADDR_UNICAST) &&
++	       !(type & (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK));
++}
++
+ static bool airoha_whnat_upstream(struct sk_buff *skb)
+ {
+ 	struct net_device *vif_dev;
+ 	struct airoha_qdma *qdma;
+ 	struct airoha_ppe *ppe;
+ 	bool taken = false;
++	bool ipv6;
+ 	int idx;
+ 
+ 	if (!READ_ONCE(whnat_enable) || !skb || !skb->dev ||
+-	    skb->protocol != htons(ETH_P_IP) || skb_is_gso(skb) ||
+-	    skb_vlan_tag_present(skb))
++	    skb_is_gso(skb) || skb_vlan_tag_present(skb))
++		return false;
++
++	ipv6 = skb->protocol == htons(ETH_P_IPV6);
++	if (ipv6 ? !airoha_whnat_ipv6_offerable(skb) :
++		   skb->protocol != htons(ETH_P_IP))
+ 		return false;
+ 
+ 	idx = airoha_whnat_vif_index(skb->dev);
+@@ -482,6 +526,8 @@
+ 	skb->dev = NULL;
+ 	if (airoha_whnat_qdma_xmit(qdma, skb) >= 0) {
+ 		atomic_inc(&handed);
++		if (ipv6)
++			atomic_inc(&handed6);
+ 		taken = true;
+ 	} else {
+ 		memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+@@ -614,6 +660,8 @@
+ 		skb_set_network_header(skb, ETH_HLEN);
+ 		skb->protocol = eth_hdr(skb)->h_proto;
+ 		atomic_inc(&downstream);
++		if (skb->protocol == htons(ETH_P_IPV6))
++			atomic_inc(&downstream6);
+ 		if (batch) {
+ 			if (!batch->dev[idx]) {
+ 				dev_hold(dev);
+--- a/drivers/net/ethernet/airoha/airoha_whnat.h
++++ b/drivers/net/ethernet/airoha/airoha_whnat.h
+@@ -27,6 +27,7 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
+ bool airoha_whnat_active(void);
++bool airoha_whnat_ipv6(void);
+ int airoha_whnat_vif_index(struct net_device *dev);
+ void airoha_whnat_set_ppe(struct airoha_ppe *ppe);
+ void airoha_whnat_clear_ppe(struct airoha_ppe *ppe);
+@@ -52,6 +53,11 @@
+ {
+ 	return false;
+ }
++
++static inline bool airoha_whnat_ipv6(void)
++{
++	return false;
++}
+ 
+ static inline int airoha_whnat_vif_index(struct net_device *dev)
+ {
