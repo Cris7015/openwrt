@@ -3,9 +3,9 @@ Subject: [PATCH] net: airoha: offload IPv6 flows of WiFi clients through WHNAT
 
 Lab port of kernel-whnat-ipv6 70591a0a1 to the Plan C kernel: offer
 routed IPv6 TCP/UDP unicast frames (not link-local) to the PPE and let
-IPv6 5T routes target a vif. Off by default in this lab image, so a boot
-is exactly Plan C; echo 1 > /sys/module/airoha_eth/parameters/whnat_ipv6
-turns it on.
+IPv6 5T routes target a vif. On by default (set 0 to fall back to
+Plan C behaviour): echo 0 > /sys/module/airoha_eth/parameters/whnat_ipv6
+switches it off.
 
 Assisted-by: Claude:claude-opus-5-5
 ---
@@ -47,9 +47,9 @@ Assisted-by: Claude:claude-opus-5-5
  module_param(whnat_enable, bool, 0644);
  MODULE_PARM_DESC(whnat_enable, "Hand WiFi frames to the EN751221 PPE");
  
-+static bool whnat_ipv6;
++static bool whnat_ipv6 = true;
 +module_param(whnat_ipv6, bool, 0644);
-+MODULE_PARM_DESC(whnat_ipv6, "Also offload routed IPv6 TCP/UDP flows (lab: off by default)");
++MODULE_PARM_DESC(whnat_ipv6, "Also offload routed IPv6 TCP/UDP flows (default: on)");
 +
  static atomic_t handed = ATOMIC_INIT(0);
  static atomic_t completed = ATOMIC_INIT(0);
