@@ -1,0 +1,56 @@
+From: Cris <tuputamadre7015@gmail.com>
+Subject: [PATCH] net: airoha: discard EN751221 duplicate PPE keepalive packets
+
+The generation-1 PPE is configured to send duplicate keepalive packets
+with the original headers to the CPU. The original packet has already
+been forwarded by the PPE, but the EcoNet RX path passes the keepalive
+copy to the network stack, allowing it to be routed a second time.
+
+Consume packets carrying KEEPALIVE_DUP_OLD_HDR on EN751221 before they
+reach the bind callback or GRO. Check after the xPON OAM handler because
+management frames use a different descriptor interpretation. Preserve
+normal unbound traffic and force-to-CPU packets, including WHNAT data.
+
+Flow activity is obtained from the bound FoE entry timestamp, so these
+copies do not need to traverse the stack to refresh the flowtable.
+
+
+Assisted-by: Codex:GPT-6
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 10 ++++++++++
+ drivers/net/ethernet/airoha/airoha_eth.h |  1 +
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index d44d31500..b37bbab69 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -463,6 +463,16 @@ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+ 					q->qdma->qdma->id, skb, &desc.msg))
+ 		return;
+ 
++	/* The PPE has already forwarded the original packet. Do not route its
++	 * duplicate keepalive copy through the network stack a second time.
++	 */
++	if (airoha_is(q->qdma->qdma->eth, econet_en751221) &&
++	    get_erx_crsn(&desc.msg.erx) ==
++	    AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	hash = get_erx_ppe_entry(&desc.msg.erx);
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 53d9c2e17..3a3bc5ecd 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1140,6 +1140,7 @@ struct airoha_gdm_port {
+ #define AIROHA_PPE_CPU_REASON_FOE_UNHIT			0x0d
+ #define AIROHA_PPE_CPU_REASON_HIT_UNBIND		0x0e
+ #define AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED	0x0f
++#define AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR	0x15
+ 
+ struct airoha_ppe_host_ops {
+ 	int (*get_fe_port)(struct airoha_gdm_dev *dev);
