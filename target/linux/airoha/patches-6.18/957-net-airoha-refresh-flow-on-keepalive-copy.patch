@@ -1,0 +1,66 @@
+From: Cristian <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: refresh the flow on a discarded EN751221 keepalive copy
+
+Lab-only. The keepalive copy is dropped (956) before the PPE code can see it,
+so a flow that only sends sparse packets is never renewed and the flowtable
+expires it after 30 s. Let the v1 PPE code note the flow as used, then drop.
+
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index bd2c0741e..84e548ccb 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -474,11 +474,17 @@ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+ 		return;
+ 
+ 	/* The PPE has already forwarded the original packet. Do not route its
+-	 * duplicate keepalive copy through the network stack a second time.
++	 * duplicate keepalive copy through the network stack a second time,
++	 * but let the PPE code note that the flow is still in use, as the
++	 * flowtable would otherwise expire a flow that only sends sparse
++	 * packets.
+ 	 */
+ 	if (airoha_is(q->qdma->qdma->eth, econet_en751221) &&
+ 	    get_erx_crsn(&desc.msg.erx) ==
+ 	    AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR) {
++		airoha_ppe_dev_check_skb_reason(q->qdma->qdma->eth->ppe_dev,
++						skb, 0,
++						AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR);
+ 		dev_kfree_skb(skb);
+ 		return;
+ 	}
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 1cc9dde7c..0b06ce5d0 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3110,12 +3110,19 @@ static void airoha_ppe_v1_rx_check(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 	struct airoha_flow_table_entry *flow;
+ 	struct airoha_foe_entry entry, lookup_raw = {};
+ 	bool lookup_valid;
++	bool keepalive = reason == AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR;
+ 	u16 bind_hash;
+ 
+-	if (!ppe || !READ_ONCE(ppe->v1.armed) ||
++	if (!ppe || !READ_ONCE(ppe->v1.armed))
++		return;
++	/* A keepalive copy carries no usable entry index: it only proves
++	 * that the flow is alive.
++	 */
++	if (!keepalive &&
+ 	    hash >= ppe->common.eth->soc->ppe_dram_entries)
+ 		return;
+-	if (reason != EN751221_PPE_CPU_REASON_NO_FLOW &&
++	if (!keepalive &&
++	    reason != EN751221_PPE_CPU_REASON_NO_FLOW &&
+ 	    reason != AIROHA_PPE_CPU_REASON_HIT_UNBIND &&
+ 	    reason != AIROHA_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+ 		return;
+@@ -3141,6 +3148,8 @@ static void airoha_ppe_v1_rx_check(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 			continue;
+ 
+ 		flow->v1_lastused = jiffies;
++		if (keepalive)
++			break;
+ 		bind_hash = airoha_ppe_v1_find_bind_way(ppe, flow, hash,
+ 						     &lookup_raw, &lookup_valid);
+ 		if (bind_hash == AIROHA_FOE_V1_INVALID_HASH)
