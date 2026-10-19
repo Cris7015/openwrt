@@ -1,0 +1,113 @@
+From: Codex <codex@localhost>
+Date: Mon, 19 Oct 2026 17:38:00 -0300
+Subject: [PATCH] net: airoha: serialize complete upstream GPON PLOAM messages
+
+The BER timer sends REI from timer context while the ordered FSM worker
+sends acknowledgements and other PLOAM replies. The upstream FIFO is fed
+with three separate word writes. Neither the free-space check nor those
+writes are serialized across the two producers, so they can interleave
+message words or both consume the same observed free space.
+
+Protect the space check and one complete message with an IRQ-safe spinlock.
+Drain posted writes before releasing it. Poll for space outside the lock
+so a full FIFO does not keep local interrupts disabled for the timeout.
+Keep the existing copy counts, PHY gate and timeout policy.
+
+The race is reproduced with actual TX functions and mocked MMIO, including
+concurrent timer/worker producers. This is not hardware validation of the
+reported OLT deactivations or of downstream BIP errors.
+---
+Target: r0+701-77531f9690 patched Linux 6.18.44 sources.
+
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1149,19 +1149,38 @@
+ 	gpon_write(priv, GPON_PLOAMu_WDATA, val);
+ }
+ 
+-static int gpon_wait_ploam_tx_space(struct xpon_priv *priv, u32 *available)
+-{
+-	u32 status;
+-	int ret;
+-
+-	ret = readl_poll_timeout_atomic(priv->gpon_reg + GPON_PLOAMu_FIFO_STS,
+-					status,
+-					(status & PLOAMu_FIFO_AVAIL_MASK) >=
+-					PLOAM_WORDS, 1,
+-					GPON_PLOAM_TX_TIMEOUT_US);
+-	*available = status & PLOAMu_FIFO_AVAIL_MASK;
+-
+-	return ret;
++static bool gpon_try_send_ploam(struct xpon_priv *priv,
++				const struct ploam_msg *msg, u32 *available)
++{
++	unsigned long flags;
++	bool sent = false;
++
++	/* REI runs in timer context, outside the ordered PLOAM FSM worker. */
++	spin_lock_irqsave(&priv->ploam_tx_lock, flags);
++	*available = gpon_read(priv, GPON_PLOAMu_FIFO_STS) &
++		     PLOAMu_FIFO_AVAIL_MASK;
++	if (*available >= PLOAM_WORDS) {
++		gpon_ploam_write_word(priv, msg->value[0]);
++		gpon_ploam_write_word(priv, msg->value[1]);
++		gpon_ploam_write_word(priv, msg->value[2]);
++		/* Drain posted writes before another CPU can use the FIFO. */
++		gpon_read(priv, GPON_PLOAMu_FIFO_STS);
++		sent = true;
++	}
++	spin_unlock_irqrestore(&priv->ploam_tx_lock, flags);
++
++	return sent;
++}
++
++static int gpon_send_ploam_copy(struct xpon_priv *priv,
++				const struct ploam_msg *msg, u32 *available)
++{
++	bool sent;
++
++	/* Wait unlocked; only the space check and complete message are atomic. */
++	return read_poll_timeout_atomic(gpon_try_send_ploam, sent, sent, 1,
++					GPON_PLOAM_TX_TIMEOUT_US, false,
++					priv, msg, available);
+ }
+ 
+ static void gpon_hw_send_ploam(struct xpon_priv *priv,
+@@ -1191,17 +1210,13 @@
+ 		u32 avail;
+ 		int ret;
+ 
+-		ret = gpon_wait_ploam_tx_space(priv, &avail);
++		ret = gpon_send_ploam_copy(priv, msg, &avail);
+ 		if (ret) {
+ 			dev_warn_ratelimited(priv->dev,
+ 					     "PLOAM TX FIFO timeout: avail=%u requested_words=%u copy=%d/%d\n",
+ 					     avail, PLOAM_WORDS, t + 1, times);
+ 			break;
+ 		}
+-
+-		gpon_ploam_write_word(priv, msg->value[0]);
+-		gpon_ploam_write_word(priv, msg->value[1]);
+-		gpon_ploam_write_word(priv, msg->value[2]);
+ 	}
+ }
+ 
+@@ -4205,6 +4220,7 @@
+ 	mutex_init(&priv->omci_profile_lock);
+ 	mutex_init(&priv->omci_config_lock);
+ 	mutex_init(&priv->link_state_lock);
++	spin_lock_init(&priv->ploam_tx_lock);
+ 	bitmap_zero(priv->service_gems, GPON_MAX_GEM_ID);
+ 	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -441,6 +441,8 @@
+ 	/* BER measurement timer */
+ 	struct timer_list	ber_timer;
+ 	u32			ber_interval_ms;
++	/* Serialize whole PLOAMu messages from the FSM and BER timer. */
++	spinlock_t		ploam_tx_lock;
+ 	/* BIP errors, from the PHY read-and-clear counter, for REI and sysfs */
+ 	spinlock_t		bip_lock;
+ 	bool			bip_active;

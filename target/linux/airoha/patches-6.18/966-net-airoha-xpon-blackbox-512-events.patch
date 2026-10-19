@@ -1,0 +1,50 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Mon, 19 Oct 2026 20:30:00 -0300
+Subject: [PATCH] net: airoha: xpon: keep 512 black box events per bank
+
+The sampler alone adds six events per second and every downstream PLOAM
+adds three, so 256 events may cover only a few tens of seconds. The OLT
+deactivations seen on the lab line follow up to ten seconds of errors and
+the interesting history can be longer. Keep 512 events per bank (32 KiB for
+both banks) and allocate the per-open debugfs copy with kvzalloc(), as it
+grows to about 16 KiB.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h	2026-10-19 20:24:23.215738177 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h	2026-10-19 20:24:23.227738175 -0300
+@@ -8,7 +8,7 @@
+ #include <linux/slab.h>
+ #include <linux/seq_file.h>
+ 
+-#define GPON_BB_SIZE 256
++#define GPON_BB_SIZE 512
+ #define GPON_BB_PRINT 24
+ #define GPON_BB_UNKNOWN U32_MAX
+ 
+@@ -430,14 +430,14 @@
+ 	int ret;
+ 
+ 	/* debugfs protects this open operation against removal. */
+-	snap = kzalloc(sizeof(*snap), GFP_KERNEL);
++	snap = kvzalloc(sizeof(*snap), GFP_KERNEL);
+ 	if (!snap)
+ 		return -ENOMEM;
+ 	ret = gpon_bb_copy_snapshot(bb, snap, last);
+ 	if (!ret)
+ 		ret = single_open(file, gpon_bb_show, snap);
+ 	if (ret)
+-		kfree(snap);
++		kvfree(snap);
+ 	return ret;
+ }
+ 
+@@ -455,7 +455,7 @@
+ {
+ 	struct seq_file *s = file->private_data;
+ 
+-	kfree(s->private);
++	kvfree(s->private);
+ 	return single_release(inode, file);
+ }
+ 

@@ -1,0 +1,172 @@
+From 0d0adc69d906d148ea8f020c93f94083fc5b368c Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 19 Oct 2026 19:42:03 -0300
+Subject: [PATCH] phy: airoha: expose cached RX sync to the GPON blackbox
+
+Retain RX sync and FEC status from reads already made by the PHY driver.
+Expose a lock-protected cached getter with age and availability, and add
+one cached record to the blackbox sampler. Do not introduce PHY MMIO
+reads at the sampling cadence or change link state decisions.
+---
+ .../ethernet/airoha/airoha_xpon_blackbox.h    | 13 +++--
+ drivers/phy/airoha/phy-airoha-xpon.c          | 52 +++++++++++++++++--
+ include/linux/phy/phy-airoha-xpon.h           |  3 ++
+ 3 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+index b63c79b..8a7d3ae 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -16,7 +16,7 @@ enum gpon_bb_event {
+ 	GPON_BB_IRQ, GPON_BB_RX_FIFO, GPON_BB_RX, GPON_BB_TX,
+ 	GPON_BB_STATE, GPON_BB_PHY, GPON_BB_CFG, GPON_BB_DEACT,
+ 	GPON_BB_BIP, GPON_BB_HEC, GPON_BB_GEM, GPON_BB_AUX,
+-	GPON_BB_TIMING, GPON_BB_TX_BEGIN,
++	GPON_BB_TIMING, GPON_BB_TX_BEGIN, GPON_BB_RX_SYNC,
+ };
+ 
+ enum gpon_bb_counter {
+@@ -84,7 +84,7 @@ static const char *gpon_bb_name(u16 event)
+ 	static const char * const names[] = {
+ 		"IRQ", "RX_FIFO", "RX", "TX", "STATE", "PHY", "CFG",
+ 		"DEACT", "BIP", "HEC_CACHE", "GEM_CACHE", "AUX_CACHE",
+-		"TIMING_CACHE", "TX_BEGIN",
++		"TIMING_CACHE", "TX_BEGIN", "RX_SYNC_CACHE",
+ 	};
+ 
+ 	return event < ARRAY_SIZE(names) ? names[event] : "UNKNOWN";
+@@ -183,11 +183,14 @@ static void gpon_bb_sample(struct xpon_priv *priv)
+ 	struct gpon_bb_cache *c;
+ 	unsigned long flags;
+ 	u64 bip, now;
+-	u32 session;
++	u32 session, sync = GPON_BB_UNKNOWN, sync_age = GPON_BB_UNKNOWN;
++	bool fec = false;
++	int sync_ret;
+ 
+ 	if (!bb || time_before(jiffies, bb->next_sample))
+ 		return;
+ 	bb->next_sample = jiffies + HZ;
++	sync_ret = airoha_xpon_phy_get_cached_rx_sync(priv->phy, &sync, &fec, &sync_age);
+ 	spin_lock_irqsave(&priv->bip_lock, flags);
+ 	bip = priv->bip_total;
+ 	session = priv->bip_session;
+@@ -215,6 +218,8 @@ static void gpon_bb_sample(struct xpon_priv *priv)
+ 					 BIT(GPON_BB_TX_BURST), now));
+ 	gpon_bb_add_locked(bb, GPON_BB_TIMING, c->value[GPON_BB_RSP],
+ 			   c->value[GPON_BB_EQD], c->value[GPON_BB_FEC], c->valid);
++	gpon_bb_add_locked(bb, GPON_BB_RX_SYNC, sync, sync_ret ? GPON_BB_UNKNOWN : fec,
++			   sync_age, sync_ret);
+ out:
+ 	spin_unlock_irqrestore(&bb->lock, flags);
+ }
+@@ -246,7 +251,7 @@ static void gpon_bb_print_work(struct work_struct *work)
+ 		 bb->id, bb->frozen_ns, div_u64(now - bb->frozen_ns, NSEC_PER_MSEC),
+ 		 bb->frozen_count, count, READ_ONCE(bb->missed), READ_ONCE(bb->suppressed));
+ 	dev_warn(priv->dev,
+-		 "gpon-bb sample_age_ms=%llu bip=%llu gem=%u session=%u cache_valid=%x rx_sync=unavailable\n",
++		 "gpon-bb sample_age_ms=%llu bip=%llu gem=%u session=%u cache_valid=%x rx_sync=see_RX_SYNC_CACHE\n",
+ 		 c->sample_ns ? div_u64(bb->frozen_ns - c->sample_ns, NSEC_PER_MSEC) : U64_MAX,
+ 		 c->bip, c->gem, c->session, c->valid);
+ 	dev_warn(priv->dev,
+diff --git a/drivers/phy/airoha/phy-airoha-xpon.c b/drivers/phy/airoha/phy-airoha-xpon.c
+index 12a8633..faea5a6 100644
+--- a/drivers/phy/airoha/phy-airoha-xpon.c
++++ b/drivers/phy/airoha/phy-airoha-xpon.c
+@@ -181,6 +181,9 @@ struct airoha_xpon_phy {
+ 	bool ready_reported;
+ 	/* Serializes the RX counter command register (latch/clear). */
+ 	spinlock_t counter_lock;
++	u32 cached_rx_status;
++	unsigned long cached_rx_jiffies;
++	bool cached_rx_valid;
+ };
+ 
+ static u32 airoha_xpon_phy_read(struct airoha_xpon_phy *priv, u32 reg)
+@@ -221,11 +224,50 @@ static bool airoha_xpon_phy_ready(struct airoha_xpon_phy *priv)
+ 	return airoha_xpon_phy_state(priv) == XPON_PHYSTA1_READY;
+ }
+ 
++static void airoha_xpon_phy_cache_rx_status(struct airoha_xpon_phy *priv,
++					    u32 status)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->counter_lock, flags);
++	priv->cached_rx_status = status;
++	priv->cached_rx_jiffies = jiffies;
++	priv->cached_rx_valid = true;
++	spin_unlock_irqrestore(&priv->counter_lock, flags);
++}
++
+ static u32 airoha_xpon_phy_rx_sync(struct airoha_xpon_phy *priv)
+ {
+-	return FIELD_GET(XPON_RX_SYNC_MASK,
+-			 airoha_xpon_phy_read(priv, XPON_RX_FEC_STATUS));
++	u32 status = airoha_xpon_phy_read(priv, XPON_RX_FEC_STATUS);
++
++	airoha_xpon_phy_cache_rx_status(priv, status);
++	return FIELD_GET(XPON_RX_SYNC_MASK, status);
++}
++
++int airoha_xpon_phy_get_cached_rx_sync(struct phy *phy, u32 *sync,
++				       bool *fec, u32 *age_ms)
++{
++	struct airoha_xpon_phy *priv;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!phy || !sync || !fec || !age_ms)
++		return -EINVAL;
++	priv = phy_get_drvdata(phy);
++	if (!priv || !READ_ONCE(priv->powered))
++		return -EHOSTDOWN;
++	spin_lock_irqsave(&priv->counter_lock, flags);
++	if (!priv->cached_rx_valid) {
++		ret = -ENODATA;
++	} else {
++		*sync = FIELD_GET(XPON_RX_SYNC_MASK, priv->cached_rx_status);
++		*fec = !!(priv->cached_rx_status & XPON_FEC_STATUS_ACTIVE);
++		*age_ms = jiffies_to_msecs(jiffies - priv->cached_rx_jiffies);
++	}
++	spin_unlock_irqrestore(&priv->counter_lock, flags);
++	return ret;
+ }
++EXPORT_SYMBOL_GPL(airoha_xpon_phy_get_cached_rx_sync);
+ 
+ static bool airoha_xpon_phy_los(struct airoha_xpon_phy *priv)
+ {
+@@ -383,6 +425,7 @@ int airoha_xpon_phy_get_gpon_fec_status(struct phy *phy,
+ 					bool *downstream, bool *upstream)
+ {
+ 	struct airoha_xpon_phy *priv;
++	u32 rx_status;
+ 	int ret;
+ 
+ 	if (!downstream || !upstream)
+@@ -392,8 +435,9 @@ int airoha_xpon_phy_get_gpon_fec_status(struct phy *phy,
+ 	if (ret)
+ 		return ret;
+ 
+-	*downstream = airoha_xpon_phy_read(priv, XPON_RX_FEC_STATUS) &
+-			  XPON_FEC_STATUS_ACTIVE;
++	rx_status = airoha_xpon_phy_read(priv, XPON_RX_FEC_STATUS);
++	airoha_xpon_phy_cache_rx_status(priv, rx_status);
++	*downstream = rx_status & XPON_FEC_STATUS_ACTIVE;
+ 	*upstream = airoha_xpon_phy_read(priv, XPON_TX_FEC_STATUS) &
+ 		       XPON_FEC_STATUS_ACTIVE;
+ 
+diff --git a/include/linux/phy/phy-airoha-xpon.h b/include/linux/phy/phy-airoha-xpon.h
+index 6eb01a7..4c959c9 100644
+--- a/include/linux/phy/phy-airoha-xpon.h
++++ b/include/linux/phy/phy-airoha-xpon.h
+@@ -24,6 +24,9 @@ enum airoha_xpon_phy_gpon_oper_state {
+ 	AIROHA_XPON_PHY_GPON_OPER_OPERATION = 3,
+ };
+ 
++/* Cached observations only: no register access or refresh. */
++int airoha_xpon_phy_get_cached_rx_sync(struct phy *phy, u32 *sync,
++				       bool *fec, u32 *age_ms);
+ int airoha_xpon_phy_get_link_state(struct phy *phy, bool *ready, bool *los);
+ /* EN751221: latch, read and clear the BIP error counter; atomic-safe. */
+ int airoha_xpon_phy_take_gpon_bip(struct phy *phy, u32 *count);

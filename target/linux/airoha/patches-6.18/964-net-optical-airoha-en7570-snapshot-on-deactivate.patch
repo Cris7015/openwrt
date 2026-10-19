@@ -1,0 +1,348 @@
+From e4c1fc7097fc66e2221590ed3aaa36457f635435 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 19 Oct 2026 19:42:03 -0300
+Subject: [PATCH] net: optical: capture passive EN7570 bias after Deactivate
+
+Add an optional best-effort snapshot operation and timestamp one passive
+EN7570 bias read in deferred context. Reuse cached optical telemetry and
+label it separately from the live read. Skip busy control locks or bus.
+
+Hold no frontend or loop control mutex across I2C. Do not refresh ADC
+telemetry, read unverified safety latches or program device controls.
+The transfer can run after shutdown and still occupies the adapter bus.
+---
+ .../ethernet/airoha/airoha_xpon_blackbox.h    | 46 ++++++++++++++++
+ drivers/net/optical/airoha/airoha_lddla.h     |  4 +-
+ .../net/optical/airoha/airoha_lddla_core.c    | 11 ++++
+ drivers/net/optical/airoha/en7570_main.c      | 55 +++++++++++++++++++
+ drivers/net/optical/core.c                    | 22 ++++++++
+ include/linux/optical_frontend.h              | 36 +++++++++++-
+ 6 files changed, 171 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+index eddc7cf..b63c79b 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -47,6 +47,8 @@ struct gpon_bb_cache {
+ };
+ 
+ struct gpon_blackbox {
++	struct optical_frontend_snapshot optical;
++	int optical_result;
+ 	/* Protects both rings, cached metadata and snapshot lifecycle. */
+ 	spinlock_t lock;
+ 	struct xpon_priv *priv;
+@@ -68,6 +70,8 @@ struct gpon_blackbox {
+ 
+ /* The open file owns this copy and never dereferences the device afterwards. */
+ struct gpon_bb_snapshot {
++	struct optical_frontend_snapshot optical;
++	int optical_result;
+ 	struct gpon_bb_entry entry[GPON_BB_SIZE];
+ 	struct gpon_bb_cache cache;
+ 	u64 ref_ns;
+@@ -251,6 +255,20 @@ static void gpon_bb_print_work(struct work_struct *work)
+ 		 gpon_bb_age_ms(c, GENMASK(GPON_BB_HECU, GPON_BB_HEC1), bb->frozen_ns),
+ 		 c->value[GPON_BB_RX_GEM], c->value[GPON_BB_TX_GEM],
+ 		 c->value[GPON_BB_RSP], c->value[GPON_BB_EQD], c->value[GPON_BB_FEC]);
++	dev_warn(priv->dev,
++		 "gpon-bb optical ret=%d valid=%x begin_us=%lld end_us=%lld live_bias_ua=%u latched_flags=unavailable\n",
++		 bb->optical_result, bb->optical.valid,
++		 bb->optical.begin_ns ? div_s64((s64)bb->optical.begin_ns -
++			(s64)bb->frozen_ns, NSEC_PER_USEC) : -1LL,
++		 bb->optical.end_ns ? div_s64((s64)bb->optical.end_ns -
++			(s64)bb->frozen_ns, NSEC_PER_USEC) : -1LL,
++		 bb->optical.live_bias_ua);
++	dev_warn(priv->dev,
++		 "gpon-bb optical_cached age=unknown temp_mc=%d apd_request_mv=%d bias_ua=%u tx_nw=%u rx_nw=%u alarm=%x mpdl=%u mpdh=%u\n",
++		 bb->optical.cached_bosa_temp_mc, bb->optical.cached_apd_request_mv,
++		 bb->optical.cached_bias_ua, bb->optical.cached_tx_power_nw,
++		 bb->optical.cached_rx_power_nw, bb->optical.cached_alarm,
++		 bb->optical.cached_mpdl_target, bb->optical.cached_mpdh_target);
+ 	for (i = 0; i < count; i++) {
+ 		const struct gpon_bb_entry *e =
+ 			&bb->bank[bb->frozen_bank][(start + i) % GPON_BB_SIZE];
+@@ -274,6 +292,20 @@ static void gpon_bb_capture_work(struct work_struct *work)
+ 	struct gpon_blackbox *bb = container_of(work, struct gpon_blackbox,
+ 						capture_work);
+ 
++	struct optical_frontend_snapshot optical = {};
++	unsigned long flags;
++	int ret;
++
++	if (READ_ONCE(bb->stopping))
++		return;
++	/* No telemetry refresh: the optional provider performs one passive read.
++	 * It may run after the MAC has already stopped; keep its actual times.
++	 */
++	ret = optical_frontend_capture_snapshot(bb->priv->frontend, &optical);
++	spin_lock_irqsave(&bb->lock, flags);
++	bb->optical = optical;
++	bb->optical_result = ret;
++	spin_unlock_irqrestore(&bb->lock, flags);
+ 	/* Never print from the ordered FSM or while the snapshot lock is held. */
+ 	if (!READ_ONCE(bb->stopping))
+ 		queue_delayed_work(system_unbound_wq, &bb->print_work, 5 * HZ);
+@@ -301,6 +333,8 @@ static void gpon_bb_deactivate(struct xpon_priv *priv)
+ 	bb->frozen_ns = bb->bank[bb->active]
+ 		[(bb->frozen_head + GPON_BB_SIZE - 1) % GPON_BB_SIZE].ns;
+ 	bb->frozen_cache = bb->cache;
++	memset(&bb->optical, 0, sizeof(bb->optical));
++	bb->optical_result = -EINPROGRESS;
+ 	bb->frozen_valid = true;
+ 	bb->pending = true;
+ 	bb->id++;
+@@ -331,6 +365,15 @@ static int gpon_bb_show(struct seq_file *s, void *unused)
+ 		   snap->cache.value[GPON_BB_RX_GEM], snap->cache.value[GPON_BB_TX_GEM],
+ 		   snap->cache.value[GPON_BB_RSP], snap->cache.value[GPON_BB_EQD],
+ 		   snap->cache.value[GPON_BB_FEC]);
++	seq_printf(s, "optical_snapshot_id=%u ret=%d valid=%x begin_ns=%llu end_ns=%llu live_bias_ua=%u\n",
++		   snap->id, snap->optical_result, snap->optical.valid,
++		   snap->optical.begin_ns, snap->optical.end_ns,
++		   snap->optical.live_bias_ua);
++	seq_printf(s, "optical_cached age=unknown temp_mc=%d apd_request_mv=%d bias_ua=%u tx_nw=%u rx_nw=%u alarm=%x mpdl=%u mpdh=%u\n",
++		   snap->optical.cached_bosa_temp_mc, snap->optical.cached_apd_request_mv,
++		   snap->optical.cached_bias_ua, snap->optical.cached_tx_power_nw,
++		   snap->optical.cached_rx_power_nw, snap->optical.cached_alarm,
++		   snap->optical.cached_mpdl_target, snap->optical.cached_mpdh_target);
+ 	for (i = 0; i < snap->count; i++) {
+ 		const struct gpon_bb_entry *e = &snap->entry[i];
+ 
+@@ -356,6 +399,8 @@ static int gpon_bb_copy_snapshot(struct gpon_blackbox *bb,
+ 	snap->count = snap->frozen ? bb->frozen_count : bb->count[bank];
+ 	snap->ref_ns = snap->frozen ? bb->frozen_ns : ktime_get_ns();
+ 	snap->cache = snap->frozen ? bb->frozen_cache : bb->cache;
++	snap->optical = bb->optical;
++	snap->optical_result = bb->optical_result;
+ 	snap->id = bb->id;
+ 	snap->missed = bb->missed;
+ 	snap->suppressed = bb->suppressed;
+@@ -436,6 +481,7 @@ static void gpon_bb_init(struct xpon_priv *priv)
+ 	bb->priv = priv;
+ 	bb->state = GPON_O1_INITIAL;
+ 	bb->next_sample = jiffies;
++	bb->optical_result = -ENODATA;
+ 	INIT_WORK(&bb->capture_work, gpon_bb_capture_work);
+ 	INIT_DELAYED_WORK(&bb->print_work, gpon_bb_print_work);
+ 	bb->dir = debugfs_create_dir(dev_name(priv->dev), NULL);
+diff --git a/drivers/net/optical/airoha/airoha_lddla.h b/drivers/net/optical/airoha/airoha_lddla.h
+index be0bec3..4ff95ee 100644
+--- a/drivers/net/optical/airoha/airoha_lddla.h
++++ b/drivers/net/optical/airoha/airoha_lddla.h
+@@ -155,12 +155,14 @@ airoha_lddla_default_thresholds;
+  * @diag_show: chip-specific debugfs diagnostic dump (optional).
+  * @tx_rearm: rearm the optical transmitter after TX_DISABLE is released.
+  * @tx_timing_calibrate: calibrate chip-local T0/T1 burst timing.
+- * @tx_trace: queue a chip-specific transmitter diagnostic snapshot.
++ * @capture_snapshot: passive fault snapshot; callback handles cache locking.
+  *
+  * The refreshers update the matching airoha_lddla.ddmi_* cache and the alarm
+  * bitmap; the shared hwmon and SFP layers only read the cache.
+  */
+ struct airoha_lddla_ops {
++	int (*capture_snapshot)(struct airoha_lddla *lddla,
++				struct optical_frontend_snapshot *snapshot);
+ 	const char *name;
+ 	const char *vendor_name;
+ 	u8 vendor_oui[3];
+diff --git a/drivers/net/optical/airoha/airoha_lddla_core.c b/drivers/net/optical/airoha/airoha_lddla_core.c
+index f25ef84..7ea49a4 100644
+--- a/drivers/net/optical/airoha/airoha_lddla_core.c
++++ b/drivers/net/optical/airoha/airoha_lddla_core.c
+@@ -647,7 +647,18 @@ airoha_lddla_frontend_tx_timing_calibrate(struct optical_frontend *frontend)
+ 	return ret;
+ }
+ 
++static int airoha_lddla_capture_snapshot(struct optical_frontend *frontend,
++					 struct optical_frontend_snapshot *snapshot)
++{
++	struct airoha_lddla *lddla = optical_frontend_get_drvdata(frontend);
++
++	if (!lddla || !lddla->ops->capture_snapshot)
++		return -EOPNOTSUPP;
++	return lddla->ops->capture_snapshot(lddla, snapshot);
++}
++
+ static const struct optical_frontend_ops airoha_lddla_frontend_ops = {
++	.capture_snapshot = airoha_lddla_capture_snapshot,
+ 	.set_mode = airoha_lddla_frontend_set_mode,
+ 	.get_telemetry = airoha_lddla_frontend_get_telemetry,
+ 	.get_state = airoha_lddla_frontend_get_state,
+diff --git a/drivers/net/optical/airoha/en7570_main.c b/drivers/net/optical/airoha/en7570_main.c
+index 30560fc..28d843d 100644
+--- a/drivers/net/optical/airoha/en7570_main.c
++++ b/drivers/net/optical/airoha/en7570_main.c
+@@ -22,6 +22,8 @@
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ 
++#include <linux/ktime.h>
++
+ #include "en7570.h"
+ 
+ /* ------------------------------------------------------------------ */
+@@ -403,7 +405,60 @@ static void en7570_op_diag(struct airoha_lddla *lddla, struct seq_file *s)
+ 	seq_printf(s, "rssi factor: %d (x1000)\n", priv->rssi_factor);
+ }
+ 
++static int en7570_capture_snapshot(struct airoha_lddla *lddla,
++				   struct optical_frontend_snapshot *snapshot)
++{
++	struct en7570_priv *priv = container_of(lddla, struct en7570_priv, lddla);
++	struct i2c_adapter *adapter = lddla->client->adapter;
++	u8 address[2] = { EN7570_P0_PWR_CTRL_CS3 >> 8,
++			  EN7570_P0_PWR_CTRL_CS3 & 0xff };
++	u8 raw[4];
++	struct i2c_msg msg[2] = {
++		{ .addr = lddla->client->addr, .len = sizeof(address), .buf = address },
++		{ .addr = lddla->client->addr, .flags = I2C_M_RD,
++		  .len = sizeof(raw), .buf = raw },
++	};
++	u32 code;
++	int ret;
++
++	if (!mutex_trylock(&lddla->lock))
++		return -EBUSY;
++	snapshot->cached_bias_ua = lddla->ddmi_current * 2U;
++	snapshot->cached_tx_power_nw = lddla->ddmi_tx_power * 100U;
++	snapshot->cached_rx_power_nw = lddla->ddmi_rx_power * 100U;
++	snapshot->cached_alarm = lddla->alarm;
++	snapshot->cached_bosa_temp_mc = priv->bosa_temp_mc;
++	snapshot->cached_apd_request_mv = priv->apd_voltage_mv;
++	snapshot->cached_mpdl_target = priv->mpdl;
++	snapshot->cached_mpdh_target = priv->mpdh;
++	snapshot->valid = OPTICAL_SNAPSHOT_CACHED;
++	mutex_unlock(&lddla->lock);
++
++	/*
++	 * Unlike ADC/control sequences, this atomic passive register read needs
++	 * only the I2C bus lock. Do not hold the loop mutex during a bus fault.
++	 */
++	if (!i2c_trylock_bus(adapter, I2C_LOCK_SEGMENT))
++		return -EBUSY;
++	/*
++	 * One register read, as used by en7570_info(IBIAS). No ADC mux or
++	 * latch commands, no safety-register reads and no device-control writes.
++	 * The first message only selects the register address for the read.
++	 */
++	snapshot->begin_ns = ktime_get_ns();
++	ret = __i2c_transfer(adapter, msg, ARRAY_SIZE(msg));
++	snapshot->end_ns = ktime_get_ns();
++	i2c_unlock_bus(adapter, I2C_LOCK_SEGMENT);
++	if (ret != ARRAY_SIZE(msg))
++		return ret < 0 ? ret : -EIO;
++	code = raw[2] | ((raw[3] & 0x0f) << 8);
++	snapshot->live_bias_ua = code * EN7570_BIAS_UA_PER_CODE_X100 / 100;
++	snapshot->valid |= OPTICAL_SNAPSHOT_LIVE_BIAS;
++	return 0;
++}
++
+ static const struct airoha_lddla_ops en7570_ops = {
++	.capture_snapshot = en7570_capture_snapshot,
+ 	.name = "en7570",
+ 	.part_number = "EN7570-LDDLA",
+ 	.serial = "EN7570SN00000001",
+diff --git a/drivers/net/optical/core.c b/drivers/net/optical/core.c
+index 989b911..f3f4902 100644
+--- a/drivers/net/optical/core.c
++++ b/drivers/net/optical/core.c
+@@ -628,6 +628,28 @@ int optical_frontend_get_telemetry(struct optical_frontend *frontend,
+ }
+ EXPORT_SYMBOL_GPL(optical_frontend_get_telemetry);
+ 
++int optical_frontend_capture_snapshot(struct optical_frontend *frontend,
++				      struct optical_frontend_snapshot *snapshot)
++{
++	int ret;
++
++	if (!snapshot)
++		return -EINVAL;
++	memset(snapshot, 0, sizeof(*snapshot));
++	if (!frontend)
++		return -ENODEV;
++	if (!frontend->ops->capture_snapshot)
++		return -EOPNOTSUPP;
++	/* Never wait behind mode changes or normal telemetry. */
++	if (!mutex_trylock(&frontend->op_lock))
++		return -EBUSY;
++	/* Device links pin the provider. Do not hold a control mutex over I/O. */
++	mutex_unlock(&frontend->op_lock);
++	ret = frontend->ops->capture_snapshot(frontend, snapshot);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(optical_frontend_capture_snapshot);
++
+ void optical_frontend_invalidate_telemetry(struct optical_frontend *frontend)
+ {
+ 	if (!frontend)
+diff --git a/include/linux/optical_frontend.h b/include/linux/optical_frontend.h
+index 83c8943..bf24d29 100644
+--- a/include/linux/optical_frontend.h
++++ b/include/linux/optical_frontend.h
+@@ -181,6 +181,25 @@ struct optical_frontend_desc {
+ 	const struct attribute_group **groups;
+ };
+ 
++#define OPTICAL_SNAPSHOT_CACHED BIT(0)
++#define OPTICAL_SNAPSHOT_LIVE_BIAS BIT(1)
++
++/* Best-effort fault snapshot. Cached values have unknown age. */
++struct optical_frontend_snapshot {
++	u64 begin_ns;
++	u64 end_ns;
++	u32 valid;
++	u32 live_bias_ua;
++	u32 cached_bias_ua;
++	u32 cached_tx_power_nw;
++	u32 cached_rx_power_nw;
++	u32 cached_alarm;
++	s32 cached_bosa_temp_mc;
++	s32 cached_apd_request_mv;
++	u16 cached_mpdl_target;
++	u16 cached_mpdh_target;
++};
++
+ /**
+  * struct optical_frontend_ops - provider operations
+  * @set_mode: configure protocol/rates; optional
+@@ -189,11 +208,15 @@ struct optical_frontend_desc {
+  * @tx_timing_calibrate: calibrate provider-local burst timing; optional
+  * @get_state: retrieve normalized frontend state; optional
+  * @get_telemetry: retrieve normalized live measurements; optional
++ * @capture_snapshot: optional passive, best-effort fault snapshot; no control writes
+  *
+- * The core serializes calls into this table. Providers may additionally use
+- * their own lock for asynchronous workers which access the same hardware.
++ * The core serializes control and telemetry calls. capture_snapshot runs
++ * without the core control mutex and must handle its own cache/bus locking.
++ * Providers may use their own lock for asynchronous hardware workers.
+  */
+ struct optical_frontend_ops {
++	int (*capture_snapshot)(struct optical_frontend *frontend,
++				struct optical_frontend_snapshot *snapshot);
+ 	int (*set_mode)(struct optical_frontend *frontend,
+ 			const struct optical_frontend_mode *mode);
+ 	int (*tx_enable)(struct optical_frontend *frontend, bool enable);
+@@ -236,6 +259,8 @@ int optical_frontend_get_state(struct optical_frontend *frontend,
+ 			       struct optical_frontend_state *state);
+ int optical_frontend_get_telemetry(struct optical_frontend *frontend,
+ 				   struct optical_frontend_telemetry *telemetry);
++int optical_frontend_capture_snapshot(struct optical_frontend *frontend,
++				      struct optical_frontend_snapshot *snapshot);
+ void optical_frontend_invalidate_telemetry(struct optical_frontend *frontend);
+ #else
+ static inline struct optical_frontend *
+@@ -334,6 +359,13 @@ optical_frontend_get_telemetry(struct optical_frontend *frontend,
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int
++optical_frontend_capture_snapshot(struct optical_frontend *frontend,
++				  struct optical_frontend_snapshot *snapshot)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline void
+ optical_frontend_invalidate_telemetry(struct optical_frontend *frontend)
+ {

@@ -1,0 +1,747 @@
+From aee73c897bf7c345b30b18b990089e007153ca95 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 19 Oct 2026 19:42:03 -0300
+Subject: [PATCH] net: airoha: keep bounded GPON metadata before Deactivate
+
+Keep two fixed RAM rings of IRQ, PLOAM metadata, state and cached counters.
+Freeze one bank before shutdown and print a bounded tail from a separate
+worker after a delay. Expose private snapshots through read-only debugfs.
+
+Do not log payloads or add counter reads. Preserve the PLOAM TX critical
+section from the prerequisite serialization patch. Recording adds bounded
+CPU work; hardware timing has not been validated.
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c    |  12 +-
+ drivers/net/ethernet/airoha/airoha_ploam.h    |   3 +
+ drivers/net/ethernet/airoha/airoha_xpon.c     |  61 ++-
+ drivers/net/ethernet/airoha/airoha_xpon.h     |   3 +
+ .../ethernet/airoha/airoha_xpon_blackbox.h    | 466 ++++++++++++++++++
+ 5 files changed, 526 insertions(+), 19 deletions(-)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index bc0478a..6137733 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -665,12 +665,20 @@ void ploam_handle_downstream(struct ploam_priv *pp,
+ 	ploam_unpack(msg, &onu_id, &type, content);
+ 
+ 	/* Drop messages not addressed to us */
+-	if (onu_id != PLOAM_ONU_BCAST && onu_id != pp->onu_id)
++	if (onu_id != PLOAM_ONU_BCAST && onu_id != pp->onu_id) {
++		if (pp->ops->rx_trace)
++			pp->ops->rx_trace(pp->hw_priv, type, onu_id, 0);
+ 		return;
++	}
+ 
+ 	/* EN7521 deduplication filter */
+-	if (ploam_filter_suppress(pp, msg, type))
++	if (ploam_filter_suppress(pp, msg, type)) {
++		if (pp->ops->rx_trace)
++			pp->ops->rx_trace(pp->hw_priv, type, onu_id, 1);
+ 		return;
++	}
++	if (pp->ops->rx_trace)
++		pp->ops->rx_trace(pp->hw_priv, type, onu_id, 2);
+ 
+ 	switch (type) {
+ 	case PLOAM_DOWN_UPSTREAM_OVERHEAD:
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 86a6af2..5f580a3 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -88,6 +88,7 @@ struct ploam_msg {
+ /**
+  * struct ploam_ops - callbacks from the PLOAM layer to the hardware layer
+  *
++ * @rx_trace: optional metadata-only receive observer.
+  * @send_upstream: write @times copies of upstream PLOAM to the TX FIFO.
+  * @set_onu_id: program the OLT-assigned ONU-ID into G_ONU_ID.
+  * @set_eqd_o4: program equalization delay in O4; byteDelay = eqd & ~7,
+@@ -114,6 +115,8 @@ struct ploam_msg {
+  * @deactivate: OLT sent Deactivate_ONU; trigger a full hardware disable/reset.
+  */
+ struct ploam_ops {
++	/* Observer only: 0=other ONU, 1=duplicate, 2=dispatch; no payload. */
++	void (*rx_trace)(void *hw_priv, u8 type, u8 onu_id, u8 result);
+ 	void (*send_upstream)(void *priv, const struct ploam_msg *msg, int times);
+ 	void (*set_onu_id)(void *priv, u8 onu_id);
+ 	void (*set_eqd_o4)(void *priv, u32 byte_delay, u32 bit_delay);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 69ff806..ab0ba89 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -63,6 +63,8 @@ static const u8 airoha_default_vendor_id[4] = {'M', 'T', 'K', 'G'};
+ 
+ static inline u32 gpon_read(struct xpon_priv *priv, u32 reg);
+ 
++#include "airoha_xpon_blackbox.h"
++
+ static int airoha_xpon_tx_timing_calibrate(struct xpon_priv *priv)
+ {
+ 	int restore_ret, ret;
+@@ -486,6 +488,11 @@ static inline u32 gpon_read(struct xpon_priv *priv, u32 reg)
+ static inline void gpon_write(struct xpon_priv *priv, u32 reg, u32 val)
+ {
+ 	writel(val, priv->gpon_reg + reg);
++	if (reg == GPON_RSP_TIME || reg == GPON_EQD) {
++		gpon_bb_cache_value(priv, reg == GPON_RSP_TIME ? GPON_BB_RSP :
++				    GPON_BB_EQD, val);
++		gpon_bb_record(priv, GPON_BB_CFG, reg, val, 0, 0);
++	}
+ }
+ 
+ static inline void gpon_set_bits(struct xpon_priv *priv, u32 reg, u32 bits)
+@@ -1197,20 +1204,18 @@ static void gpon_hw_send_ploam(struct xpon_priv *priv,
+ 			dev_dbg_ratelimited(priv->dev,
+ 					    "dropping PLOAM type %#04x while PHY ready=%u LOS=%u\n",
+ 					     type, ready, los);
++			gpon_bb_record(priv, GPON_BB_TX, type, 0, -ENOLINK, 0);
+ 			return;
+ 		}
+ 	}
+ 
+-	if (type != PLOAM_UP_REI)
+-		dev_dbg(priv->dev,
+-			"PLOAM TX: onu=%u type=%#04x copies=%d words=%08x/%08x/%08x\n",
+-			onu_id, type, times, msg->value[0], msg->value[1], msg->value[2]);
+-
+ 	for (t = 0; t < times; t++) {
+ 		u32 avail;
+ 		int ret;
+ 
++		gpon_bb_record(priv, GPON_BB_TX_BEGIN, type, t + 1, 0, onu_id);
+ 		ret = gpon_send_ploam_copy(priv, msg, &avail);
++		gpon_bb_record(priv, GPON_BB_TX, type, t + 1, ret, avail);
+ 		if (ret) {
+ 			dev_warn_ratelimited(priv->dev,
+ 					     "PLOAM TX FIFO timeout: avail=%u requested_words=%u copy=%d/%d\n",
+@@ -1235,10 +1240,18 @@ static bool gpon_ploam_rx_queue_push(struct xpon_priv *priv,
+ 	/* Pairs with the consumer release when it advances the tail. */
+ 	if (next == smp_load_acquire(&priv->ploam_rx_tail)) {
+ 		priv->ploam_rx_drops++;
++		gpon_bb_record(priv, GPON_BB_RX_FIFO,
++			       (msg->value[0] >> 16) & 0xff, msg->value[0] >> 24,
++			       0, 0);
+ 		return false;
+ 	}
+ 
+ 	priv->ploam_rx_queue[head] = *msg;
++	/* Only the assigned numeric ONU-ID is retained, never its serial. */
++	gpon_bb_record(priv, GPON_BB_RX_FIFO,
++		       (msg->value[0] >> 16) & 0xff, msg->value[0] >> 24, 1,
++		       ((msg->value[0] >> 16) & 0xff) == PLOAM_DOWN_ASSIGN_ONU_ID ?
++		       (msg->value[0] >> 8) & 0xff : 0);
+ 	/* Publish the message before making the new head visible. */
+ 	smp_store_release(&priv->ploam_rx_head, next);
+ 	priv->ploam_rx_messages++;
+@@ -1329,10 +1342,6 @@ static void gpon_process_ploam_queue(struct xpon_priv *priv)
+ 	struct ploam_msg msg;
+ 
+ 	while (gpon_ploam_rx_queue_pop(priv, &msg)) {
+-		dev_dbg(priv->dev,
+-			"PLOAM RX: onu=%u type=%#04x words=%08x/%08x/%08x\n",
+-			msg.value[0] >> 24, (msg.value[0] >> 16) & 0xff,
+-			msg.value[0], msg.value[1], msg.value[2]);
+ 		ploam_handle_downstream(priv->ploam, &msg);
+ 	}
+ }
+@@ -2147,6 +2156,7 @@ int airoha_gpon_omci_hw_get_telemetry(void *hw_priv,
+ 						  &downstream_fec,
+ 						  &upstream_fec);
+ 	if (!ret) {
++		gpon_bb_cache_value(priv, GPON_BB_FEC, downstream_fec | (upstream_fec << 1));
+ 		telemetry->downstream_fec = downstream_fec ?
+ 			OMCI_FEC_STATUS_UP : OMCI_FEC_STATUS_DOWN;
+ 		telemetry->upstream_fec = upstream_fec ?
+@@ -2200,6 +2210,8 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 	bool update_phy_state = true;
+ 	int ret;
+ 
++	gpon_bb_state(priv, state);
++
+ 	/*
+ 	 * Mirror the vendor PHY state sequencing before updating the MAC
+ 	 * activation state: disabled in O2, ranging formatter in O3/O4 and
+@@ -2369,6 +2381,8 @@ static void gpon_cb_deactivate(void *hw_priv)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+ 
++	gpon_bb_deactivate(priv);
++
+ 	/*
+ 	 * The callback runs while the ordered IRQ worker is processing the
+ 	 * downstream FIFO. Defer the stop/restart sequence until that worker
+@@ -2379,7 +2393,13 @@ static void gpon_cb_deactivate(void *hw_priv)
+ 		mod_delayed_work(priv->fsm_wq, &priv->restart_work, 0);
+ }
+ 
++static void gpon_cb_rx_trace(void *hw_priv, u8 type, u8 onu_id, u8 result)
++{
++	gpon_bb_record(hw_priv, GPON_BB_RX, type, onu_id, result, 0);
++}
++
+ static const struct ploam_ops gpon_ploam_ops = {
++	.rx_trace = gpon_cb_rx_trace,
+ 	.send_upstream       = gpon_cb_send_upstream,
+ 	.set_onu_id          = gpon_cb_set_onu_id,
+ 	.set_eqd_o4          = gpon_cb_set_eqd_o4,
+@@ -2744,6 +2764,7 @@ static void gpon_handle_irq_status(struct xpon_priv *priv, u32 raw, u32 enabled)
+ 
+ 	/* G_INT_STATUS is W1C; acknowledge the complete hardware snapshot. */
+ 	gpon_write(priv, GPON_INT_STATUS, raw);
++	gpon_bb_record(priv, GPON_BB_IRQ, raw, enabled, 0, 0);
+ 
+ 	if (!active)
+ 		return;
+@@ -2779,6 +2800,8 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 	if (priv->xpon)
+ 		xpon_device_report_optical(priv->xpon, ready, los);
+ 
++	if (changed)
++		gpon_bb_record(priv, GPON_BB_PHY, ready, los, GPON_BB_UNKNOWN, 0);
+ 	if (changed)
+ 		dev_info(priv->dev,
+ 			 "%s digital PHY link %s: ready=%u LOS=%u\n",
+@@ -2814,6 +2837,7 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 	}
+ 
+ rearm:
++	gpon_bb_sample(priv);
+ 	if (READ_ONCE(priv->phy_powered))
+ 		mod_delayed_work(priv->fsm_wq, &priv->phy_link_work,
+ 				 msecs_to_jiffies(XPON_LINK_POLL_MS));
+@@ -3053,14 +3077,14 @@ static void gpon_dump_error_counters(struct xpon_priv *priv, u32 errors)
+ 			     gpon_read(priv, GPON_DBG_ERR_CTRL));
+ 	dev_warn_ratelimited(priv->dev,
+ 			     "GPON counters: rx=%u/%u/%u tx=%u/%u hec=%u/%u/%u\n",
+-			     gpon_read(priv, GPON_DBG_RX_GEM_CNT),
+-			     gpon_read(priv, GPON_DBG_RX_CRC_ERR_CNT),
+-			     gpon_read(priv, GPON_DBG_RX_GTC_CNT),
+-			     gpon_read(priv, GPON_DBG_TX_GEM_CNT),
+-			     gpon_read(priv, GPON_DBG_TX_BST_CNT),
+-			     gpon_read(priv, GPON_DBG_GEM_HEC_ONE_ERR_CNT),
+-			     gpon_read(priv, GPON_DBG_GEM_HEC_TWO_ERR_CNT),
+-			     gpon_read(priv, GPON_DBG_GEM_HEC_UC_ERR_CNT));
++			     gpon_bb_read_counter(priv, GPON_DBG_RX_GEM_CNT, GPON_BB_RX_GEM),
++			     gpon_bb_read_counter(priv, GPON_DBG_RX_CRC_ERR_CNT, GPON_BB_RX_CRC),
++			     gpon_bb_read_counter(priv, GPON_DBG_RX_GTC_CNT, GPON_BB_RX_GTC),
++			     gpon_bb_read_counter(priv, GPON_DBG_TX_GEM_CNT, GPON_BB_TX_GEM),
++			     gpon_bb_read_counter(priv, GPON_DBG_TX_BST_CNT, GPON_BB_TX_BURST),
++			     gpon_bb_read_counter(priv, GPON_DBG_GEM_HEC_ONE_ERR_CNT, GPON_BB_HEC1),
++			     gpon_bb_read_counter(priv, GPON_DBG_GEM_HEC_TWO_ERR_CNT, GPON_BB_HEC2),
++			     gpon_bb_read_counter(priv, GPON_DBG_GEM_HEC_UC_ERR_CNT, GPON_BB_HECU));
+ }
+ 
+ static void gpon_irq_work_fn(struct work_struct *work)
+@@ -4221,6 +4245,7 @@ static int airoha_xpon_init_gpon(struct platform_device *pdev,
+ 	mutex_init(&priv->omci_config_lock);
+ 	mutex_init(&priv->link_state_lock);
+ 	spin_lock_init(&priv->ploam_tx_lock);
++	gpon_bb_init(priv);
+ 	bitmap_zero(priv->service_gems, GPON_MAX_GEM_ID);
+ 	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));
+@@ -4261,6 +4286,7 @@ static int airoha_xpon_init_gpon(struct platform_device *pdev,
+ 	return 0;
+ 
+ err_destroy_fsm_wq:
++	gpon_bb_cleanup(priv);
+ 	destroy_workqueue(priv->fsm_wq);
+ 	priv->fsm_wq = NULL;
+ 	return ret;
+@@ -4268,6 +4294,7 @@ err_destroy_fsm_wq:
+ 
+ static void airoha_xpon_cleanup_gpon(struct xpon_priv *priv)
+ {
++	gpon_bb_cleanup(priv);
+ 	ploam_free(priv->ploam);
+ 	priv->ploam = NULL;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 5b34cc0..fa99c06 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -368,7 +368,10 @@ struct epon_llid {
+ 	u16		value;
+ };
+ 
++struct gpon_blackbox;
++
+ struct xpon_priv {
++	struct gpon_blackbox *blackbox;
+ 	void __iomem		*base;
+ 	void __iomem		*gpon_reg;
+ 	void __iomem		*epon_reg;
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+new file mode 100644
+index 0000000..eddc7cf
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -0,0 +1,466 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _AIROHA_XPON_BLACKBOX_H
++#define _AIROHA_XPON_BLACKBOX_H
++
++#include <linux/debugfs.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
++#include <linux/slab.h>
++#include <linux/seq_file.h>
++
++#define GPON_BB_SIZE 256
++#define GPON_BB_PRINT 24
++#define GPON_BB_UNKNOWN U32_MAX
++
++enum gpon_bb_event {
++	GPON_BB_IRQ, GPON_BB_RX_FIFO, GPON_BB_RX, GPON_BB_TX,
++	GPON_BB_STATE, GPON_BB_PHY, GPON_BB_CFG, GPON_BB_DEACT,
++	GPON_BB_BIP, GPON_BB_HEC, GPON_BB_GEM, GPON_BB_AUX,
++	GPON_BB_TIMING, GPON_BB_TX_BEGIN,
++};
++
++enum gpon_bb_counter {
++	GPON_BB_RX_GEM, GPON_BB_RX_CRC, GPON_BB_RX_GTC,
++	GPON_BB_TX_GEM, GPON_BB_TX_BURST,
++	GPON_BB_HEC1, GPON_BB_HEC2, GPON_BB_HECU,
++	GPON_BB_RSP, GPON_BB_EQD, GPON_BB_FEC, GPON_BB_COUNTERS,
++};
++
++struct gpon_bb_entry {
++	u64 ns;
++	u32 seq;
++	u16 event;
++	u16 state;
++	u32 data[4];
++};
++
++static_assert(sizeof(struct gpon_bb_entry) == 32);
++
++struct gpon_bb_cache {
++	u32 value[GPON_BB_COUNTERS];
++	u64 ns[GPON_BB_COUNTERS];
++	u32 valid;
++	u64 sample_ns;
++	u64 bip;
++	u32 gem;
++	u32 session;
++};
++
++struct gpon_blackbox {
++	/* Protects both rings, cached metadata and snapshot lifecycle. */
++	spinlock_t lock;
++	struct xpon_priv *priv;
++	struct dentry *dir;
++	struct work_struct capture_work;
++	struct delayed_work print_work;
++	struct gpon_bb_entry bank[2][GPON_BB_SIZE];
++	struct gpon_bb_cache cache;
++	struct gpon_bb_cache frozen_cache;
++	u32 head[2], count[2], seq;
++	u32 frozen_bank, frozen_head, frozen_count, frozen_seq;
++	u32 id, missed, suppressed;
++	u64 frozen_ns, last_print_ns;
++	unsigned long next_sample;
++	u16 state;
++	u8 active;
++	bool pending, frozen_valid, stopping;
++};
++
++/* The open file owns this copy and never dereferences the device afterwards. */
++struct gpon_bb_snapshot {
++	struct gpon_bb_entry entry[GPON_BB_SIZE];
++	struct gpon_bb_cache cache;
++	u64 ref_ns;
++	u32 count, id, missed, suppressed;
++	bool frozen;
++};
++
++static const char *gpon_bb_name(u16 event)
++{
++	static const char * const names[] = {
++		"IRQ", "RX_FIFO", "RX", "TX", "STATE", "PHY", "CFG",
++		"DEACT", "BIP", "HEC_CACHE", "GEM_CACHE", "AUX_CACHE",
++		"TIMING_CACHE", "TX_BEGIN",
++	};
++
++	return event < ARRAY_SIZE(names) ? names[event] : "UNKNOWN";
++}
++
++static void gpon_bb_add_locked(struct gpon_blackbox *bb, u16 event,
++			       u32 a, u32 b, u32 c, u32 d)
++{
++	struct gpon_bb_entry *e = &bb->bank[bb->active][bb->head[bb->active]];
++
++	lockdep_assert_held(&bb->lock);
++	e->ns = ktime_get_ns();
++	e->seq = bb->seq++;
++	e->event = event;
++	e->state = bb->state;
++	e->data[0] = a;
++	e->data[1] = b;
++	e->data[2] = c;
++	e->data[3] = d;
++	bb->head[bb->active] = (bb->head[bb->active] + 1) % GPON_BB_SIZE;
++	if (bb->count[bb->active] < GPON_BB_SIZE)
++		bb->count[bb->active]++;
++}
++
++static void gpon_bb_record(struct xpon_priv *priv, u16 event,
++			   u32 a, u32 b, u32 c, u32 d)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	unsigned long flags;
++
++	if (!bb)
++		return;
++	spin_lock_irqsave(&bb->lock, flags);
++	if (!bb->stopping)
++		gpon_bb_add_locked(bb, event, a, b, c, d);
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++static void gpon_bb_cache_value(struct xpon_priv *priv, unsigned int index,
++				u32 value)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	unsigned long flags;
++
++	if (!bb)
++		return;
++	spin_lock_irqsave(&bb->lock, flags);
++	bb->cache.value[index] = value;
++	bb->cache.ns[index] = ktime_get_ns();
++	bb->cache.valid |= BIT(index);
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++/* Replace an existing read, including its original printk rate-limit guard. */
++static u32 gpon_bb_read_counter(struct xpon_priv *priv, u32 reg,
++				unsigned int index)
++{
++	u32 value = gpon_read(priv, reg);
++
++	gpon_bb_cache_value(priv, index, value);
++	return value;
++}
++
++static void gpon_bb_state(struct xpon_priv *priv, u16 state)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	unsigned long flags;
++	u16 old;
++
++	if (!bb)
++		return;
++	spin_lock_irqsave(&bb->lock, flags);
++	old = bb->state;
++	bb->state = state;
++	if (!bb->stopping)
++		gpon_bb_add_locked(bb, GPON_BB_STATE, old, state, 0, 0);
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++static u32 gpon_bb_age_ms(const struct gpon_bb_cache *c, u32 mask, u64 now)
++{
++	u64 oldest = now;
++	unsigned int i;
++
++	if ((c->valid & mask) != mask)
++		return GPON_BB_UNKNOWN;
++	for (i = 0; i < GPON_BB_COUNTERS; i++)
++		if (mask & BIT(i))
++			oldest = min(oldest, c->ns[i]);
++	return min_t(u64, div_u64(now - oldest, NSEC_PER_MSEC), U32_MAX - 1);
++}
++
++static void gpon_bb_sample(struct xpon_priv *priv)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	struct gpon_bb_cache *c;
++	unsigned long flags;
++	u64 bip, now;
++	u32 session;
++
++	if (!bb || time_before(jiffies, bb->next_sample))
++		return;
++	bb->next_sample = jiffies + HZ;
++	spin_lock_irqsave(&priv->bip_lock, flags);
++	bip = priv->bip_total;
++	session = priv->bip_session;
++	spin_unlock_irqrestore(&priv->bip_lock, flags);
++	spin_lock_irqsave(&bb->lock, flags);
++	if (bb->stopping)
++		goto out;
++	now = ktime_get_ns();
++	c = &bb->cache;
++	c->sample_ns = now;
++	c->bip = bip;
++	c->gem = READ_ONCE(priv->gem_delin_events);
++	c->session = session;
++	gpon_bb_add_locked(bb, GPON_BB_BIP, lower_32_bits(bip),
++			   upper_32_bits(bip), c->gem, session);
++	gpon_bb_add_locked(bb, GPON_BB_HEC, c->value[GPON_BB_HEC1],
++			   c->value[GPON_BB_HEC2], c->value[GPON_BB_HECU],
++			   gpon_bb_age_ms(c, GENMASK(GPON_BB_HECU, GPON_BB_HEC1), now));
++	gpon_bb_add_locked(bb, GPON_BB_GEM, c->value[GPON_BB_RX_GEM],
++			   c->value[GPON_BB_TX_GEM], c->valid,
++			   gpon_bb_age_ms(c, BIT(GPON_BB_RX_GEM) | BIT(GPON_BB_TX_GEM), now));
++	gpon_bb_add_locked(bb, GPON_BB_AUX, c->value[GPON_BB_RX_CRC],
++			   c->value[GPON_BB_RX_GTC], c->value[GPON_BB_TX_BURST],
++			   gpon_bb_age_ms(c, BIT(GPON_BB_RX_CRC) | BIT(GPON_BB_RX_GTC) |
++					 BIT(GPON_BB_TX_BURST), now));
++	gpon_bb_add_locked(bb, GPON_BB_TIMING, c->value[GPON_BB_RSP],
++			   c->value[GPON_BB_EQD], c->value[GPON_BB_FEC], c->valid);
++out:
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++static void gpon_bb_print_work(struct work_struct *work)
++{
++	struct gpon_blackbox *bb = container_of(to_delayed_work(work),
++						struct gpon_blackbox, print_work);
++	struct xpon_priv *priv = bb->priv;
++	const struct gpon_bb_cache *c = &bb->frozen_cache;
++	unsigned long flags;
++	u32 i, start, count;
++	u64 now = ktime_get_ns();
++
++	/* The pending bank is immutable until this worker releases it. */
++	if (READ_ONCE(bb->stopping))
++		goto done;
++	if (bb->last_print_ns && now - bb->last_print_ns < 30ULL * NSEC_PER_SEC) {
++		spin_lock_irqsave(&bb->lock, flags);
++		bb->suppressed++;
++		spin_unlock_irqrestore(&bb->lock, flags);
++		goto done;
++	}
++	bb->last_print_ns = now;
++	count = min_t(u32, bb->frozen_count, GPON_BB_PRINT);
++	start = (bb->frozen_head + GPON_BB_SIZE - count) % GPON_BB_SIZE;
++	dev_warn(priv->dev,
++		 "gpon-bb id=%u deact_ns=%llu dump_delay_ms=%llu kept=%u printed=%u missed=%u suppressed=%u\n",
++		 bb->id, bb->frozen_ns, div_u64(now - bb->frozen_ns, NSEC_PER_MSEC),
++		 bb->frozen_count, count, READ_ONCE(bb->missed), READ_ONCE(bb->suppressed));
++	dev_warn(priv->dev,
++		 "gpon-bb sample_age_ms=%llu bip=%llu gem=%u session=%u cache_valid=%x rx_sync=unavailable\n",
++		 c->sample_ns ? div_u64(bb->frozen_ns - c->sample_ns, NSEC_PER_MSEC) : U64_MAX,
++		 c->bip, c->gem, c->session, c->valid);
++	dev_warn(priv->dev,
++		 "gpon-bb hw_cache hec=%u/%u/%u hec_age_ms=%u rx_gem=%u tx_gem=%u rsp=%x eqd=%x fec=%x\n",
++		 c->value[GPON_BB_HEC1], c->value[GPON_BB_HEC2], c->value[GPON_BB_HECU],
++		 gpon_bb_age_ms(c, GENMASK(GPON_BB_HECU, GPON_BB_HEC1), bb->frozen_ns),
++		 c->value[GPON_BB_RX_GEM], c->value[GPON_BB_TX_GEM],
++		 c->value[GPON_BB_RSP], c->value[GPON_BB_EQD], c->value[GPON_BB_FEC]);
++	for (i = 0; i < count; i++) {
++		const struct gpon_bb_entry *e =
++			&bb->bank[bb->frozen_bank][(start + i) % GPON_BB_SIZE];
++
++		dev_warn(priv->dev,
++			 "gpon-bb %lldus #%u %s s=%u %08x %08x %08x %08x\n",
++			 div_s64((s64)e->ns - (s64)bb->frozen_ns, NSEC_PER_USEC),
++			 e->seq, gpon_bb_name(e->event), e->state,
++			 e->data[0], e->data[1], e->data[2], e->data[3]);
++	}
++	dev_warn(priv->dev, "gpon-bb end id=%u full=debugfs/%s/gpon_blackbox_last\n",
++		 bb->id, dev_name(priv->dev));
++done:
++	spin_lock_irqsave(&bb->lock, flags);
++	bb->pending = false;
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++static void gpon_bb_capture_work(struct work_struct *work)
++{
++	struct gpon_blackbox *bb = container_of(work, struct gpon_blackbox,
++						capture_work);
++
++	/* Never print from the ordered FSM or while the snapshot lock is held. */
++	if (!READ_ONCE(bb->stopping))
++		queue_delayed_work(system_unbound_wq, &bb->print_work, 5 * HZ);
++}
++
++static void gpon_bb_deactivate(struct xpon_priv *priv)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	unsigned long flags;
++
++	if (!bb)
++		return;
++	spin_lock_irqsave(&bb->lock, flags);
++	if (bb->stopping)
++		goto out;
++	gpon_bb_add_locked(bb, GPON_BB_DEACT, 0, 0, 0, 0);
++	if (bb->pending) {
++		bb->missed++;
++		goto out;
++	}
++	bb->frozen_bank = bb->active;
++	bb->frozen_head = bb->head[bb->active];
++	bb->frozen_count = bb->count[bb->active];
++	bb->frozen_seq = bb->seq;
++	bb->frozen_ns = bb->bank[bb->active]
++		[(bb->frozen_head + GPON_BB_SIZE - 1) % GPON_BB_SIZE].ns;
++	bb->frozen_cache = bb->cache;
++	bb->frozen_valid = true;
++	bb->pending = true;
++	bb->id++;
++	bb->active ^= 1;
++	bb->head[bb->active] = 0;
++	bb->count[bb->active] = 0;
++	/* Queue under the same lock that cleanup uses to stop producers. */
++	queue_work(system_unbound_wq, &bb->capture_work);
++out:
++	spin_unlock_irqrestore(&bb->lock, flags);
++}
++
++static int gpon_bb_show(struct seq_file *s, void *unused)
++{
++	struct gpon_bb_snapshot *snap = s->private;
++	u32 i;
++
++	seq_printf(s, "id=%u frozen=%u count=%u ref_ns=%llu missed=%u suppressed=%u\n",
++		   snap->id, snap->frozen, snap->count, snap->ref_ns,
++		   snap->missed, snap->suppressed);
++	seq_printf(s, "sample_ns=%llu bip=%llu gem=%u session=%u cache_valid=%x\n",
++		   snap->cache.sample_ns, snap->cache.bip, snap->cache.gem,
++		   snap->cache.session, snap->cache.valid);
++	seq_printf(s, "hw_cache hec=%u/%u/%u hec_age_ms=%u rx_gem=%u tx_gem=%u rsp=%x eqd=%x fec=%x\n",
++		   snap->cache.value[GPON_BB_HEC1], snap->cache.value[GPON_BB_HEC2],
++		   snap->cache.value[GPON_BB_HECU],
++		   gpon_bb_age_ms(&snap->cache, GENMASK(GPON_BB_HECU, GPON_BB_HEC1), snap->ref_ns),
++		   snap->cache.value[GPON_BB_RX_GEM], snap->cache.value[GPON_BB_TX_GEM],
++		   snap->cache.value[GPON_BB_RSP], snap->cache.value[GPON_BB_EQD],
++		   snap->cache.value[GPON_BB_FEC]);
++	for (i = 0; i < snap->count; i++) {
++		const struct gpon_bb_entry *e = &snap->entry[i];
++
++		seq_printf(s, "%lldus #%u %s s=%u %08x %08x %08x %08x\n",
++			   div_s64((s64)e->ns - (s64)snap->ref_ns, NSEC_PER_USEC),
++			   e->seq, gpon_bb_name(e->event), e->state,
++			   e->data[0], e->data[1], e->data[2], e->data[3]);
++	}
++	return 0;
++}
++
++static int gpon_bb_copy_snapshot(struct gpon_blackbox *bb,
++				 struct gpon_bb_snapshot *snap, bool last)
++{
++	unsigned long flags;
++	u32 bank, head, end, i;
++
++	spin_lock_irqsave(&bb->lock, flags);
++	snap->frozen = last && bb->frozen_valid;
++	bank = snap->frozen ? bb->frozen_bank : bb->active;
++	head = snap->frozen ? bb->frozen_head : bb->head[bank];
++	end = snap->frozen ? bb->frozen_seq : bb->seq;
++	snap->count = snap->frozen ? bb->frozen_count : bb->count[bank];
++	snap->ref_ns = snap->frozen ? bb->frozen_ns : ktime_get_ns();
++	snap->cache = snap->frozen ? bb->frozen_cache : bb->cache;
++	snap->id = bb->id;
++	snap->missed = bb->missed;
++	snap->suppressed = bb->suppressed;
++	spin_unlock_irqrestore(&bb->lock, flags);
++	for (i = 0; i < snap->count; i++) {
++		u32 slot = (head + GPON_BB_SIZE - snap->count + i) % GPON_BB_SIZE;
++
++		/* One entry per critical section, never an 8 KiB IRQ-off memcpy. */
++		spin_lock_irqsave(&bb->lock, flags);
++		snap->entry[i] = bb->bank[bank][slot];
++		spin_unlock_irqrestore(&bb->lock, flags);
++		if (snap->entry[i].seq != end - snap->count + i)
++			return -EAGAIN;
++	}
++	return 0;
++}
++
++static int gpon_bb_open_common(struct inode *inode, struct file *file, bool last)
++{
++	struct gpon_blackbox *bb = inode->i_private;
++	struct gpon_bb_snapshot *snap;
++	int ret;
++
++	/* debugfs protects this open operation against removal. */
++	snap = kzalloc(sizeof(*snap), GFP_KERNEL);
++	if (!snap)
++		return -ENOMEM;
++	ret = gpon_bb_copy_snapshot(bb, snap, last);
++	if (!ret)
++		ret = single_open(file, gpon_bb_show, snap);
++	if (ret)
++		kfree(snap);
++	return ret;
++}
++
++static int gpon_bb_open(struct inode *inode, struct file *file)
++{
++	return gpon_bb_open_common(inode, file, false);
++}
++
++static int gpon_bb_last_open(struct inode *inode, struct file *file)
++{
++	return gpon_bb_open_common(inode, file, true);
++}
++
++static int gpon_bb_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *s = file->private_data;
++
++	kfree(s->private);
++	return single_release(inode, file);
++}
++
++static const struct file_operations gpon_bb_fops = {
++	.owner = THIS_MODULE,
++	.open = gpon_bb_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = gpon_bb_release,
++};
++
++static const struct file_operations gpon_bb_last_fops = {
++	.owner = THIS_MODULE,
++	.open = gpon_bb_last_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = gpon_bb_release,
++};
++
++static void gpon_bb_init(struct xpon_priv *priv)
++{
++	struct gpon_blackbox *bb;
++
++	bb = devm_kzalloc(priv->dev, sizeof(*bb), GFP_KERNEL);
++	if (!bb)
++		return;
++	spin_lock_init(&bb->lock);
++	bb->priv = priv;
++	bb->state = GPON_O1_INITIAL;
++	bb->next_sample = jiffies;
++	INIT_WORK(&bb->capture_work, gpon_bb_capture_work);
++	INIT_DELAYED_WORK(&bb->print_work, gpon_bb_print_work);
++	bb->dir = debugfs_create_dir(dev_name(priv->dev), NULL);
++	if (!IS_ERR_OR_NULL(bb->dir)) {
++		debugfs_create_file("gpon_blackbox", 0400, bb->dir, bb, &gpon_bb_fops);
++		debugfs_create_file("gpon_blackbox_last", 0400, bb->dir, bb,
++				    &gpon_bb_last_fops);
++	}
++	WRITE_ONCE(priv->blackbox, bb);
++}
++
++static void gpon_bb_cleanup(struct xpon_priv *priv)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++	unsigned long flags;
++
++	if (!bb)
++		return;
++	spin_lock_irqsave(&bb->lock, flags);
++	bb->stopping = true;
++	spin_unlock_irqrestore(&bb->lock, flags);
++	debugfs_remove_recursive(bb->dir);
++	cancel_work_sync(&bb->capture_work);
++	cancel_delayed_work_sync(&bb->print_work);
++	WRITE_ONCE(priv->blackbox, NULL);
++}
++
++#endif /* _AIROHA_XPON_BLACKBOX_H */
