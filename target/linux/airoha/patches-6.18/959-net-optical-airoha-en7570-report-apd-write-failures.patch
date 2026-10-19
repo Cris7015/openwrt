@@ -1,0 +1,65 @@
+Subject: [PATCH] optical: airoha: en7570: report APD write failures
+
+Propagate the DAC write status and only update the requested-voltage cache
+after a successful transfer. Report failures with rate limiting. Do not
+add immediate retries or change the voltage law or update schedule.
+
+The cached value remains a software request, not an independent voltage
+measurement. A failed transaction may still have reached the device.
+
+---
+Base: 1c64056452af63203240b8851a0d3038e09f19d5
+
+diff --git a/drivers/net/optical/airoha/en7570.h b/drivers/net/optical/airoha/en7570.h
+index ba7d42b13..29d4efe38 100644
+--- a/drivers/net/optical/airoha/en7570.h
++++ b/drivers/net/optical/airoha/en7570.h
+@@ -150,7 +150,7 @@ int en7570_pattern_start(struct en7570_priv *priv, int mode);
+ void en7570_pattern_stop(struct en7570_priv *priv);
+ void en7570_apd_init(struct en7570_priv *priv);
+ void en7570_apd_update(struct en7570_priv *priv);
+-void en7570_apd_write(struct en7570_priv *priv, u8 code);
++int en7570_apd_write(struct en7570_priv *priv, u8 code);
+ void en7570_rogue_clear(struct en7570_priv *priv);
+ void en7570_safe_reset(struct en7570_priv *priv);
+ void en7570_tx_alarms(struct en7570_priv *priv);
+diff --git a/drivers/net/optical/airoha/en7570_txrx.c b/drivers/net/optical/airoha/en7570_txrx.c
+index d2041dda0..b70fa82fa 100644
+--- a/drivers/net/optical/airoha/en7570_txrx.c
++++ b/drivers/net/optical/airoha/en7570_txrx.c
+@@ -419,9 +419,9 @@ void en7570_apd_init(struct en7570_priv *priv)
+ 		       EN7570_APD_CONTROL_ENABLE);
+ }
+ 
+-void en7570_apd_write(struct en7570_priv *priv, u8 code)
++int en7570_apd_write(struct en7570_priv *priv, u8 code)
+ {
+-	lddla_wr8(&priv->lddla, EN7570_APD_DAC_CODE, code);
++	return lddla_wr8(&priv->lddla, EN7570_APD_DAC_CODE, code);
+ }
+ 
+ /* Convert an APD voltage (mV) to a DAC code, four-segment or legacy. */
+@@ -491,7 +491,7 @@ static int en7570_apd_voltage_to_code(struct en7570_priv *priv, s32 v_mv)
+ void en7570_apd_update(struct en7570_priv *priv)
+ {
+ 	s32 v_mv, contrib;
+-	int code;
++	int code, ret;
+ 
+ 	if (priv->bosa_temp_mc > EN7570_APD_KNEE_TEMP_MC) {
+ 		contrib = div_s64((s64)priv->apd_slope_up_uv *
+@@ -509,8 +509,13 @@ void en7570_apd_update(struct en7570_priv *priv)
+ 	if (code < 0)
+ 		return;
+ 
++	ret = en7570_apd_write(priv, code);
++	if (ret) {
++		dev_warn_ratelimited(priv->lddla.dev,
++				     "EN7570 APD write failed (%d)\n", ret);
++		return;
++	}
+ 	priv->apd_voltage_mv = v_mv;
+-	en7570_apd_write(priv, code);
+ }
+ 
+ void en7570_rogue_clear(struct en7570_priv *priv)

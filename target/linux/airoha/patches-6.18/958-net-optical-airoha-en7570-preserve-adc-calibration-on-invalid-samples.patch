@@ -1,0 +1,87 @@
+Subject: [PATCH] optical: airoha: en7570: preserve ADC calibration on invalid samples
+
+A failed mux restore currently reports sampling success. Propagate the
+cleanup error, preserving an earlier transfer error if both fail.
+
+Reject a bandgap spread below the existing validity threshold without
+replacing the previous slope and offset. Falling back to the default slope
+with an untrusted anchor can produce a plausible but incorrect temperature
+and therefore a different APD bias. An invalid initial calibration now
+fails initialization instead of programming from invalid references.
+
+This repairs error paths; it does not establish the cause of observed GPON
+errors. Hardware validation is pending.
+
+---
+Base: 1c64056452af63203240b8851a0d3038e09f19d5
+
+diff --git a/drivers/net/optical/airoha/en7570_adcloop.c b/drivers/net/optical/airoha/en7570_adcloop.c
+index 84f4b3b4b..8d0986f60 100644
+--- a/drivers/net/optical/airoha/en7570_adcloop.c
++++ b/drivers/net/optical/airoha/en7570_adcloop.c
+@@ -41,12 +41,13 @@ static int en7570_adc_select(struct en7570_priv *priv, u8 channel)
+ }
+ 
+ /* Restore the SVADC_PD channel field to its default (cleared). */
+-static void en7570_adc_restore(struct en7570_priv *priv, u8 channel)
++static int en7570_adc_restore(struct en7570_priv *priv, u8 channel)
+ {
+ 	if (channel == EN7570_ADC_CH_BG0V875)
+-		lddla_update8(&priv->lddla, EN7570_SVADC_PD + 1, EN7570_ADC_BG0V875_MASK, 0);
+-	else
+-		lddla_update8(&priv->lddla, EN7570_SVADC_PD, EN7570_ADC_SELECT_MASK, 0);
++		return lddla_update8(&priv->lddla, EN7570_SVADC_PD + 1,
++				    EN7570_ADC_BG0V875_MASK, 0);
++	return lddla_update8(&priv->lddla, EN7570_SVADC_PD,
++			    EN7570_ADC_SELECT_MASK, 0);
+ }
+ 
+ /**
+@@ -60,7 +61,7 @@ int en7570_adc_sample(struct en7570_priv *priv, u8 channel, int samples,
+ 		      u32 *out)
+ {
+ 	u32 sum = 0;
+-	int i, ret;
++	int i, ret, restore;
+ 	u16 v;
+ 
+ 	if (samples < 1)
+@@ -85,9 +86,11 @@ int en7570_adc_sample(struct en7570_priv *priv, u8 channel, int samples,
+ 	}
+ 
+ restore:
+-	en7570_adc_restore(priv, channel);
++	restore = en7570_adc_restore(priv, channel);
+ 	if (ret)
+ 		return ret;
++	if (restore)
++		return restore;
+ 
+ 	*out = (sum + samples / 2) / samples;	/* round to nearest */
+ 	return 0;
+@@ -120,17 +123,16 @@ int en7570_adc_calibrate(struct en7570_priv *priv)
+ 		return ret;
+ 
+ 	delta = (s32)bg1v76 - (s32)bg0v875;
+-	if (delta > EN7570_ADC_BANDGAP_MIN_DELTA) {
+-		priv->adc_slope_nv =
+-			div_s64(EN7570_BG_1V76_NV - EN7570_BG_0V875_NV, delta);
+-	} else {
+-		/* ADC stuck at bandgap: slope would be infinite, use default. */
+-		dev_warn(priv->lddla.dev,
+-			 "ADC bandgap spread too small (%d); using default slope\n",
+-			 delta);
+-		priv->adc_slope_nv = EN7570_DEFAULT_SLOPE_NV;
++	if (delta <= EN7570_ADC_BANDGAP_MIN_DELTA) {
++		/* An invalid reference must not replace the last calibration. */
++		dev_warn_ratelimited(priv->lddla.dev,
++				     "ADC bandgap spread too small (%d); keeping calibration\n",
++				     delta);
++		return -ERANGE;
+ 	}
+ 
++	priv->adc_slope_nv =
++		div_s64(EN7570_BG_1V76_NV - EN7570_BG_0V875_NV, delta);
+ 	priv->adc_offset_uv = 1760000 - div_s64(priv->adc_slope_nv * bg1v76, 1000);
+ 	return 0;
+ }

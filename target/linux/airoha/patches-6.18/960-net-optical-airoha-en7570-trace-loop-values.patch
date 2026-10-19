@@ -1,0 +1,86 @@
+Subject: [PATCH] net: optical: airoha: en7570: trace what the periodic loop measures
+
+Lab image only. The ADC calibration, temperature and APD updates already run
+in the tick worker; log their values on change and as a slow heartbeat, and
+warn on a request above 50.5 V. No extra I2C access is added.
+
+---
+--- a/drivers/net/optical/airoha/en7570.h
++++ b/drivers/net/optical/airoha/en7570.h
+@@ -77,6 +77,10 @@
+ 	s32 env_temp_offset_mc;
+ 
+ 	s32 apd_voltage_mv;	/* last APD voltage written (mV) */
++	/* Lab trace state: what the periodic loop logged last. */
++	u32 dbg_bg1, dbg_bg0;
++	s32 dbg_apd_mv, dbg_temp_mc;
++	u16 dbg_cal_n, dbg_apd_n, dbg_temp_n;
+ 	s32 apd_slope_up_uv;	/* uV/degC above knee */
+ 	s32 apd_slope_dn_uv;	/* uV/degC below knee */
+ 	s32 apd_knee_mv;	/* knee voltage (mV) */
+--- a/drivers/net/optical/airoha/en7570_adcloop.c
++++ b/drivers/net/optical/airoha/en7570_adcloop.c
+@@ -126,14 +126,25 @@
+ 	if (delta <= EN7570_ADC_BANDGAP_MIN_DELTA) {
+ 		/* An invalid reference must not replace the last calibration. */
+ 		dev_warn_ratelimited(priv->lddla.dev,
+-				     "ADC bandgap spread too small (%d); keeping calibration\n",
+-				     delta);
++				     "ADC bandgap spread too small (%d, bg1=%u bg0=%u); keeping calibration\n",
++				     delta, bg1v76, bg0v875);
+ 		return -ERANGE;
+ 	}
+ 
+ 	priv->adc_slope_nv =
+ 		div_s64(EN7570_BG_1V76_NV - EN7570_BG_0V875_NV, delta);
+ 	priv->adc_offset_uv = 1760000 - div_s64(priv->adc_slope_nv * bg1v76, 1000);
++
++	/* Lab trace: the loop already measured these; log changes and a heartbeat. */
++	if (!(priv->dbg_cal_n++ % 15) ||
++	    abs((s32)bg1v76 - (s32)priv->dbg_bg1) > 3 ||
++	    abs((s32)bg0v875 - (s32)priv->dbg_bg0) > 3)
++		dev_info(priv->lddla.dev,
++			 "EN7570 ADC cal: bg1=%u bg0=%u spread=%d slope=%lld nV/code offset=%d uV\n",
++			 bg1v76, bg0v875, delta, priv->adc_slope_nv,
++			 priv->adc_offset_uv);
++	priv->dbg_bg1 = bg1v76;
++	priv->dbg_bg0 = bg0v875;
+ 	return 0;
+ }
+ 
+@@ -192,6 +203,14 @@
+ 	priv->ic_temp_mc = ic_temp_mc;
+ 	priv->bosa_temp_mc = priv->ic_temp_mc - priv->bosa_temp_offset_mc;
+ 	priv->env_temp_mc = priv->ic_temp_mc - priv->env_temp_offset_mc;
++
++	/* Lab trace: log a heartbeat and any jump of 3 degC or more. */
++	if (!(priv->dbg_temp_n++ % 20) ||
++	    abs(priv->ic_temp_mc - priv->dbg_temp_mc) >= 3000)
++		dev_info(priv->lddla.dev,
++			 "EN7570 temp: code=%u ic=%d mC bosa=%d mC\n",
++			 raw, priv->ic_temp_mc, priv->bosa_temp_mc);
++	priv->dbg_temp_mc = priv->ic_temp_mc;
+ 	return 0;
+ 
+ fail:
+--- a/drivers/net/optical/airoha/en7570_txrx.c
++++ b/drivers/net/optical/airoha/en7570_txrx.c
+@@ -516,6 +516,18 @@
+ 		return;
+ 	}
+ 	priv->apd_voltage_mv = v_mv;
++
++	/* Lab trace: heartbeat, any change of 300 mV or more, and any over-bias. */
++	if (!(priv->dbg_apd_n++ % 20) ||
++	    abs(v_mv - priv->dbg_apd_mv) >= 300)
++		dev_info(priv->lddla.dev,
++			 "EN7570 APD: %d mV code=%d bosa=%d mC\n",
++			 v_mv, code, priv->bosa_temp_mc);
++	if (v_mv > 50500)
++		dev_warn_ratelimited(priv->lddla.dev,
++				     "EN7570 APD request %d mV is above 50.5 V (code %d, bosa %d mC)\n",
++				     v_mv, code, priv->bosa_temp_mc);
++	priv->dbg_apd_mv = v_mv;
+ }
+ 
+ void en7570_rogue_clear(struct en7570_priv *priv)
