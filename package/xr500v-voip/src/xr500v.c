@@ -689,6 +689,51 @@ static int xr_play_alloc(struct auplay_st **stp, const struct auplay *ap,
 	return err;
 }
 
+/* ------------------------------------------------- incoming call reject */
+
+/* "xr500v_reject <call-id> <status>": reject an incoming call that is still
+ * unanswered with one of the statuses the network maps to an announcement
+ * (reject.inc in the call manager). Runs from ctrl_tcp, not from inside an
+ * event handler, so the call may be released here. */
+static int cmd_reject(struct re_printf *pf, void *arg)
+{
+	const struct cmd_arg *carg = arg;
+	struct pl id, code;
+	struct call *call;
+	const char *reason;
+	char callid[1024];
+
+	if (!str_isset(carg->prm) ||
+	    re_regex(carg->prm, strlen(carg->prm), "[^ ]+ [0-9]+", &id, &code)) {
+		re_hprintf(pf, "usage: xr500v_reject <call-id> <status>\n");
+		return EINVAL;
+	}
+
+	switch (pl_u32(&code)) {
+	case 404: reason = "Not Found"; break;
+	case 410: reason = "Gone"; break;
+	case 480: reason = "Temporarily Unavailable"; break;
+	case 486: reason = "Busy Here"; break;
+	case 603: reason = "Decline"; break;
+	case 604: reason = "Does Not Exist Anywhere"; break;
+	default: return EINVAL;
+	}
+
+	if (pl_strcpy(&id, callid, sizeof(callid)))
+		return EINVAL;
+	call = uag_call_find(callid);
+	if (!call || call_state(call) != CALL_STATE_INCOMING)
+		return ENOENT;
+
+	ua_hangup(call_get_ua(call), call, (uint16_t)pl_u32(&code), reason);
+	return 0;
+}
+
+static const struct cmd reject_cmdv[] = {
+	{"xr500v_reject", 0, CMD_PRM, "Reject an incoming call with a status",
+	 cmd_reject},
+};
+
 /* ---------------------------------------------------------------- module */
 
 static int module_init(void)
@@ -721,6 +766,11 @@ static int module_init(void)
 		return err;
 	info("xr500v: call waiting tone %s\n", g_cw_enabled ? "on" : "off");
 
+	err = cmd_register(baresip_commands(), reject_cmdv,
+			   RE_ARRAY_SIZE(reject_cmdv));
+	if (err)
+		return err;
+
 	err = voice_calls_init();
 	if (err)
 		return err;
@@ -733,6 +783,7 @@ static int module_init(void)
 
 static int module_close(void)
 {
+	cmd_unregister(baresip_commands(), reject_cmdv);
 	bevent_unregister(call_event_handler);
 	voice_calls_close();
 	ausrc  = mem_deref(ausrc);

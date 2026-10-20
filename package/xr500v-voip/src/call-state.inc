@@ -202,6 +202,15 @@ static void handle_call_event(int s, const char *payload)
 	if (!strcmp(type, "CALL_INCOMING")) {
 		if (!strcmp(id, active_callid) || !strcmp(id, other_callid))
 			goto out; /* duplicate event */
+		{
+			/* A rejected dialog never owns the line, busy or not. */
+			int code = reject_lookup(event_string(obj, "peeruri"));
+
+			if (code) {
+				reject_incoming(s, id, code);
+				goto out;
+			}
+		}
 		if (!handset_available()) {
 			if (call_waiting && state == INCALL && *active_callid && !*other_callid) {
 				strcpy(other_callid, id);

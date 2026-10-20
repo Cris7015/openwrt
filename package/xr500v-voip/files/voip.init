@@ -39,6 +39,31 @@ voip_idle_feed() {
 	echo "$value"
 }
 
+# Incoming call rejection (reject.inc in the call manager): the manager reads
+# $RUNDIR/reject.conf on every incoming call. incoming_reject: off, all or
+# list (only the reject_number entries); reject_code: the SIP status sent.
+voip_reject_number() {
+	case "$1" in
+		anonymous) echo "number anonymous" ;;
+		*[!0-9+]*|'') logger -t voip "reject_number '$1' ignored" ;;
+		*) echo "number $1" ;;
+	esac
+}
+
+render_reject() {
+	local mode code
+	config_get mode globals incoming_reject off
+	config_get code globals reject_code 404
+	case "$mode" in off|all|list) ;; *) mode=off ;; esac
+	case "$code" in 404|410|480|486|603|604) ;; *) logger -t voip "reject_code '$code' invalid, rejection off"; mode=off ;; esac
+	mkdir -p "$RUNDIR"
+	{
+		echo "mode $mode"
+		echo "code $code"
+		config_list_foreach globals reject_number voip_reject_number
+	} > "$RUNDIR/reject.conf.tmp" && mv "$RUNDIR/reject.conf.tmp" "$RUNDIR/reject.conf"
+}
+
 start_service() {
 	local enabled aec denoise gain line active ip device cfg mode net ring_on ring_off ring_prefeed emergency cid
 	local cw flash_min flash_max
@@ -47,6 +72,7 @@ start_service() {
 	config_load xr500v-voip
 	config_get_bool enabled globals enabled 1
 	[ "$enabled" = 1 ] || return 0
+	render_reject
 	config_get_bool aec globals echo_cancel 1
 	config_get_bool denoise globals noise_suppress 1
 	config_get gain globals playback_percent 50

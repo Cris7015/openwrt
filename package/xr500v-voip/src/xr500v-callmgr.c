@@ -678,6 +678,7 @@ static int keypad_key(char c)
 
 #include "cid.inc"
 #include "registration.inc"
+#include "reject.inc"
 #include "call-state.inc"
 
 /* One tick of the ring cadence. Returns 1 while the bell is energized and
@@ -778,6 +779,7 @@ int main(void)
 		runtime = "/tmp/xr500v-dual";
 	if (*runtime != '/' || strlen(runtime) > 80)
 		return 2;
+	snprintf(reject_path, sizeof(reject_path), "%s/reject.conf", runtime);
 
 	ring_on_ms = cadence_ms(getenv("XR500V_RING_ON_MS"), 1000);
 	ring_off_ms = cadence_ms(getenv("XR500V_RING_OFF_MS"), 4000);
