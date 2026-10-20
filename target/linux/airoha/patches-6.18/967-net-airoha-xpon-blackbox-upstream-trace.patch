@@ -1,0 +1,260 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Tue, 20 Oct 2026 16:00:00 -0300
+Subject: [PATCH] net: airoha: xpon: trace upstream bursts and grant FIFOs for 256 ms
+
+In every black box dump the BW map single-grant FIFO full status (bit 23
+of the interrupt status) appears only in the last milliseconds before the
+OLT deactivates the ONU, after a downstream GEM delineation loss. A full
+grant FIFO means grants keep arriving and are not consumed, so the
+upstream burst engine may have stopped.
+
+Sample the TX burst and RX GTC counters, both BW map FIFO status words,
+the received grant status and the raw interrupt status every millisecond
+from an hrtimer while the GPON MAC is enabled. Keep 256 samples per bank,
+freeze them with the black box on Deactivate_ONU-ID and expose the frozen
+bank as gpon_ustrace_last. The MAC disable path waits for a running
+sample before it stops the MAC. Nothing is written to the hardware.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -120,6 +120,7 @@
+ #define GPON_DBG_BWM_SFIFO_STS	0x224
+ #define GPON_DBG_GRP_0		0x228
+ #define GPON_DBG_GRP_1		0x22C
++#define GPON_DBG_BWM_GRANT_STS	0x234
+ #define GPON_DBG_BWM_BFIFO_STS	0x250
+ #define GPON_DBG_PROBE_CTRL	0x240
+ #define GPON_DBG_PROBE_HIGH32	0x244
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -3,6 +3,7 @@
+ #define _AIROHA_XPON_BLACKBOX_H
+ 
+ #include <linux/debugfs.h>
++#include <linux/hrtimer.h>
+ #include <linux/ktime.h>
+ #include <linux/math64.h>
+ #include <linux/slab.h>
+@@ -11,6 +12,9 @@
+ #define GPON_BB_SIZE 512
+ #define GPON_BB_PRINT 24
+ #define GPON_BB_UNKNOWN U32_MAX
++/* Upstream trace: 1 ms samples, the last 256 ms before a deactivation. */
++#define GPON_UST_SIZE 256
++#define GPON_UST_PERIOD_NS NSEC_PER_MSEC
+ 
+ enum gpon_bb_event {
+ 	GPON_BB_IRQ, GPON_BB_RX_FIFO, GPON_BB_RX, GPON_BB_TX,
+@@ -36,6 +40,18 @@
+ 
+ static_assert(sizeof(struct gpon_bb_entry) == 32);
+ 
++struct gpon_ust_entry {
++	u64 ns;
++	u32 tx_bst;
++	u32 rx_gtc;
++	u32 sfifo;
++	u32 bfifo;
++	u32 grant;
++	u32 irq;
++};
++
++static_assert(sizeof(struct gpon_ust_entry) == 32);
++
+ struct gpon_bb_cache {
+ 	u32 value[GPON_BB_COUNTERS];
+ 	u64 ns[GPON_BB_COUNTERS];
+@@ -58,6 +74,11 @@
+ 	struct gpon_bb_entry bank[2][GPON_BB_SIZE];
+ 	struct gpon_bb_cache cache;
+ 	struct gpon_bb_cache frozen_cache;
++	struct hrtimer ust_timer;
++	struct gpon_ust_entry ust[2][GPON_UST_SIZE];
++	u32 ust_head[2], ust_count[2];
++	u32 ust_frozen_bank, ust_frozen_head, ust_frozen_count;
++	u8 ust_active;
+ 	u32 head[2], count[2], seq;
+ 	u32 frozen_bank, frozen_head, frozen_count, frozen_seq;
+ 	u32 id, missed, suppressed;
+@@ -79,6 +100,12 @@
+ 	bool frozen;
+ };
+ 
++struct gpon_ust_snapshot {
++	struct gpon_ust_entry entry[GPON_UST_SIZE];
++	u64 ref_ns;
++	u32 count, id;
++};
++
+ static const char *gpon_bb_name(u16 event)
+ {
+ 	static const char * const names[] = {
+@@ -224,6 +251,54 @@
+ 	spin_unlock_irqrestore(&bb->lock, flags);
+ }
+ 
++/*
++ * Reads only the MAC debug counters and status, never clears anything: it
++ * shows whether upstream bursts stop and the grant FIFOs fill before the
++ * OLT deactivates the ONU. Runs only while the GPON MAC is enabled.
++ */
++static enum hrtimer_restart gpon_ust_tick(struct hrtimer *t)
++{
++	struct gpon_blackbox *bb = container_of(t, struct gpon_blackbox, ust_timer);
++	struct xpon_priv *priv = bb->priv;
++	struct gpon_ust_entry e;
++	unsigned long flags;
++	u32 a;
++
++	if (READ_ONCE(bb->stopping))
++		return HRTIMER_NORESTART;
++	hrtimer_forward_now(t, ns_to_ktime(GPON_UST_PERIOD_NS));
++	if (priv->mode != AIROHA_XPON_MODE_GPON || !READ_ONCE(priv->mac_enabled))
++		return HRTIMER_RESTART;
++	e.ns = ktime_get_ns();
++	e.tx_bst = gpon_read(priv, GPON_DBG_TX_BST_CNT);
++	e.rx_gtc = gpon_read(priv, GPON_DBG_RX_GTC_CNT);
++	e.sfifo = gpon_read(priv, GPON_DBG_BWM_SFIFO_STS);
++	e.bfifo = gpon_read(priv, GPON_DBG_BWM_BFIFO_STS);
++	e.grant = gpon_read(priv, GPON_DBG_BWM_GRANT_STS);
++	e.irq = gpon_read(priv, GPON_INT_STATUS);
++	spin_lock_irqsave(&bb->lock, flags);
++	a = bb->ust_active;
++	bb->ust[a][bb->ust_head[a]] = e;
++	bb->ust_head[a] = (bb->ust_head[a] + 1) % GPON_UST_SIZE;
++	if (bb->ust_count[a] < GPON_UST_SIZE)
++		bb->ust_count[a]++;
++	spin_unlock_irqrestore(&bb->lock, flags);
++	return HRTIMER_RESTART;
++}
++
++/* Wait out a tick that may still be reading the MAC before it is stopped. */
++static void gpon_ust_sync(struct xpon_priv *priv)
++{
++	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
++
++	if (!bb)
++		return;
++	hrtimer_cancel(&bb->ust_timer);
++	if (!READ_ONCE(bb->stopping))
++		hrtimer_start(&bb->ust_timer, ns_to_ktime(GPON_UST_PERIOD_NS),
++			      HRTIMER_MODE_REL);
++}
++
+ static void gpon_bb_print_work(struct work_struct *work)
+ {
+ 	struct gpon_blackbox *bb = container_of(to_delayed_work(work),
+@@ -346,6 +421,12 @@
+ 	bb->active ^= 1;
+ 	bb->head[bb->active] = 0;
+ 	bb->count[bb->active] = 0;
++	bb->ust_frozen_bank = bb->ust_active;
++	bb->ust_frozen_head = bb->ust_head[bb->ust_active];
++	bb->ust_frozen_count = bb->ust_count[bb->ust_active];
++	bb->ust_active ^= 1;
++	bb->ust_head[bb->ust_active] = 0;
++	bb->ust_count[bb->ust_active] = 0;
+ 	/* Queue under the same lock that cleanup uses to stop producers. */
+ 	queue_work(system_unbound_wq, &bb->capture_work);
+ out:
+@@ -475,6 +556,65 @@
+ 	.release = gpon_bb_release,
+ };
+ 
++static int gpon_ust_show(struct seq_file *s, void *unused)
++{
++	struct gpon_ust_snapshot *snap = s->private;
++	u32 i;
++
++	seq_printf(s, "id=%u count=%u period_us=%lu ref_ns=%llu\n", snap->id,
++		   snap->count, GPON_UST_PERIOD_NS / NSEC_PER_USEC, snap->ref_ns);
++	seq_puts(s, "t_us tx_bst rx_gtc sfifo bfifo grant irq_raw\n");
++	for (i = 0; i < snap->count; i++) {
++		const struct gpon_ust_entry *e = &snap->entry[i];
++
++		seq_printf(s, "%lld %08x %08x %08x %08x %08x %08x\n",
++			   div_s64((s64)e->ns - (s64)snap->ref_ns, NSEC_PER_USEC),
++			   e->tx_bst, e->rx_gtc, e->sfifo, e->bfifo, e->grant, e->irq);
++	}
++	return 0;
++}
++
++static int gpon_ust_last_open(struct inode *inode, struct file *file)
++{
++	struct gpon_blackbox *bb = inode->i_private;
++	struct gpon_ust_snapshot *snap;
++	unsigned long flags;
++	u32 bank = 0, head = 0, i;
++	int ret;
++
++	snap = kvzalloc(sizeof(*snap), GFP_KERNEL);
++	if (!snap)
++		return -ENOMEM;
++	spin_lock_irqsave(&bb->lock, flags);
++	if (bb->frozen_valid) {
++		bank = bb->ust_frozen_bank;
++		head = bb->ust_frozen_head;
++		snap->count = bb->ust_frozen_count;
++		snap->ref_ns = bb->frozen_ns;
++		snap->id = bb->id;
++	}
++	spin_unlock_irqrestore(&bb->lock, flags);
++	for (i = 0; i < snap->count; i++) {
++		u32 slot = (head + GPON_UST_SIZE - snap->count + i) % GPON_UST_SIZE;
++
++		spin_lock_irqsave(&bb->lock, flags);
++		snap->entry[i] = bb->ust[bank][slot];
++		spin_unlock_irqrestore(&bb->lock, flags);
++	}
++	ret = single_open(file, gpon_ust_show, snap);
++	if (ret)
++		kvfree(snap);
++	return ret;
++}
++
++static const struct file_operations gpon_ust_last_fops = {
++	.owner = THIS_MODULE,
++	.open = gpon_ust_last_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = gpon_bb_release,
++};
++
+ static void gpon_bb_init(struct xpon_priv *priv)
+ {
+ 	struct gpon_blackbox *bb;
+@@ -494,8 +634,14 @@
+ 		debugfs_create_file("gpon_blackbox", 0400, bb->dir, bb, &gpon_bb_fops);
+ 		debugfs_create_file("gpon_blackbox_last", 0400, bb->dir, bb,
+ 				    &gpon_bb_last_fops);
++		debugfs_create_file("gpon_ustrace_last", 0400, bb->dir, bb,
++				    &gpon_ust_last_fops);
+ 	}
++	hrtimer_setup(&bb->ust_timer, gpon_ust_tick, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL);
+ 	WRITE_ONCE(priv->blackbox, bb);
++	hrtimer_start(&bb->ust_timer, ns_to_ktime(GPON_UST_PERIOD_NS),
++		      HRTIMER_MODE_REL);
+ }
+ 
+ static void gpon_bb_cleanup(struct xpon_priv *priv)
+@@ -508,6 +654,7 @@
+ 	spin_lock_irqsave(&bb->lock, flags);
+ 	bb->stopping = true;
+ 	spin_unlock_irqrestore(&bb->lock, flags);
++	hrtimer_cancel(&bb->ust_timer);
+ 	debugfs_remove_recursive(bb->dir);
+ 	cancel_work_sync(&bb->capture_work);
+ 	cancel_delayed_work_sync(&bb->print_work);
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2621,6 +2621,7 @@
+ 	 * remains enabled so no activation edge is lost across a restart.
+ 	 */
+ 	WRITE_ONCE(priv->mac_enabled, false);
++	gpon_ust_sync(priv);
+ 	gpon_bip_set_active(priv, false);
+ 	if (mac_enabled) {
+ 		gpon_write(priv, GPON_INT_ENABLE, 0);
