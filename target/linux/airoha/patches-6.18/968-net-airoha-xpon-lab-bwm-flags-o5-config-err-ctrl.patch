@@ -1,0 +1,215 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Tue, 20 Oct 2026 21:00:00 -0300
+Subject: [PATCH] net: airoha: xpon: lab: BW map flags in the trace, O5 config and resync knob
+
+The 1 ms upstream trace showed the single-grant FIFO filling after a
+downstream GEM delineation loss while upstream bursts stop, with the
+downstream frame counter still running. To find what starts it:
+
+- Sample BW MAP FILTER CONTROL (0x4220) and DEBUG SIGNAL GROUP 1 (0x422c)
+  with the other trace registers, so order/length/interval flags and the
+  BW map, burst length and next-full debug bits are visible.
+- Reject a trace snapshot whose bank was recycled by a new freeze while it
+  was copied.
+- Log the MAC configuration not covered by the trace once per O5 entry.
+- Add a lab debugfs knob, gpon_err_ctrl, that sets only the hardware
+  resync enables of DBG_ERR_CTRL (bits 4:1, as named in the EN7521 SDK
+  header) and re-applies them on every O5 entry. Nothing changes until it
+  is written.
+
+Snapshot check and the two trace columns by Codex.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -114,6 +114,8 @@
+ /* GPON/PSE memory-bus interface control */
+ #define GPON_MBI_MPI_STOP	0x160
+ /* EN7523 GPON debug and timing registers */
++#define GPON_FLEX_ONU_CAP	0x200
++#define GPON_US_PREFETCH	0x204
+ #define GPON_DBG_DLY		0x208
+ #define GPON_DBG_IDLE_GEM_THLD	0x20C
+ #define GPON_DBG_BWM_FILTER_CTRL	0x220
+@@ -134,6 +136,9 @@
+ #define GPON_DBG_GEM_HEC_ONE_ERR_CNT	0x330
+ #define GPON_DBG_GEM_HEC_TWO_ERR_CNT	0x334
+ #define GPON_DBG_GEM_HEC_UC_ERR_CNT	0x338
++#define GPON_DBG_DBA_BACKDOOR	0x340
++#define GPON_DBG_SW_RESYNC	0x364
++#define GPON_MAC_SET		0x3A0
+ /* Debug / TX sync (EN7521 EqD adjustment) */
+ #define GPON_DBG_TX_SYNC_OFFSET	0x35C
+ /* Power management (always-on domain) */
+@@ -287,6 +292,9 @@
+ #define DBG_PROBE_RX_DELAY_SEL		0x0000000f
+ #define DBG_PROBE_RX_DELAY_MASK		GENMASK(23, 12)
+ 
++/* DBG_ERR_CTRL: hardware resync enables (EN7521 SDK register header) */
++#define DBG_ERR_CTRL_RESYNC_MASK	GENMASK(4, 1)
++
+ /* DBG_BWM_FILTER_CTRL */
+ #define BWM_FILTER_LEN_VALID_CHECK_EN	BIT(17)
+ 
+@@ -390,6 +398,9 @@
+ 	bool			started;
+ 	bool			optical_active;
+ 	bool			mac_enabled;
++	/* Lab override of the DBG_ERR_CTRL resync enables, applied on O5 */
++	bool			lab_err_ctrl_set;
++	u32			lab_err_ctrl;
+ 	/* O7 gated a transmitter that O2 does not gate again */
+ 	bool			gpon_o7_tx_off;
+ 	bool			phy_link_known;
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -48,9 +48,11 @@
+ 	u32 bfifo;
+ 	u32 grant;
+ 	u32 irq;
++	u32 bwm_filter;
++	u32 dbg_grp1;
+ };
+ 
+-static_assert(sizeof(struct gpon_ust_entry) == 32);
++static_assert(sizeof(struct gpon_ust_entry) == 40);
+ 
+ struct gpon_bb_cache {
+ 	u32 value[GPON_BB_COUNTERS];
+@@ -252,9 +254,9 @@
+ }
+ 
+ /*
+- * Reads only the MAC debug counters and status, never clears anything: it
+- * shows whether upstream bursts stop and the grant FIFOs fill before the
+- * OLT deactivates the ONU. Runs only while the GPON MAC is enabled.
++ * Sample MAC debug counters and status without explicit writes or ACKs.
++ * Keep BWM filter and group-1 diagnostics alongside the FIFO history.
++ * Runs only while the GPON MAC is enabled.
+  */
+ static enum hrtimer_restart gpon_ust_tick(struct hrtimer *t)
+ {
+@@ -276,6 +278,8 @@
+ 	e.bfifo = gpon_read(priv, GPON_DBG_BWM_BFIFO_STS);
+ 	e.grant = gpon_read(priv, GPON_DBG_BWM_GRANT_STS);
+ 	e.irq = gpon_read(priv, GPON_INT_STATUS);
++	e.bwm_filter = gpon_read(priv, GPON_DBG_BWM_FILTER_CTRL);
++	e.dbg_grp1 = gpon_read(priv, GPON_DBG_GRP_1);
+ 	spin_lock_irqsave(&bb->lock, flags);
+ 	a = bb->ust_active;
+ 	bb->ust[a][bb->ust_head[a]] = e;
+@@ -563,13 +567,14 @@
+ 
+ 	seq_printf(s, "id=%u count=%u period_us=%lu ref_ns=%llu\n", snap->id,
+ 		   snap->count, GPON_UST_PERIOD_NS / NSEC_PER_USEC, snap->ref_ns);
+-	seq_puts(s, "t_us tx_bst rx_gtc sfifo bfifo grant irq_raw\n");
++	seq_puts(s, "t_us tx_bst rx_gtc sfifo bfifo grant irq_raw bwm_filter dbg_grp1\n");
+ 	for (i = 0; i < snap->count; i++) {
+ 		const struct gpon_ust_entry *e = &snap->entry[i];
+ 
+-		seq_printf(s, "%lld %08x %08x %08x %08x %08x %08x\n",
++		seq_printf(s, "%lld %08x %08x %08x %08x %08x %08x %08x %08x\n",
+ 			   div_s64((s64)e->ns - (s64)snap->ref_ns, NSEC_PER_USEC),
+-			   e->tx_bst, e->rx_gtc, e->sfifo, e->bfifo, e->grant, e->irq);
++			   e->tx_bst, e->rx_gtc, e->sfifo, e->bfifo, e->grant, e->irq,
++			   e->bwm_filter, e->dbg_grp1);
+ 	}
+ 	return 0;
+ }
+@@ -601,6 +606,15 @@
+ 		snap->entry[i] = bb->ust[bank][slot];
+ 		spin_unlock_irqrestore(&bb->lock, flags);
+ 	}
++	/* A new freeze may have recycled this bank while it was copied. */
++	spin_lock_irqsave(&bb->lock, flags);
++	ret = snap->id != bb->id || bank != bb->ust_frozen_bank ||
++	      snap->ref_ns != bb->frozen_ns ? -EAGAIN : 0;
++	spin_unlock_irqrestore(&bb->lock, flags);
++	if (ret) {
++		kvfree(snap);
++		return ret;
++	}
+ 	ret = single_open(file, gpon_ust_show, snap);
+ 	if (ret)
+ 		kvfree(snap);
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2203,6 +2203,59 @@
+ /* Forward declaration needed by gpon_disable */
+ static void gpon_disable(struct xpon_priv *priv);
+ 
++/*
++ * Lab: apply the DBG_ERR_CTRL resync override, if any, and log the MAC
++ * configuration that the upstream trace cannot show, once per O5 entry.
++ */
++static void gpon_lab_o5_config(struct xpon_priv *priv)
++{
++	if (READ_ONCE(priv->lab_err_ctrl_set))
++		gpon_rmw(priv, GPON_DBG_ERR_CTRL, DBG_ERR_CTRL_RESYNC_MASK,
++			 READ_ONCE(priv->lab_err_ctrl));
++
++	dev_info(priv->dev,
++		 "GPON O5 config: cap=%08x prefetch=%08x dly=%08x bwm_filter=%08x err_ctrl=%08x dba=%08x resync=%08x mac_set=%08x sleep=%08x\n",
++		 gpon_read(priv, GPON_FLEX_ONU_CAP),
++		 gpon_read(priv, GPON_US_PREFETCH),
++		 gpon_read(priv, GPON_DBG_DLY),
++		 gpon_read(priv, GPON_DBG_BWM_FILTER_CTRL),
++		 gpon_read(priv, GPON_DBG_ERR_CTRL),
++		 gpon_read(priv, GPON_DBG_DBA_BACKDOOR),
++		 gpon_read(priv, GPON_DBG_SW_RESYNC),
++		 gpon_read(priv, GPON_MAC_SET),
++		 gpon_read(priv, GPON_SLEEP_GLB_CFG));
++}
++
++static int gpon_lab_err_ctrl_get(void *data, u64 *val)
++{
++	struct xpon_priv *priv = data;
++
++	if (priv->mode != AIROHA_XPON_MODE_GPON || !READ_ONCE(priv->mac_enabled))
++		return -ENODEV;
++	*val = gpon_read(priv, GPON_DBG_ERR_CTRL);
++	return 0;
++}
++
++/* Only the resync enables (bits 4:1) can be changed; other bits are kept. */
++static int gpon_lab_err_ctrl_set(void *data, u64 val)
++{
++	struct xpon_priv *priv = data;
++
++	if (val & ~(u64)DBG_ERR_CTRL_RESYNC_MASK)
++		return -EINVAL;
++	WRITE_ONCE(priv->lab_err_ctrl, (u32)val);
++	WRITE_ONCE(priv->lab_err_ctrl_set, true);
++	if (priv->mode == AIROHA_XPON_MODE_GPON && READ_ONCE(priv->mac_enabled)) {
++		gpon_rmw(priv, GPON_DBG_ERR_CTRL, DBG_ERR_CTRL_RESYNC_MASK, (u32)val);
++		dev_info(priv->dev, "GPON lab: err_ctrl resync bits set to %#x, now %08x\n",
++			 (u32)val, gpon_read(priv, GPON_DBG_ERR_CTRL));
++	}
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(gpon_lab_err_ctrl_fops, gpon_lab_err_ctrl_get,
++			 gpon_lab_err_ctrl_set, "0x%08llx\n");
++
+ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+@@ -2340,6 +2393,7 @@
+ 		priv->to1_failures = 0;
+ 		dev_info(priv->dev, "GPON O5: operational, ONU-ID=%u\n",
+ 			 ploam_get_onu_id(priv->ploam));
++		gpon_lab_o5_config(priv);
+ 		break;
+ 	case GPON_O6_POPUP:
+ 		/* Cancel TO1, start TO2 */
+@@ -4247,6 +4301,9 @@
+ 	mutex_init(&priv->link_state_lock);
+ 	spin_lock_init(&priv->ploam_tx_lock);
+ 	gpon_bb_init(priv);
++	if (priv->blackbox && !IS_ERR_OR_NULL(priv->blackbox->dir))
++		debugfs_create_file_unsafe("gpon_err_ctrl", 0600, priv->blackbox->dir,
++					   priv, &gpon_lab_err_ctrl_fops);
+ 	bitmap_zero(priv->service_gems, GPON_MAX_GEM_ID);
+ 	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));

@@ -1,0 +1,221 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: xpon: lab: resync the MAC when the grant FIFO wedges
+
+Every captured Deactivate_ONU-ID (r703 and r704) starts the same way: after
+an RX error the single-grant FIFO grows by 40 entries/ms while bursts still
+go out, then fills up, upstream bursts stop and the OLT deactivates us
+~12 ms later.  The hardware resyncs in DBG_ERR_CTRL never fire.
+
+Watch the FIFO in the existing 1 ms trace tick and, in O5, pulse the MAC
+software resync (DBG_SW_RESYNC, the SDK gponDevSwResync() sequence) once
+48 or more entries are queued; normal operation never goes above 7.  Log
+whether bursts resumed 8 ms later and freeze the black box around it.
+Lab only; disable with debugfs 1fb60000.xmac/gpon_sfifo_resync.
+
+Single reads of the used field are sometimes corrupt: 85 of 87 resyncs
+in 11 h fired on a value above the 256 entry depth or above the hardware
+high-water mark (bits 24:16), with the next tick back at 0-4 and bursts
+never interrupted.  Only act when a second read confirms a consistent
+backlog, or when the previous tick was already above the level, and
+count the rejected reads in gpon_sfifo_glitch_count/_last.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon_blackbox.h
+@@ -15,12 +15,32 @@
+ /* Upstream trace: 1 ms samples, the last 256 ms before a deactivation. */
+ #define GPON_UST_SIZE 256
+ #define GPON_UST_PERIOD_NS NSEC_PER_MSEC
++/*
++ * Lab: in O5 the single-grant FIFO stays empty apart from 2-7 entry
++ * transients.  Before every Deactivate captured so far it grew by 40
++ * entries/ms after an RX error until upstream bursts stopped.  Pulse the
++ * MAC software resync (SDK gponDevSwResync()) once it crosses this level.
++ *
++ * Single samples of the used field are sometimes corrupt (above the FIFO
++ * depth or above the hardware high-water mark, gone on the next tick).
++ * Act only on a sample that a second read confirms, or that the previous
++ * tick already showed above the level.
++ */
++#define GPON_SFIFO_USED GENMASK(8, 0)
++#define GPON_SFIFO_MAX_USED GENMASK(24, 16)
++#define GPON_SFIFO_DEPTH 256
++#define GPON_SFIFO_STUCK 48
++#define GPON_SFIFO_RESYNC_GAP_NS (5 * NSEC_PER_MSEC)
++/* Ticks between the resync and the log line plus black box freeze. */
++#define GPON_SFIFO_RESYNC_CHECK 8
++#define GPON_SW_RESYNC_EN BIT(31)
++#define GPON_SW_RESYNC_GO BIT(0)
+ 
+ enum gpon_bb_event {
+ 	GPON_BB_IRQ, GPON_BB_RX_FIFO, GPON_BB_RX, GPON_BB_TX,
+ 	GPON_BB_STATE, GPON_BB_PHY, GPON_BB_CFG, GPON_BB_DEACT,
+ 	GPON_BB_BIP, GPON_BB_HEC, GPON_BB_GEM, GPON_BB_AUX,
+-	GPON_BB_TIMING, GPON_BB_TX_BEGIN, GPON_BB_RX_SYNC,
++	GPON_BB_TIMING, GPON_BB_TX_BEGIN, GPON_BB_RX_SYNC, GPON_BB_RESYNC,
+ };
+ 
+ enum gpon_bb_counter {
+@@ -81,6 +101,12 @@
+ 	u32 ust_head[2], ust_count[2];
+ 	u32 ust_frozen_bank, ust_frozen_head, ust_frozen_count;
+ 	u8 ust_active;
++	/* SFIFO resync state, only written from the 1 ms tick */
++	u64 resync_ns;
++	u32 resync_count, resync_sfifo, resync_tx_bst;
++	u32 resync_glitch, resync_glitch_last, sfifo_prev;
++	u8 resync_check;
++	bool resync_enable;
+ 	u32 head[2], count[2], seq;
+ 	u32 frozen_bank, frozen_head, frozen_count, frozen_seq;
+ 	u32 id, missed, suppressed;
+@@ -113,7 +139,7 @@
+ 	static const char * const names[] = {
+ 		"IRQ", "RX_FIFO", "RX", "TX", "STATE", "PHY", "CFG",
+ 		"DEACT", "BIP", "HEC_CACHE", "GEM_CACHE", "AUX_CACHE",
+-		"TIMING_CACHE", "TX_BEGIN", "RX_SYNC_CACHE",
++		"TIMING_CACHE", "TX_BEGIN", "RX_SYNC_CACHE", "SFIFO_RESYNC",
+ 	};
+ 
+ 	return event < ARRAY_SIZE(names) ? names[event] : "UNKNOWN";
+@@ -253,6 +279,78 @@
+ 	spin_unlock_irqrestore(&bb->lock, flags);
+ }
+ 
++static void gpon_bb_freeze(struct xpon_priv *priv, u16 event);
++
++static void gpon_sfifo_resync(struct xpon_priv *priv, struct gpon_blackbox *bb,
++			      const struct gpon_ust_entry *e)
++{
++	u32 after;
++
++	writel(GPON_SW_RESYNC_EN | GPON_SW_RESYNC_GO,
++	       priv->gpon_reg + GPON_DBG_SW_RESYNC);
++	udelay(1);
++	writel(0, priv->gpon_reg + GPON_DBG_SW_RESYNC);
++	after = gpon_read(priv, GPON_DBG_BWM_SFIFO_STS);
++	bb->resync_ns = e->ns;
++	bb->resync_sfifo = e->sfifo;
++	bb->resync_tx_bst = e->tx_bst;
++	bb->resync_check = GPON_SFIFO_RESYNC_CHECK;
++	WRITE_ONCE(bb->resync_count, bb->resync_count + 1);
++	gpon_bb_record(priv, GPON_BB_RESYNC, e->sfifo, after, e->tx_bst,
++		       bb->resync_count);
++}
++
++static bool gpon_sfifo_high(u32 sfifo)
++{
++	u32 used = FIELD_GET(GPON_SFIFO_USED, sfifo);
++
++	return used >= GPON_SFIFO_STUCK && used <= GPON_SFIFO_DEPTH;
++}
++
++static bool gpon_sfifo_stuck(u32 sfifo)
++{
++	return gpon_sfifo_high(sfifo) &&
++	       FIELD_GET(GPON_SFIFO_USED, sfifo) <=
++	       FIELD_GET(GPON_SFIFO_MAX_USED, sfifo);
++}
++
++/* Resync on a confirmed backlog; count corrupt single reads instead. */
++static void gpon_sfifo_watch(struct xpon_priv *priv, struct gpon_blackbox *bb,
++			     const struct gpon_ust_entry *e)
++{
++	u32 prev = bb->sfifo_prev;
++
++	bb->sfifo_prev = e->sfifo;
++	if (FIELD_GET(GPON_SFIFO_USED, e->sfifo) < GPON_SFIFO_STUCK ||
++	    !READ_ONCE(bb->resync_enable) || !READ_ONCE(priv->gpon_o5) ||
++	    e->ns - bb->resync_ns < GPON_SFIFO_RESYNC_GAP_NS)
++		return;
++	if (gpon_sfifo_high(e->sfifo) &&
++	    ((gpon_sfifo_stuck(e->sfifo) &&
++	      gpon_sfifo_stuck(gpon_read(priv, GPON_DBG_BWM_SFIFO_STS))) ||
++	     gpon_sfifo_high(prev))) {
++		gpon_sfifo_resync(priv, bb, e);
++		return;
++	}
++	WRITE_ONCE(bb->resync_glitch, bb->resync_glitch + 1);
++	WRITE_ONCE(bb->resync_glitch_last, e->sfifo);
++}
++
++/* Report whether upstream bursts resumed, then keep the trace around it. */
++static void gpon_sfifo_resync_check(struct xpon_priv *priv,
++				    struct gpon_blackbox *bb,
++				    const struct gpon_ust_entry *e)
++{
++	if (!bb->resync_check || --bb->resync_check)
++		return;
++	dev_info(priv->dev,
++		 "GPON lab: SFIFO resync #%u sfifo %08x -> %08x after %u ms, tx_bst +%u, o5=%u\n",
++		 bb->resync_count, bb->resync_sfifo, e->sfifo,
++		 GPON_SFIFO_RESYNC_CHECK, e->tx_bst - bb->resync_tx_bst,
++		 READ_ONCE(priv->gpon_o5));
++	gpon_bb_freeze(priv, GPON_BB_RESYNC);
++}
++
+ /*
+  * Sample MAC debug counters and status without explicit writes or ACKs.
+  * Keep BWM filter and group-1 diagnostics alongside the FIFO history.
+@@ -287,6 +385,8 @@
+ 	if (bb->ust_count[a] < GPON_UST_SIZE)
+ 		bb->ust_count[a]++;
+ 	spin_unlock_irqrestore(&bb->lock, flags);
++	gpon_sfifo_resync_check(priv, bb, &e);
++	gpon_sfifo_watch(priv, bb, &e);
+ 	return HRTIMER_RESTART;
+ }
+ 
+@@ -395,7 +495,7 @@
+ 		queue_delayed_work(system_unbound_wq, &bb->print_work, 5 * HZ);
+ }
+ 
+-static void gpon_bb_deactivate(struct xpon_priv *priv)
++static void gpon_bb_freeze(struct xpon_priv *priv, u16 event)
+ {
+ 	struct gpon_blackbox *bb = READ_ONCE(priv->blackbox);
+ 	unsigned long flags;
+@@ -405,7 +505,7 @@
+ 	spin_lock_irqsave(&bb->lock, flags);
+ 	if (bb->stopping)
+ 		goto out;
+-	gpon_bb_add_locked(bb, GPON_BB_DEACT, 0, 0, 0, 0);
++	gpon_bb_add_locked(bb, event, 0, 0, 0, 0);
+ 	if (bb->pending) {
+ 		bb->missed++;
+ 		goto out;
+@@ -437,6 +537,11 @@
+ 	spin_unlock_irqrestore(&bb->lock, flags);
+ }
+ 
++static void gpon_bb_deactivate(struct xpon_priv *priv)
++{
++	gpon_bb_freeze(priv, GPON_BB_DEACT);
++}
++
+ static int gpon_bb_show(struct seq_file *s, void *unused)
+ {
+ 	struct gpon_bb_snapshot *snap = s->private;
+@@ -641,6 +746,7 @@
+ 	bb->state = GPON_O1_INITIAL;
+ 	bb->next_sample = jiffies;
+ 	bb->optical_result = -ENODATA;
++	bb->resync_enable = true;
+ 	INIT_WORK(&bb->capture_work, gpon_bb_capture_work);
+ 	INIT_DELAYED_WORK(&bb->print_work, gpon_bb_print_work);
+ 	bb->dir = debugfs_create_dir(dev_name(priv->dev), NULL);
+@@ -650,6 +756,14 @@
+ 				    &gpon_bb_last_fops);
+ 		debugfs_create_file("gpon_ustrace_last", 0400, bb->dir, bb,
+ 				    &gpon_ust_last_fops);
++		debugfs_create_bool("gpon_sfifo_resync", 0600, bb->dir,
++				    &bb->resync_enable);
++		debugfs_create_u32("gpon_sfifo_resync_count", 0400, bb->dir,
++				   &bb->resync_count);
++		debugfs_create_u32("gpon_sfifo_glitch_count", 0400, bb->dir,
++				   &bb->resync_glitch);
++		debugfs_create_x32("gpon_sfifo_glitch_last", 0400, bb->dir,
++				   &bb->resync_glitch_last);
+ 	}
+ 	hrtimer_setup(&bb->ust_timer, gpon_ust_tick, CLOCK_MONOTONIC,
+ 		      HRTIMER_MODE_REL);

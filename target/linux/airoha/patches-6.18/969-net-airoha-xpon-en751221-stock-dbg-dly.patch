@@ -1,0 +1,46 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Wed, 21 Oct 2026 08:50:00 -0300
+Subject: [PATCH] net: airoha: xpon: en751221: use the stock DBG_DLY settings
+
+The TP-Link stock firmware in O5 on this board reads back
+DBG_DLY = 0x001c1440: fine delay 0x14 and the PHY RX delay selector
+clear, so the MAC follows the delay the PHY measures. The driver used
+fine delay 0x1c and, at overhead programming, forced the selector and
+froze half of the RX delay probed at that moment (0x80901c40 in O5).
+
+A frozen RX delay cannot follow the PHY if a downstream glitch moves the
+receive phase, which fits the upstream stall seen after a GEM
+delineation loss. Use the stock values for EN751221 (lab test).
+
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-20 19:55:27.575867988 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-21 08:45:12.608876242 -0300
+@@ -610,6 +610,10 @@
+ 	gpon_rmw(priv, GPON_DBG_DLY, DBG_DLY_FINE_INT_MASK,
+ 		 FIELD_PREP(DBG_DLY_FINE_INT_MASK,
+ 			    priv->match_data->gpon_fine_delay));
++	if (!priv->match_data->en7523_gpon_defaults &&
++	    !priv->match_data->gpon_reset_dbg_dly &&
++	    !priv->match_data->gpon_adjust_rx_delay)
++		gpon_clear_bits(priv, GPON_DBG_DLY, DBG_DLY_PHY_RX_DLY_SEL);
+ 	gpon_rmw(priv, GPON_DBG_IDLE_GEM_THLD, GENMASK(15, 0),
+ 		 priv->match_data->gpon_idle_gem_threshold);
+ 
+@@ -4765,12 +4769,16 @@
+ 	.version = econet_en751221,
+ 	.mode_from_dt = true,
+ 	.wan_mode_mask = EN751221_SCU_WAN_MODE_MASK,
+-	.gpon_fine_delay = 0x1c,
++	/*
++	 * Live register of the TP-Link stock firmware in O5 on this board:
++	 * DBG_DLY = 0x001c1440, i.e. fine delay 0x14 and the PHY RX delay
++	 * left to the hardware (selector clear).
++	 */
++	.gpon_fine_delay = 0x14,
+ 	.gpon_rsp_time_activation = GPON_RSP_TIME_ACT_EN751221,
+ 	.gpon_idle_gem_threshold = GPON_IDLE_GEM_THLD_DEFAULT,
+ 	.gpon_guard_bits_override = GPON_PHY_GUARD_BIT_NUM_EN751221,
+ 	.gpon_sn_tx_power_mode = GPON_SN_TX_POWER_MODE_LEGACY,
+-	.gpon_adjust_rx_delay = true,
+ 	.mac_irq_via_eth = true,
+ 	.gpon_rearm_tx_on_overhead = true,
+ 	.gpon_runtime_tgen = true,
