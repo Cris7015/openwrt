@@ -20,7 +20,7 @@ static int reject_code_valid(long code)
 	       code == 603 || code == 604;
 }
 
-/* Digits of the user part of a sip:/tel: URI, e.g. "+5492611234567". */
+/* Digits of the user part of a sip:/tel: URI, e.g. "+15551234567". */
 static void reject_caller_digits(const char *uri, char *out, size_t len)
 {
 	const char *p = uri, *colon;
