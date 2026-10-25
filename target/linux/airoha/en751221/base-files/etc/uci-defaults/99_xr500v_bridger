@@ -1,0 +1,22 @@
+#!/bin/sh
+# bridger offloads the bridges it manages through BPF and tc flower. On the
+# Archer XR500v it is meant for an L2 bridge between the PON and a LAN port
+# (ONU bridge mode). On br-lan it would only put a BPF program in the Wi-Fi
+# path, so blacklist br-lan once; the user may change it afterwards.
+
+. /lib/functions.sh
+
+case "$(board_name)" in
+tplink,archer-xr500v-v1) ;;
+*) exit 0 ;;
+esac
+
+[ -f /etc/config/bridger ] || exit 0
+[ "$(uci -q get bridger.@defaults[0].xr500v_lan)" = 1 ] && exit 0
+
+uci -q get bridger.@defaults[0].blacklist | grep -qw br-lan ||
+	uci -q add_list bridger.@defaults[0].blacklist='br-lan'
+uci -q set bridger.@defaults[0].xr500v_lan=1
+uci commit bridger
+
+exit 0
