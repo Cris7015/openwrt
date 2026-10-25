@@ -1,4 +1,4 @@
-From: Cris <tuputamadre7015@gmail.com>
+From: Cristian Papa <pcristian292@gmail.com>
 Subject: [PATCH] net: airoha: xpon: count GEM delineation losses instead of warning
 
 The loss-of-GEM-delineation interrupt does not change the activation state

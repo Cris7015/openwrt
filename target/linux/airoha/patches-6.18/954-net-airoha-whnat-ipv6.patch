@@ -1,4 +1,4 @@
-From: Cris <tuputamadre7015@gmail.com>
+From: Cristian Papa <pcristian292@gmail.com>
 Subject: [PATCH] net: airoha: offload IPv6 flows of WiFi clients through WHNAT
 
 Lab port of kernel-whnat-ipv6 70591a0a1 to the Plan C kernel: offer

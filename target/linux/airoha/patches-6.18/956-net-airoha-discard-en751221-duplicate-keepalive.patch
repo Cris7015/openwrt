@@ -1,4 +1,4 @@
-From: Cris <tuputamadre7015@gmail.com>
+From: Cristian Papa <pcristian292@gmail.com>
 Subject: [PATCH] net: airoha: discard EN751221 duplicate PPE keepalive packets
 
 The generation-1 PPE is configured to send duplicate keepalive packets
