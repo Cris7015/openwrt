@@ -1,0 +1,125 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 25 Oct 2026 15:00:00 -0300
+Subject: [PATCH] wifi: mt76: mt76x02: keep rate probes meaningful when they
+ are aggregated
+
+With tracked A-MPDU frames on the EDCA queue (the XR500v qsel policy), a
+rate control probe queued behind data frames of its TID is appended to
+their A-MPDU by the hardware and goes out at the leader's rate, whatever
+rate its own TXWI asks for. Its status then reports that rate with no
+retries, and mt76x02_mac_fill_tx_status() builds the fallback chain from
+the probed rate down to it, so minstrel books failed attempts at rates
+that were never tried. Under a sustained download right after association
+every probe ends like this and minstrel stays at MCS 1-5 (about 100
+Mbit/s) for as long as the load lasts.
+
+Report a tracked frame whose final rate cannot be reached from the
+requested one as sent at the final rate. Then give probes a way to be
+sent at their own rate: while fewer than probe_mgmt_max_queued frames
+(default 16) are queued on the frame's queue, send the probe through the
+MGMT queue as the original policy did. It overtakes at most those frames,
+well inside the peer's 64-frame block ack window; the original policy
+let it overtake 79 and made a Samsung phone tear the session down.
+
+Cold-start download on the XR500v: 66-140 -> 379-408 Mbit/s, MCS 9 in
+6/6 tries. Samsung phone: 406/351 Mbit/s, 5 tx failed and no BA session
+restart over three speed tests.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -495,6 +495,27 @@
+ 	}
+ }
+ 
++/*
++ * The hardware appends a frame queued behind another one of the same TID to
++ * that frame's A-MPDU, and sends it at the leader's rate whatever rate its
++ * own TXWI asks for. The final rate then cannot be reached from the
++ * requested one through the fallback chain.
++ */
++static bool
++mt76x02_tx_rate_absorbed(const struct ieee80211_tx_rate *sent,
++			 const struct ieee80211_tx_rate *final, int retry)
++{
++	const u16 mask = IEEE80211_TX_RC_MCS | IEEE80211_TX_RC_VHT_MCS |
++			 IEEE80211_TX_RC_40_MHZ_WIDTH |
++			 IEEE80211_TX_RC_80_MHZ_WIDTH |
++			 IEEE80211_TX_RC_160_MHZ_WIDTH;
++
++	if ((sent->flags ^ final->flags) & mask)
++		return true;
++
++	return retry ? final->idx > sent->idx : final->idx != sent->idx;
++}
++
+ static void
+ mt76x02_mac_fill_tx_status(struct mt76x02_dev *dev, struct mt76x02_sta *msta,
+ 			   struct ieee80211_tx_info *info,
+@@ -532,6 +553,19 @@
+ 					dev->mphy.chandef.chan->band))
+ 		return;
+ 
++	/*
++	 * A tracked frame (a rate probe) that went out inside another frame's
++	 * A-MPDU says nothing about the rate it asked for: report the rate it
++	 * was really sent at, not failed attempts at rates never tried.
++	 */
++	if (!(st->pktid & MT_PACKET_ID_HAS_RATE) && st->aggr &&
++	    mt76x02_tx_rate_absorbed(&rate[0], &last_rate, st->retry)) {
++		rate[0] = last_rate;
++		rate[0].count = st->retry + 1;
++		i = 0;
++		goto out;
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(info->status.rates); i++) {
+ 		retry--;
+ 		if (i + 1 == ARRAY_SIZE(info->status.rates)) {
+@@ -545,6 +579,7 @@
+ 			break;
+ 	}
+ 
++out:
+ 	if (i + 1 < ARRAY_SIZE(info->status.rates)) {
+ 		info->status.rates[i + 1].idx = -1;
+ 		info->status.rates[i + 1].count = 0;
+--- a/mt76x02_txrx.c
++++ b/mt76x02_txrx.c
+@@ -18,6 +18,11 @@
+ module_param(qsel_edca, int, 0444);
+ MODULE_PARM_DESC(qsel_edca, "XR500v tracked AMPDU queue: -1 auto, 0 original, 1 EDCA");
+ 
++static unsigned int probe_mgmt_max_queued = 16;
++module_param(probe_mgmt_max_queued, uint, 0644);
++MODULE_PARM_DESC(probe_mgmt_max_queued,
++		 "EDCA policy: send a rate probe through the MGMT queue while fewer frames than this are queued ahead of it (0: never)");
++
+ static int __init mt76x02_qsel_init(void)
+ {
+ 	qsel_edca = mt76x02_resolve_qsel(
+@@ -190,8 +195,22 @@
+ 
+ 	txwi->pktid = pid;
+ 
+-	if (mt76x02_use_mgmt_qsel(mt76_is_skb_pktid(pid), ampdu, qsel_edca))
++	if (mt76x02_use_mgmt_qsel(mt76_is_skb_pktid(pid), ampdu, qsel_edca)) {
++		qsel = MT_QSEL_MGMT;
++	} else if (qsel_edca == 1 && ampdu && mt76_is_skb_pktid(pid) &&
++		   (info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) &&
++		   mdev->phy.q_tx[qid] &&
++		   READ_ONCE(mdev->phy.q_tx[qid]->queued) <
++		   READ_ONCE(probe_mgmt_max_queued)) {
++		/*
++		 * Behind other frames of its TID, a probe is appended to their
++		 * A-MPDU and goes out at their rate. Through the MGMT queue it
++		 * goes alone at its own rate but overtakes the frames queued
++		 * ahead of it; with only a few of them, the jump stays well
++		 * inside the peer's block ack window.
++		 */
+ 		qsel = MT_QSEL_MGMT;
++	}
+ 
+ 	tx_info->info = FIELD_PREP(MT_TXD_INFO_QSEL, qsel) |
+ 			MT_TXD_INFO_80211;

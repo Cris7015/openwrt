@@ -1,0 +1,37 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 25 Oct 2026 21:00:00 -0300
+Subject: [PATCH] wifi: mt76: call the built-in EN751221 WHNAT hook directly
+
+mt76_rx_complete() looked up en75_whnat_upstream_early with symbol_get()
+and dropped it with symbol_put() on every NAPI poll. Each lookup is a
+binary search with strcmp over the kernel's exported symbols plus a
+module reference: about 1.6 % of the RX CPU during a WiFi upload on the
+XR500v. WHNAT is built into the kernel there (CONFIG_NET_AIROHA_WHNAT=y),
+so the symbol is always present: call it directly and keep the lookup
+only for a modular build.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1562,7 +1562,10 @@
+ 		return;
+ 	}
+ 
+-#if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
++#if IS_BUILTIN(CONFIG_NET_AIROHA_WHNAT)
++	/* Built in: no lookup needed (a symbol_get() per poll costs ~2 %). */
++	whnat_early = en75_whnat_upstream_early;
++#elif IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
+ 	/* Looked up once per poll; the hook keeps the frames it takes. */
+ 	whnat_early = symbol_get(en75_whnat_upstream_early);
+ #endif
+@@ -1572,7 +1575,7 @@
+ 			continue;
+ 		napi_gro_receive(napi, skb);
+ 	}
+-#if IS_ENABLED(CONFIG_NET_AIROHA_WHNAT)
++#if IS_MODULE(CONFIG_NET_AIROHA_WHNAT)
+ 	if (whnat_early)
+ 		symbol_put(en75_whnat_upstream_early);
+ #endif
