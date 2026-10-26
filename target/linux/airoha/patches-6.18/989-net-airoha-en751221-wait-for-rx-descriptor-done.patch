@@ -1,0 +1,161 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: en751221: wait for DONE on RX descriptors
+
+econet_qdma_rx_process() consumed every descriptor up to RX_HWI without
+looking at its DONE bit. RX_HWI can pass a descriptor before the DMA
+write-back of that descriptor is visible in memory, and such a
+descriptor still holds what econet_fill_rx_queue() wrote: no DONE, the
+buffer size as length and an all-zero message. The frame data had
+already arrived, so the rest of the path saw a frame from port 0 with
+CPU reason 0 and a length of 1728 bytes: WHNAT injected a PPE-rewritten
+downstream frame as RX on the WiFi interface, and the bridge dropped it
+with "received packet ... with own address as source address", about
+once every 3-7 minutes under load. On the WAN QDMA such a frame would
+be dropped silently. The vendor driver (qdma_bm_receive_packets()) only
+consumes descriptors with DONE set.
+
+Spin briefly for DONE; if it is still clear, stop and let NAPI poll
+again. A descriptor that never gets DONE is consumed as before after
+256 polls, with a warning, so a wrong assumption cannot stall the ring.
+Also drop descriptors with the overflow bit (bit 30), as the vendor
+driver does. Counters: rx_wait_done, rx_wait_gave_up, rx_overflow.
+
+On the XR500v, 554 descriptors needed the wait in 77 minutes of WiFi
+traffic, none gave up, and the bridge warning has not come back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -415,6 +415,11 @@
+ static u16 econet_rx_ingress_gem(struct airoha_qdma *qdma,
+ 				 const union desc_msg *msg);
+ 
++/* EN751221: RX descriptors dropped for the overflow bit, per QDMA. */
++static unsigned int rx_overflow[2];
++module_param_array(rx_overflow, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_overflow, "EN751221 RX descriptors with the overflow bit, dropped, per QDMA");
++
+ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+ 				     enum dma_data_direction dir,
+ 				     struct airoha_whnat_batch *batch)
+@@ -448,6 +453,12 @@
+ 	if (WARN_ON_ONCE(is_desc_info_nls(&desc.info)))
+ 		goto return_page;
+ 
++	/* Bit 30 is "overflow" on RX: the vendor driver drops the frame. */
++	if (unlikely(is_desc_info_dropped(&desc.info))) {
++		rx_overflow[q->qdma->qdma->id & 1]++;
++		goto return_page;
++	}
++
+ 	skb = napi_build_skb(e->buf, q->buf_size);
+ 	if (!skb)
+ 		goto return_page;
+@@ -520,6 +531,59 @@
+ 	page_pool_put_full_page(q->page_pool, page, false);
+ }
+ 
++/* EN751221: descriptors that needed waiting for DONE, and give-ups. */
++static unsigned int rx_wait_done[2], rx_wait_gave_up[2];
++module_param_array(rx_wait_done, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_wait_done, "EN751221 RX descriptors below RX_HWI found without DONE, per QDMA");
++module_param_array(rx_wait_gave_up, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_wait_gave_up, "EN751221 RX descriptors consumed without DONE after waiting, per QDMA");
++
++#define ECONET_RX_DONE_SPIN	16
++#define ECONET_RX_DONE_POLLS	256
++
++/*
++ * RX_HWI can pass a descriptor before its write-back is visible in memory.
++ * Such a descriptor still holds what econet_fill_rx_queue() wrote: no DONE,
++ * the buffer size as length and an all-zero message, which the rest of the
++ * path would take as a frame from port 0 with CPU reason 0 (WHNAT then
++ * injects a PPE-rewritten downstream frame as RX on the vif). The vendor
++ * driver (qdma_bm_receive_packets()) only consumes descriptors with DONE
++ * set. Spin briefly for it; if it still is not there, leave the descriptor
++ * for the next poll. A descriptor that never gets DONE is consumed as
++ * before after ECONET_RX_DONE_POLLS polls, so a wrong assumption cannot
++ * stall the ring.
++ */
++static bool econet_rx_desc_ready(struct econet_q_rx *q, u32 i)
++{
++	unsigned int id = q->qdma->qdma->id & 1;
++	int spin;
++
++	for (spin = 0; spin < ECONET_RX_DONE_SPIN; spin++) {
++		if (READ_ONCE(q->desc[i].info.word) & DESC_INFO_DONE) {
++			if (spin)
++				rx_wait_done[id]++;
++			q->wait_polls = 0;
++			/* Read the rest of the descriptor after DONE. */
++			dma_rmb();
++			return true;
++		}
++		cpu_relax();
++	}
++
++	if (++q->wait_polls < ECONET_RX_DONE_POLLS) {
++		if (q->wait_polls == 1)
++			rx_wait_done[id]++;
++		return false;
++	}
++
++	rx_wait_gave_up[id]++;
++	q->wait_polls = 0;
++	pr_warn_ratelimited("airoha: qdma%u rx %u: no DONE after %d polls, info %08x\n",
++			    id, i, ECONET_RX_DONE_POLLS,
++			    READ_ONCE(q->desc[i].info.word));
++	return true;
++}
++
+ static int econet_qdma_rx_process(struct econet_q_rx *q, int budget,
+ 				  struct airoha_whnat_batch *batch)
+ {
+@@ -543,6 +607,10 @@
+ 	cpu_i = q->next_i;
+ 
+ 	for (done = 0; done < budget && cpu_i != hardware_i; done++) {
++		if (unlikely(!econet_rx_desc_ready(q, cpu_i))) {
++			q->wait_done = true;
++			break;
++		}
+ 		econet_qdma_rx_process_one(q, cpu_i, dir, batch);
+ 		cpu_i = (cpu_i + 1) % ndesc;
+ 	}
+@@ -739,6 +807,7 @@
+ 		airoha_whnat_batch_init(pending);
+ 	}
+ 
++	q->wait_done = false;
+ 	do {
+ 		cur = econet_qdma_rx_process(q, budget - done, pending);
+ 		done += cur;
+@@ -750,9 +819,12 @@
+ 	/*
+ 	 * A failed refill leaves the hardware short of descriptors. Once it
+ 	 * has none left it raises no interrupt that would retry the refill,
+-	 * so keep polling until the ring is whole again.
++	 * so keep polling until the ring is whole again. The same goes for a
++	 * descriptor RX_HWI already passed but whose DONE is not visible yet:
++	 * its interrupt has been taken, so poll again rather than wait for the
++	 * next frame.
+ 	 */
+-	if (q->next_i != (q->cpu_i + 1) % q->ndesc)
++	if (q->next_i != (q->cpu_i + 1) % q->ndesc || q->wait_done)
+ 		return budget;
+ 
+ 	if (done < budget && napi_complete(napi)) {
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -4907,6 +4907,10 @@
+ 	u16				cpu_i;
+ 	/* Next descriptor to process; past cpu_i + 1 after a failed refill. */
+ 	u16				next_i;
++	/* Polls spent waiting for DONE on next_i (EN751221). */
++	u16				wait_polls;
++	/* This poll stopped at a descriptor without DONE. */
++	bool				wait_done;
+ 
+ 	/* Not modified after init */
+ 	struct airoha_qdma_mips		*qdma;
