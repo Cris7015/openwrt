@@ -216,7 +216,7 @@ return baseclass.extend({
 
 		root.appendChild(line);
 		node.chart = {
-			t0: t0, t1: t1, step: opts.step || 60, box: box,
+			t0: t0, t1: t1, step: opts.step || 60, box: box, secPerPx: opts.span / W,
 			/* the drawing is W pixels wide from the SVG's left edge */
 			timeAt: function(clientX) {
 				return t0 + (clientX - root.getBoundingClientRect().left) / W * opts.span;

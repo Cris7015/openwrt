@@ -144,7 +144,10 @@ return view.extend({
 
 	/* The cursor's box: values and events of the point under the cursor */
 	showTip: function(t, cx, cy) {
-		var tip = (t != null) ? analysis.tooltip(this.points, this.tipEvents, t, this.step) : null,
+		/* events within a marker's width (8 px) of the cursor count as under
+		 * it: a marker covers its event's whole 8 px strip */
+		var slack = (this.charts && this.charts[0]) ? 8 * this.charts[0].chart.secPerPx : 0,
+		    tip = (t != null) ? analysis.tooltip(this.points, this.tipEvents, t, this.step, slack) : null,
 		    spread = this.step > 60, rows, w, h;
 
 		if (!tip) {
@@ -235,13 +238,17 @@ return view.extend({
 
 	/* zoom: an `around` reply, drawn instead of the chosen window */
 	renderGraphs: function(history, summary, zoom) {
-		if (!zoom && summary.health == 'nofiber') {
+		/* no fiber: the note goes above whatever history there still is (a
+		 * reboot during an outage keeps the restored rings) */
+		var note = (!zoom && summary.health == 'nofiber') ? E('div', { 'class': 'cbi-section-descr' }, [
+			E('strong', {}, [ _('No fiber') ]), ' — ',
+			_('the GPON port has not reached O5 since the router started and receives no light: no alerts or events until it does.')
+		]) : '';
+
+		if (note && !(history.points || []).length) {
 			this.points = [];
 			this.tipEvents = [];
-			return E('div', { 'class': 'cbi-section-descr' }, [
-				E('strong', {}, [ _('No fiber') ]), ' — ',
-				_('the GPON port has not reached O5 since the router started and receives no light. Nothing is recorded until it does.')
-			]);
+			return note;
 		}
 
 		var win = WINDOWS.filter(function(w) { return w[0] == history.window; })[0] || WINDOWS[0],
@@ -275,6 +282,7 @@ return view.extend({
 		graph.cursor(charts, L.bind(this.showTip, this));
 
 		return E('div', {}, [
+			note,
 			zoom ? E('div', { 'class': 'cbi-section-descr' }, [
 				E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(this, 'setWindow', this.window) },
 					[ _('← Back to %s').format(win[1]) ]),

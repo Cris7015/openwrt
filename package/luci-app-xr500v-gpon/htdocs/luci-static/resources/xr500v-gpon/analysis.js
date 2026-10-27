@@ -94,15 +94,39 @@ return baseclass.extend({
 		return (Math.abs(data[hi].t - t) < Math.abs(data[lo].t - t)) ? hi : lo;
 	},
 
-	/* What the cursor at t points at: the closest point, its values and the
-	 * events of its interval [p.t, p.t + step). null without points. */
-	tooltip: function(points, events, t, step) {
-		var i = this.nearest(points, t), p, evs;
+	/* index of the last entry at or before t (the first one if t is earlier),
+	 * -1 if none: the point whose interval [p.t, p.t + step) holds t */
+	floor: function(data, t) {
+		var lo = 0, hi = (data ? data.length : 0) - 1;
+
+		if (hi < 0)
+			return -1;
+		if (data[hi].t <= t)
+			return hi;
+		while (hi - lo > 1) {
+			var mid = (lo + hi) >> 1;
+
+			if (data[mid].t <= t)
+				lo = mid;
+			else
+				hi = mid;
+		}
+		return lo;
+	},
+
+	/* What the cursor at t points at: the point whose interval holds t, its
+	 * values, and the events of that interval or within `slack` seconds of
+	 * the cursor (a marker is 8 px wide). null without points. */
+	tooltip: function(points, events, t, step, slack) {
+		var i = this.floor(points, t), p, evs;
 
 		if (i < 0)
 			return null;
 		p = points[i];
-		evs = inBucket(events, p.t, step);
+		slack = slack || 0;
+		evs = (events || []).filter(function(e) {
+			return (e.t >= p.t && e.t < p.t + step) || Math.abs(e.t - t) <= slack;
+		});
 		return {
 			t: p.t,
 			rx: triple(p, 'rx', dbm),

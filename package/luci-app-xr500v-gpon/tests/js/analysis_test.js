@@ -34,6 +34,17 @@ module.exports = ({ load, eq, ok }) => {
 	eq('analysis_tooltip_no_data', a.tooltip(pts, [], T + 130, 60).rx, null);
 	eq('analysis_tooltip_empty_points', a.tooltip([], [], T, 60), null);
 
+	// Final review, Important 1: the point under the cursor is the one whose
+	// interval holds it, and an event near the cursor shows even when it falls
+	// in the next interval (a marker covers 8 px).
+	const two = [ pt(T, 8400, 50776, 0), pt(T + 60, 8500, 50800, 0), pt(T + 120, 8600, 50800, 0) ];
+	eq('analysis_tooltip_floor', a.tooltip(two, [], T + 50, 60, 0).t, T);
+	eq('analysis_tooltip_event_second_half',
+		a.tooltip(two, [ { t: T + 45, type: 'deactivate', severity: 'crit' } ], T + 45, 60, 0).events.length, 1);
+	eq('analysis_tooltip_slack',
+		a.tooltip(two, [ { t: T + 100, type: 'deactivate', severity: 'crit' } ], T + 130, 60, 40).events.length, 1);
+	eq('analysis_tooltip_before_first', a.tooltip(two, [], T - 30, 60, 0).t, T);
+
 	// eventText
 	ok('analysis_eventtext_bip', a.eventText({ type: 'bip_burst', n: 12, msg: 'x' }).indexOf('12') >= 0);
 	ok('analysis_eventtext_alarm_flags', a.eventText({ type: 'bosa_alarm', flags: 4, msg: 'x' }).indexOf('0x04') >= 0);
