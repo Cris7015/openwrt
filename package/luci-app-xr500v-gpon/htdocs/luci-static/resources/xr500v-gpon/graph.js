@@ -1,5 +1,6 @@
 'use strict';
 'require baseclass';
+'require xr500v-gpon.analysis as analysis';
 
 /*
  * History graph drawn like the LuCI realtime graphs: white SVG box, filled
@@ -13,10 +14,6 @@
 var NS = 'http://www.w3.org/2000/svg';
 var TEXT_STYLE = 'fill:#eee;font-size:9pt;font-family:sans-serif;text-shadow:1px 1px 1px #000';
 var TICKS = [ 3600, 10800, 21600, 86400, 172800, 604800 ];
-
-function dbm(nw) {
-	return (nw > 0) ? 10 * Math.log10(nw / 1e6) : null;
-}
 
 function svg(tag, attrs, text) {
 	var el = document.createElementNS(NS, tag);
@@ -33,27 +30,6 @@ function svg(tag, attrs, text) {
 /* Real minus sign, as in the overview section */
 function num(v, digits) {
 	return (v < 0 ? '−' : '') + ('%.' + digits + 'f').format(Math.abs(v));
-}
-
-/* [ { t, n, avg, min, max } ] in display units, points without data skipped */
-function series(points, field) {
-	var out = [];
-
-	(points || []).forEach(function(p) {
-		var v;
-
-		if (field == 'rx')
-			v = { avg: dbm(p.rx_avg), min: dbm(p.rx_min), max: dbm(p.rx_max) };
-		else if (field == 'temp')
-			v = (p.temp_avg != null) ? { avg: p.temp_avg / 1000, min: p.temp_min / 1000, max: p.temp_max / 1000 } : {};
-		else
-			v = (p.bip != null) ? { avg: p.bip, min: p.bip, max: p.bip } : {};
-
-		if (v.avg != null)
-			out.push({ t: p.t, n: p.n || 1, avg: v.avg, min: v.min, max: v.max });
-	});
-
-	return out;
 }
 
 /* Integer range whose span divides by 4, so the 25/50/75 % grid lines fall on whole numbers */
@@ -124,11 +100,14 @@ return baseclass.extend({
 		var view = document.querySelector('#view'),
 		    W = opts.width || ((view && view.offsetWidth > 100) ? view.offsetWidth - 2 : 800),
 		    H = opts.height || 200,
-		    data = series(points, opts.field),
+		    all = analysis.series(points, opts.field),
+		    t1 = opts.now || (all.length ? all[all.length - 1].t : Date.now() / 1000),
+		    t0 = t1 - opts.span,
+		    /* the rings are capped by count: after downtime they reach back
+		     * before the window, which must not count in the legend or scale */
+		    data = analysis.inWindow(all, t0, t1 + 1),
 		    digits = (opts.field == 'bip') ? 0 : 1,
 		    r = range(data, opts.field, opts.lines),
-		    t1 = opts.now || (data.length ? data[data.length - 1].t : Date.now() / 1000),
-		    t0 = t1 - opts.span,
 		    root = svg('svg', { 'width': '100%', 'height': '100%', 'version': '1.1' });
 
 		var x = function(t) { return (t - t0) / opts.span * W; };
@@ -162,9 +141,6 @@ return baseclass.extend({
 		};
 
 		data.forEach(function(d, i) {
-			if (d.t < t0)
-				return;
-
 			if (opts.field == 'bip') {
 				if (d.avg > 0)
 					root.appendChild(svg('rect', { 'x': x(d.t), 'y': y(d.avg),
