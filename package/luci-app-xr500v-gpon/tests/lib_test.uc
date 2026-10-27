@@ -76,6 +76,14 @@ ok('evaluate_deact_old', !has(r.alerts, 'deactivate_recent'));
 r = evaluate(sample({}), { bip_last_hour: 3 }, th);
 ok('evaluate_bip_hour', has(r.alerts, 'bip_hour'));
 
+// An unanswered omci.agent call is "no data", not a link alarm; alerts that
+// do not depend on it still count.
+r = evaluate(normalize_status(null), {}, th);
+eq('evaluate_unknown_state_health', r.health, 'unknown');
+eq('evaluate_unknown_state_alerts', length(r.alerts), 0);
+r = evaluate(normalize_status(null), { now: now, last_deact_t: now - 300 }, th);
+eq('evaluate_unknown_state_keeps_deact', r.health, 'crit');
+
 let s = normalize_status({ state: 1, telemetry_valid: 0, bosa_rx_power_nw: 8400 });
 eq('normalize_no_telemetry_rx', s.rx_nw, null);
 r = evaluate(s, {}, th);

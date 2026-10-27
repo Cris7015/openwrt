@@ -8,6 +8,8 @@ import * as fs from 'fs';
 const BASE = '/tmp/xr500v-gpon-test';
 const T0 = 1800000000;	// aligned to 300 s and 1800 s buckets
 const DEACT = '[  100.000000] airoha-xpon 1fb60000.xmac: restarting GPON after Deactivate_ONU-ID from the OLT';
+const DEACT2 = '[  150.000000] airoha-xpon 1fb60000.xmac: restarting GPON after Deactivate_ONU-ID from the OLT';
+const LINKUP = '[  100.000000] airoha-xpon 1fb60000.xmac: GPON netdev link ready';
 
 function status(over) {
 	let st = {
@@ -66,7 +68,8 @@ eq('recorder_replay_basic_bip_total', r.out?.counters?.bip_total, 29);
 samples = [];
 for (let i = 0; i < 10; i++)
 	push(samples, sample(T0 + 60 * i));
-r = replay('deact', { samples, klog: [ { t: T0 + 540, line: DEACT } ] });
+// Kernel lines carry their own time: [100 s] after a boot at T0 + 440.
+r = replay('deact', { boot: T0 + 440, samples, klog: [ { t: T0 + 540, line: DEACT } ] });
 eq('recorder_replay_deactivate_events', length(filter(types(r.out?.events), (t) => t == 'deactivate')), 1);
 eq('recorder_replay_deactivate_counter', r.out?.counters?.deactivate, 1);
 eq('recorder_replay_deactivate_health', r.out?.health, 'crit');
@@ -86,7 +89,7 @@ r = replay('nostatus', { samples: [ sample(T0), sample(T0 + 60, { status: null }
 eq('recorder_replay_survives_missing_status_rc', r.rc, 0);
 eq('recorder_replay_survives_missing_status_m1', r.out?.m1_len, 2);
 eq('recorder_replay_survives_missing_status_state', r.out?.last?.state, null);
-eq('recorder_replay_survives_missing_status_health', r.out?.health, 'crit');
+eq('recorder_replay_survives_missing_status_health', r.out?.health, 'unknown');
 
 // recorder_replay_missing_status_keeps_o5: one unanswered call at O5 is not
 // a link drop: no o5 events, o5_since kept.
@@ -113,6 +116,42 @@ r = replay('nodebugfs', { samples });
 eq('recorder_replay_without_debugfs_resync', r.out?.counters?.sfifo_resync, null);
 eq('recorder_replay_without_debugfs_glitch', r.out?.counters?.sfifo_glitch, null);
 ok('recorder_replay_without_debugfs_no_resync_event', !('resync' in types(r.out?.events)));
+
+// recorder_klog_skips_lines_before_start: lines already in klog.log when the
+// daemon starts were counted from dmesg; only lines appended later are read.
+fs.writefile(`${BASE}/klog.log`, DEACT + '\n');
+r = replay('klogstart', { boot: T0, klog_file: `${BASE}/klog.log`,
+	klog_append: [ { t: T0 + 120, line: DEACT2 } ],
+	samples: [ sample(T0), sample(T0 + 60), sample(T0 + 180) ] });
+eq('recorder_klog_skips_lines_before_start_counter', r.out?.counters?.deactivate, 1);
+eq('recorder_klog_skips_lines_before_start_events',
+	length(filter(types(r.out?.events), (t) => t == 'deactivate')), 1);
+
+// recorder_o5_since_from_kernel_survives_clock_step: the link-ready line is
+// read before NTP (wrong clock); the time in O5 uses the clock at query time.
+r = replay('kstep', { boot: T0 - 1000, klog: [ { t: 1800, line: LINKUP } ],
+	samples: [ sample(T0, { up: 1000 }) ] });
+eq('recorder_o5_since_from_kernel_survives_clock_step', r.out?.o5_since, T0 - 900);
+
+// recorder_o5_since_from_sample_survives_clock_step: first O5 sample taken
+// with a stale clock (a day behind), then NTP steps it.
+r = replay('sstep', { boot: T0 - 3600,
+	samples: [ sample(T0 - 86400, { up: 200 }), sample(T0, { up: 3600 }) ] });
+eq('recorder_o5_since_from_sample_survives_clock_step', r.out?.o5_since, T0 - 3400);
+
+// recorder_crit_events_bypass_write_budget: a flood of warnings must not keep
+// a link drop off the flash.
+fs.unlink(`${BASE}/events.jsonl`);
+samples = [];
+for (let i = 0; i < 6; i++)
+	push(samples, sample(T0 + 60 * i, { sfifo_resync: `${i}\n` }));
+push(samples, sample(T0 + 360, { status: status({ state: 1 }) }));
+r = replay('budget', { events_file: `${BASE}/events.jsonl`, writes_per_day: 2, samples });
+let written = filter(split(fs.readfile(`${BASE}/events.jsonl`) || '', '\n'), length);
+eq('recorder_crit_events_bypass_write_budget_warn',
+	length(filter(written, (l) => index(l, '"resync"') >= 0)), 2);
+eq('recorder_crit_events_bypass_write_budget_crit',
+	length(filter(written, (l) => index(l, '"o5_down"') >= 0)), 1);
 
 // load_snapshot_tolerates_corrupt_file: power cut during a snapshot write.
 fs.writefile(`${BASE}/bad.json.gz`, '\x1f\x8b\x08\x00garbage');

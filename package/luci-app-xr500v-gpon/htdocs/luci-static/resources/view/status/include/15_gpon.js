@@ -46,7 +46,11 @@ function linkState(s) {
 			(s.o5_since && s.now >= s.o5_since) ? ' · ' + _('up %s').format('%t'.format(s.now - s.o5_since)) : ''
 		];
 
-	return [ dot('crit'), (s.state != null) ? _('O%d · Not operational').format(s.state) : '—' ];
+	/* null: omci.agent did not answer this sample */
+	if (s.state == null)
+		return [ dot(s.health), _('No data') ];
+
+	return [ dot('crit'), _('O%d · Not operational').format(s.state) ];
 }
 
 function olt(s) {

@@ -166,13 +166,18 @@ function hot(sample, th) {
 export function evaluate(sample, ctx, th) {
 	ctx = ctx || {};
 	let ids = [];
-	if (sample?.state != 5)
-		push(ids, 'not_o5');
-	let rx = rx_alert(sample?.rx_nw, th);
-	if (rx)
-		push(ids, rx);
-	if (hot(sample, th))
-		push(ids, 'temp_warn');
+	// A null state means omci.agent did not answer: the link and optics
+	// alerts cannot be judged, the counter-based ones still can.
+	let known = sample?.state != null;
+	if (known) {
+		if (sample.state != 5)
+			push(ids, 'not_o5');
+		let rx = rx_alert(sample.rx_nw, th);
+		if (rx)
+			push(ids, rx);
+		if (hot(sample, th))
+			push(ids, 'temp_warn');
+	}
 	if (ctx.bip_last_hour > 0)
 		push(ids, 'bip_hour');
 	if (ctx.last_deact_t != null && ctx.now != null &&
@@ -180,7 +185,7 @@ export function evaluate(sample, ctx, th) {
 		push(ids, 'deactivate_recent');
 
 	let alerts = map(ids, (id) => ({ id, severity: SEVERITY[id] }));
-	let health = 'ok';
+	let health = known ? 'ok' : 'unknown';
 	for (let a in alerts) {
 		if (a.severity == 'crit')
 			return { alerts, health: 'crit' };

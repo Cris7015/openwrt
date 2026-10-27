@@ -185,7 +185,7 @@ return view.extend({
 	renderAlerts: function(s) {
 		return table([ _('Severity'), _('Active alert') ], (s.alerts || []).map(function(a) {
 			return [ tag(a.severity), ALERTS[a.id] || a.id ];
-		}), s.stale ? _('No data') : _('No active alerts'));
+		}), (s.stale || s.health == 'unknown') ? _('No data') : _('No active alerts'));
 	},
 
 	setWindow: function(id, ev) {

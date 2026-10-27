@@ -40,8 +40,12 @@ let sink = null;	// daemon only: event -> overlay
 let st = {
 	m1: [], m5: [], m30: [], p5: [], p30: [], events: [],
 	last: null, known: null, info: null, serial: null,
-	o5_since: null, deact: 0, last_deact_t: null, skipped: 0
+	// moments kept as uptime when known (immune to NTP steps), else wall time
+	o5_up: null, o5_t: null, deact: 0, deact_up: null, deact_t: null,
+	skipped: 0
 };
+
+let klog_path = KLOG_FILE, events_path = EVENTS_FILE;
 
 function num(text) {
 	if (text == null)
@@ -51,6 +55,28 @@ function num(text) {
 		return null;
 	let n = +s;
 	return (n != n) ? null : n;
+}
+
+function uptime() {
+	let s = num(split(fs.readfile('/proc/uptime') || '', ' ')[0]);
+	return (s != null) ? int(s) : null;
+}
+
+function boot_time() {
+	return time() - (uptime() || 0);
+}
+
+let boot_of = boot_time;	// replay: the fixture's boot time
+
+// Wall-clock time of a moment, converted with the clock as it is now.
+function wall(up, t) {
+	return (up != null) ? boot_of() + up : t;
+}
+
+// "[ 6747.947031] airoha-xpon ..." -> seconds since boot, or null
+function kernel_up(line) {
+	let m = match(line, /\[ *([0-9]+)\.[0-9]+\]/);
+	return m ? int(m[1]) : null;
 }
 
 function add_event(t, ev) {
@@ -94,10 +120,12 @@ function ingest(raw) {
 	// Unknown state (no answer from omci.agent) keeps the link timeline;
 	// transitions compare against the last sample the agent answered.
 	if (sample.state == 5) {
-		if (st.o5_since == null)
-			st.o5_since = sample.t;
+		if (st.o5_up == null && st.o5_t == null) {
+			st.o5_up = raw.up;
+			st.o5_t = sample.t;
+		}
 	} else if (sample.state != null) {
-		st.o5_since = null;
+		st.o5_up = st.o5_t = null;
 	}
 
 	for (let ev in detect(st.known, sample, sample.bip, th))
@@ -112,14 +140,18 @@ function ingest(raw) {
 		st.serial = raw.status.serial;
 }
 
-function on_klog(t, line) {
+// t: wall clock when the line was read, used if it has no kernel timestamp.
+function on_klog(line, t) {
+	let up = kernel_up(line);
 	if (index(line, 'Deactivate_ONU-ID') >= 0) {
 		st.deact++;
-		st.last_deact_t = t;
-		add_event(t, { type: 'deactivate', severity: 'crit',
+		st.deact_up = up;
+		st.deact_t = t;
+		add_event(wall(up, t), { type: 'deactivate', severity: 'crit',
 			msg: 'OLT sent Deactivate_ONU-ID; GPON restarting' });
 	} else if (index(line, 'GPON netdev link ready') >= 0) {
-		st.o5_since = t;
+		st.o5_up = up;
+		st.o5_t = t;
 	}
 }
 
@@ -134,7 +166,7 @@ function bip_last_hour(now) {
 function assess(now) {
 	return evaluate(st.last, {
 		now, bip_last_min: st.last?.bip, bip_last_hour: bip_last_hour(now),
-		last_deact_t: st.last_deact_t
+		last_deact_t: wall(st.deact_up, st.deact_t)
 	}, th);
 }
 
@@ -143,7 +175,7 @@ function summary(now) {
 	return {
 		now, stale: !l || now - l.t > 3 * cfg.interval,
 		health: a.health, alerts: a.alerts,
-		state: l?.state, o5_since: st.o5_since,
+		state: l?.state, o5_since: wall(st.o5_up, st.o5_t),
 		olt: { vendor: i.olt_vendor, version: i.olt_version, profile: i.olt_profile },
 		onu_id: i.onu_id, fec: { ds: i.fec_ds, us: i.fec_us },
 		optics: { rx_nw: l?.rx_nw, tx_nw: l?.tx_nw, temp_mc: l?.temp_mc,
@@ -212,18 +244,20 @@ function load_snapshot(path) {
 	return true;
 }
 
-let writes = { day: null, n: 0 };
+let writes = { day: null, n: 0, crit: 0 };
 
+// Critical events have their own daily budget, so a flood of warnings cannot
+// keep a link drop off the flash.
 function append_event(e) {
-	let day = int(e.t / 86400);
+	let day = int(e.t / 86400), key = (e.severity == 'crit') ? 'crit' : 'n';
 	if (writes.day != day) {
 		writes.day = day;
-		writes.n = 0;
+		writes.n = writes.crit = 0;
 	}
-	if (writes.n >= cfg.event_writes_per_day)
+	if (writes[key] >= cfg.event_writes_per_day)
 		return;	// stays in RAM; the next persist() rewrites the file
-	writes.n++;
-	let f = fs.open(EVENTS_FILE, 'a');
+	writes[key]++;
+	let f = fs.open(events_path, 'a');
 	if (f) {
 		f.write(sprintf('%J\n', e));
 		f.close();
@@ -231,7 +265,7 @@ function append_event(e) {
 }
 
 function load_events() {
-	let text = fs.readfile(EVENTS_FILE);
+	let text = fs.readfile(events_path);
 	for (let line in split(text || '', '\n')) {
 		if (!length(line))
 			continue;
@@ -241,9 +275,9 @@ function load_events() {
 
 function persist() {
 	let ok = save_snapshot(SNAPSHOT);
-	let tmp = EVENTS_FILE + '.tmp';
+	let tmp = events_path + '.tmp';
 	fs.writefile(tmp, join('', map(st.events, (e) => sprintf('%J\n', e))));
-	fs.rename(tmp, EVENTS_FILE);
+	fs.rename(tmp, events_path);
 	return ok;
 }
 
@@ -258,27 +292,19 @@ function load_config() {
 	th = thresholds(uci.get_all('xr500v-gpon', 'thresholds'));
 }
 
-function boot_time() {
-	return time() - int(num(split(fs.readfile('/proc/uptime') || '0', ' ')[0]) || 0);
-}
-
-// "[ 6747.947031] airoha-xpon ..." -> wall clock seconds
-function kernel_time(line, boot) {
-	let m = match(line, /\[ *([0-9]+)\.[0-9]+\]/);
-	return m ? boot + int(m[1]) : time();
-}
-
 // Deactivates and the last O5 since boot, from one dmesg read at start.
 function startup_scan() {
-	let boot = boot_time(), p = fs.popen('dmesg');
+	let p = fs.popen('dmesg');
 	if (!p)
 		return;
 	for (let line = p.read('line'); length(line); line = p.read('line')) {
 		if (index(line, 'Deactivate_ONU-ID') >= 0) {
 			st.deact++;
-			st.last_deact_t = kernel_time(line, boot);
+			st.deact_up = kernel_up(line);
+			st.deact_t = null;
 		} else if (index(line, 'GPON netdev link ready') >= 0) {
-			st.o5_since = kernel_time(line, boot);
+			st.o5_up = kernel_up(line);
+			st.o5_t = null;
 		}
 	}
 	p.close();
@@ -286,14 +312,19 @@ function startup_scan() {
 
 let klog_off = 0;
 
+// Lines already in the file at start were counted by startup_scan().
+function klog_init() {
+	klog_off = fs.stat(klog_path)?.size || 0;
+}
+
 // New complete lines appended by the logread instance since the last tick.
-function read_klog() {
-	let size = fs.stat(KLOG_FILE)?.size;
+function read_klog(t) {
+	let size = fs.stat(klog_path)?.size;
 	if (size == null)
 		return;
 	if (size < klog_off)
 		klog_off = 0;	// truncated
-	let f = fs.open(KLOG_FILE, 'r');
+	let f = fs.open(klog_path, 'r');
 	if (!f)
 		return;
 	f.seek(klog_off);
@@ -303,12 +334,11 @@ function read_klog() {
 	if (nl < 0)
 		return;
 	klog_off += nl + 1;
-	let boot = boot_time();
 	for (let line in split(substr(text, 0, nl), '\n'))
 		if (length(line))
-			on_klog(kernel_time(line, boot), line);
+			on_klog(line, t);
 	if (klog_off > KLOG_MAX) {
-		fs.writefile(KLOG_FILE, '');
+		fs.writefile(klog_path, '');
 		klog_off = 0;
 	}
 }
@@ -321,7 +351,7 @@ function collect(bus) {
 		status = null;
 	}
 	return {
-		t: time(), status,
+		t: time(), up: uptime(), status,
 		bip: fs.readfile(XMAC + '/gpon_bip'),
 		gem_delin: fs.readfile(XMAC + '/gpon_gem_delin'),
 		sfifo_resync: fs.readfile(DBG + '/gpon_sfifo_resync_count'),
@@ -331,16 +361,36 @@ function collect(bus) {
 
 function replay(path) {
 	let fx = json(fs.readfile(path));
+	if (fx.boot != null)
+		boot_of = () => fx.boot;
+	if (fx.events_file) {
+		events_path = fx.events_file;
+		if (fx.writes_per_day > 0)
+			cfg.event_writes_per_day = fx.writes_per_day;
+		sink = append_event;
+	}
+	if (fx.klog_file) {
+		klog_path = fx.klog_file;
+		klog_init();
+	}
 	if (fx.snapshot)
 		load_snapshot(fx.snapshot);
-	let klog = fx.klog || [], k = 0;
+	let klog = fx.klog || [], k = 0, extra = fx.klog_append || [], x = 0;
 	for (let raw in fx.samples || []) {
 		for (; k < length(klog) && klog[k].t <= raw.t; k++)
-			on_klog(klog[k].t, klog[k].line);
+			on_klog(klog[k].line, klog[k].t);
+		if (fx.klog_file) {
+			for (; x < length(extra) && extra[x].t <= raw.t; x++) {
+				let f = fs.open(klog_path, 'a');
+				f.write(extra[x].line + '\n');
+				f.close();
+			}
+			read_klog(raw.t);
+		}
 		ingest(raw);
 	}
 	for (; k < length(klog); k++)
-		on_klog(klog[k].t, klog[k].line);
+		on_klog(klog[k].line, klog[k].t);
 	if (fx.save)
 		save_snapshot(fx.save);
 	let now = st.last ? st.last.t : time();
@@ -348,7 +398,7 @@ function replay(path) {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
 		counters: summary(now).counters, skipped: st.skipped, last: st.last,
-		o5_since: st.o5_since
+		o5_since: wall(st.o5_up, st.o5_t)
 	}));
 }
 
@@ -358,6 +408,7 @@ function daemon() {
 	load_snapshot(SNAPSHOT);
 	load_events();
 	sink = append_event;
+	klog_init();
 	startup_scan();
 	uloop.init();
 	let bus = ubus.connect();
@@ -372,7 +423,7 @@ function daemon() {
 		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});
 	let tick = () => {
-		read_klog();
+		read_klog(time());
 		ingest(collect(bus));
 	};
 	let sampler, saver;
