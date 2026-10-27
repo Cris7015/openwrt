@@ -375,6 +375,14 @@ void pcm_en751221_dual_mute(unsigned int index, bool mute)
 }
 EXPORT_SYMBOL_GPL(pcm_en751221_dual_mute);
 
+/* Diagnostics: timestamp SLIC events in capture frames, so a mute edge in
+ * dmesg can be lined up with the RTP stream (both count 10 ms of audio). */
+u32 pcm_en751221_dual_rx_frames(void)
+{
+	return READ_ONCE(pd.rx_frames);
+}
+EXPORT_SYMBOL_GPL(pcm_en751221_dual_rx_frames);
+
 ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf, size_t len, bool capture)
 {
 	struct pcm_dual_line *l;

@@ -8,6 +8,8 @@ int pcm_en751221_dual_open(unsigned int index);
 void pcm_en751221_dual_close(unsigned int index);
 /* Replace this line's captured audio with silence while the loop is open. */
 void pcm_en751221_dual_mute(unsigned int index, bool mute);
+/* Capture frames (10 ms each) the shared engine has completed since start. */
+u32 pcm_en751221_dual_rx_frames(void);
 ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf,
 			   size_t len, bool capture);
 #endif

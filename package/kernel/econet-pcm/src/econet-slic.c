@@ -30,6 +30,9 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <linux/ktime.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
 
 #define DRV_NAME "econet-slic"
 
@@ -311,6 +314,105 @@ static int zsi_mpi_read(u8 ec, u8 reg, u8 *buf, u8 len)
 	if (ret)
 		return ret;
 	return zsi_read(reg, buf, len);
+}
+
+/*
+ * Fast, read-only ZSI path (used by the dual-mode in-call mute poller and its
+ * bus self-test, see slic-dual.inc).
+ *
+ * zsi_write_byte()/zsi_read_byte() settle with usleep_range(zsi_gap_us,
+ * zsi_gap_us + 1000). On this NO_HZ_IDLE kernel an otherwise idle CPU wakes at
+ * the END of that range, so at zsi_gap_us=1000 a byte costs 1-2 ms and the
+ * 8-byte hook read (EC prefix + SIGREG) holds sd.lock ~10-16 ms. The OEM
+ * spi.ko ZSI_bytes_read()/ZSI_bytes_write() poll the same ack/ready bits and
+ * then settle only udelay(10) per byte.
+ *
+ * zsi_fast_gap_us (0 = keep zsi_gap_us, but with a tight range) applies to
+ * READS only. A byte lost in a read garbles the answer, which the callers
+ * detect; a byte lost in a write could turn a data byte into a command
+ * (EC_2 = 0x02 is the VP886 software-reset opcode), so writes never use it.
+ */
+static int zsi_fast_gap_us;
+module_param(zsi_fast_gap_us, int, 0644);
+MODULE_PARM_DESC(zsi_fast_gap_us, "post-ack settle (us) of the mute poller's device-register reads; 0 = zsi_gap_us");
+
+static void zsi_settle_tight(int gap)
+{
+	if (gap <= 0)
+		return;
+	if (gap < 20)
+		udelay(gap);
+	else
+		usleep_range(gap, gap + max(gap / 4, 10));
+}
+
+static int zsi_xfer_write(u8 v, int gap)
+{
+	int ret;
+
+	writel(v, sd.zsi + ZSI_TXRX);
+	ret = zsi_poll_set(ZSI_CTL_TX_ACK);
+	if (ret)
+		return ret;
+	writel(ZSI_CTL_TX_ACK, sd.zsi + ZSI_CTL);
+	zsi_settle_tight(gap);
+	return 0;
+}
+
+static int zsi_xfer_read(u8 *out, int gap)
+{
+	int ret;
+
+	writel(ZSI_CTL_READ_REQ, sd.zsi + ZSI_CTL);
+	ret = zsi_poll_set(ZSI_CTL_RX_READY);
+	if (ret)
+		return ret;
+	*out = readl(sd.zsi + ZSI_RX) & 0xff;
+	writel(ZSI_CTL_RX_READY, sd.zsi + ZSI_CTL);
+	zsi_settle_tight(gap);
+	return 0;
+}
+
+/*
+ * Read a DEVICE-level register (SIGREG 0x4d, RCNPCN 0x73) without the EC
+ * prefix. VP-API reads SIGREG with a NULL line context (Vp886GetEvent);
+ * byte 0 is EC_1 and byte 1 EC_2 whatever EC holds (hook_raw already relies
+ * on this), and every runtime path that touches a channel register writes EC
+ * itself first. Saves 2 of the 8 bytes and the only write of the transaction.
+ * Called with sd.lock held.
+ */
+static int zsi_dev_read_fast(u8 reg, u8 *buf, u8 len, int gap)
+{
+	int ret;
+	u8 i;
+
+	sd.where = "dev_read_fast";
+	zsi_begin();
+	ret = zsi_xfer_write(reg, gap);
+	if (!ret)
+		ret = zsi_xfer_write(0x06, gap);	/* framing byte, as in zsi_read() */
+	for (i = 0; !ret && i < len; i++)
+		ret = zsi_xfer_read(&buf[i], gap);
+	return ret;
+}
+
+/*
+ * After a failed or doubtful fast read: clock NOOPs (0x06, the byte zsi_read()
+ * already uses as framing) at the safe gap, so a half-finished read cannot
+ * leave the SLIC mid-answer for the next slow transaction, whose EC data byte
+ * (0x02) would then land as an opcode (software reset). Twice the longest
+ * read the poller issues (4 data bytes). Heuristic: the Le9642 ZSI framing is
+ * not documented here. Called with sd.lock held.
+ */
+static void zsi_resync_locked(void)
+{
+	int i;
+
+	sd.where = "resync";
+	zsi_begin();
+	for (i = 0; i < 8; i++)
+		if (zsi_write_byte(0x06))
+			break;
 }
 
 static int slic_detect(u8 *buf, u8 n)

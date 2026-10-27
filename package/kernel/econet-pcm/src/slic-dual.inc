@@ -68,6 +68,55 @@ static unsigned int ring_trip_reads = 2;
 module_param(ring_trip_reads, uint, 0644);
 MODULE_PARM_DESC(ring_trip_reads, "consecutive off-hook samples during the ON burst before the ring trips");
 
+/*
+ * In-call capture mute poller (hang-up "piii").
+ *
+ * When the handset goes down mid-call the far end hears the loop-open click
+ * and then the DC-DC light-load buzz until the capture mute takes effect.
+ * Without this poller the mute only follows the call manager's `hook` reads:
+ * one slow ZSI read (EC + SIGREG, ~10-16 ms with sd.lock held) per 40 ms tick
+ * of a userspace loop, so it lands ~90-140 ms after the click (25-oct RTP).
+ *
+ * With dual_mute_poll_ms > 0 a work item samples SIGREG every
+ * dual_mute_poll_ms while at least one stream is open (never at idle): ONE
+ * device-level read serves both jacks (bytes 0/1), no EC prefix, settle
+ * zsi_fast_gap_us. A hook EDGE on an open, non-ringing line is confirmed by
+ * a second read before the mute flips, so one garbled read costs nothing.
+ * Muting is immediate; unmuting waits until the loop has stayed closed for
+ * dual_unmute_ms, because the hook switch bounces at hang-up (two clicks
+ * 30-40 ms apart in 3 of the 4 calls of 25-oct) and a re-close in between
+ * must not let the second click through. While enabled the poller is the only
+ * writer of the mute (the hook node no longer toggles it), so the two cannot
+ * fight. It only toggles the capture mute: call control still waits for the
+ * manager's 450 ms of stable on-hook, the ring trip and the lpm node are not
+ * touched, and a ringing line is skipped. The next sample is never sooner
+ * than 3x the last read's duration, which caps the poller's share of the ZSI
+ * bus at ~25-33 % even if the fast gap is off or the bus is slow.
+ *
+ * dual_hook_from_poll: the `hook` node of an open, non-ringing line answers
+ * from the poller's sample while it is fresh (< 2 periods + 5 ms) instead of
+ * doing its own slow read. Same bit, fresher; the managers' 40 ms reads stop
+ * competing for the bus during calls.
+ */
+static unsigned int dual_mute_poll_ms;
+module_param(dual_mute_poll_ms, uint, 0644);
+MODULE_PARM_DESC(dual_mute_poll_ms, "in-call SIGREG poll period for the capture mute (ms); 0 = off, manager-driven only");
+static bool dual_hook_from_poll = true;
+module_param(dual_hook_from_poll, bool, 0644);
+MODULE_PARM_DESC(dual_hook_from_poll, "an open line's hook node reuses the mute poller's fresh sample");
+static unsigned int dual_mute_max_errors = 5;
+module_param(dual_mute_max_errors, uint, 0644);
+MODULE_PARM_DESC(dual_mute_max_errors, "consecutive poller read errors before zsi_fast_gap_us falls back to 0");
+static unsigned int dual_unmute_ms = 40;
+module_param(dual_unmute_ms, uint, 0644);
+MODULE_PARM_DESC(dual_unmute_ms, "loop closed this long before the poller lifts the mute (hang-up contact bounce, hook flash end)");
+
+static struct delayed_work dual_mute_work;
+static struct {			/* all under sd.lock */
+	u32 reads, errors, busy, confirm_fail, fast_off, consecutive;
+	s64 last_us, max_us;
+} dmp;
+
 struct slic_dual_line {
 	struct miscdevice misc;
 	unsigned int index;
@@ -81,6 +130,11 @@ struct slic_dual_line {
 	bool muted;		/* capture muted because the loop opened mid-stream */
 	int last_state;		/* last STATE written, -1 unknown; repeats are skipped */
 	u32 state_errors, state_mismatches;
+	int poll_sample;	/* mute poller's last hook bit, -1 = none since open */
+	unsigned long poll_jiffies;
+	unsigned long closed_since;	/* muted line seen closed again since (0 = not) */
+	u32 open_rx_frame;	/* PCM capture frame counter at stream open */
+	u32 poll_mutes, poll_unmutes;
 };
 static struct slic_dual_line dl[2];
 
@@ -92,6 +146,219 @@ static int slic_dual_hook_sample(struct slic_dual_line *l)
 
 	return ret ? ret : !!(sig[l->ec - 1] & 1);
 }
+
+static void slic_dual_mute_arm(void)
+{
+	/* No-op when already pending; the work re-queues itself while a
+	 * stream is open and stops on its own when both are closed. */
+	if (READ_ONCE(dual_mute_poll_ms))
+		queue_delayed_work(system_highpri_wq, &dual_mute_work, 0);
+}
+
+static void slic_dual_poll_set_mute(struct slic_dual_line *l, bool mute, s64 us)
+{
+	l->muted = mute;
+	pcm_en751221_dual_mute(l->index, mute);
+	if (mute)
+		l->poll_mutes++;
+	else
+		l->poll_unmutes++;
+	pr_info("econet-slic: phone%u capture %s by poller (frame +%u since open, read %lld us)\n",
+		l->index + 1, mute ? "muted" : "unmuted",
+		pcm_en751221_dual_rx_frames() - l->open_rx_frame, (long long)us);
+}
+
+static void slic_dual_mute_poll(struct work_struct *w)
+{
+	unsigned int ms = READ_ONCE(dual_mute_poll_ms);
+	u8 sig[4], chk[4];
+	bool edge = false, checked = false;
+	unsigned long next;
+	ktime_t t0;
+	s64 us;
+	int i, ret, gap;
+
+	if (!ms)
+		return;			/* switched off: the next open re-arms */
+	if (!mutex_trylock(&sd.lock)) {
+		/* A long operation (ring line-up, state verify) owns the bus. */
+		dmp.busy++;
+		queue_delayed_work(system_highpri_wq, &dual_mute_work,
+				   msecs_to_jiffies(2));
+		return;
+	}
+	if (!dl[0].opened && !dl[1].opened) {
+		mutex_unlock(&sd.lock);
+		return;			/* both streams closed: stop */
+	}
+	gap = READ_ONCE(zsi_fast_gap_us);
+	if (gap <= 0)
+		gap = zsi_gap_us;
+	t0 = ktime_get();
+	ret = zsi_dev_read_fast(0x4d, sig, sizeof(sig), gap);
+	if (!ret && sig[0] == 0xff && sig[1] == 0xff && sig[2] == 0xff && sig[3] == 0xff)
+		ret = -EIO;		/* Vp886GetEvent's bus-error signature */
+	for (i = 0; !ret && i < 2; i++) {
+		struct slic_dual_line *l = &dl[i];
+		bool open_loop = !(sig[l->ec - 1] & 1);
+
+		if (l->opened && !l->ringing && open_loop != l->muted)
+			edge = true;
+	}
+	if (!ret && edge) {
+		ret = zsi_dev_read_fast(0x4d, chk, sizeof(chk), gap);
+		checked = !ret;
+	}
+	us = ktime_us_delta(ktime_get(), t0);
+	dmp.last_us = us;
+	if (us > dmp.max_us)
+		dmp.max_us = us;
+	if (ret) {
+		dmp.errors++;
+		zsi_resync_locked();
+		if (++dmp.consecutive >= max(dual_mute_max_errors, 1U) &&
+		    READ_ONCE(zsi_fast_gap_us) > 0) {
+			WRITE_ONCE(zsi_fast_gap_us, 0);
+			dmp.fast_off++;
+			pr_warn("econet-slic: mute poller: %u read errors in a row, zsi_fast_gap_us -> 0\n",
+				dmp.consecutive);
+		}
+	} else {
+		bool disagree = false;
+
+		dmp.reads++;
+		dmp.consecutive = 0;
+		for (i = 0; i < 2; i++) {
+			struct slic_dual_line *l = &dl[i];
+			int v = !!(sig[l->ec - 1] & 1);
+			bool open_loop = !v;
+
+			if (!l->opened || l->ringing)
+				continue;
+			if (checked && open_loop != l->muted && !!(chk[l->ec - 1] & 1) != v) {
+				dmp.confirm_fail++;
+				disagree = true;
+				continue;	/* reads disagree: next sample decides */
+			}
+			l->poll_sample = v;
+			l->poll_jiffies = jiffies;
+			if (open_loop) {
+				l->closed_since = 0;
+				if (!l->muted)
+					slic_dual_poll_set_mute(l, true, us);
+			} else if (l->muted) {
+				if (!l->closed_since)
+					l->closed_since = jiffies ?: 1;
+				if (time_after_eq(jiffies, l->closed_since +
+						  msecs_to_jiffies(READ_ONCE(dual_unmute_ms)))) {
+					l->closed_since = 0;
+					slic_dual_poll_set_mute(l, false, us);
+				}
+			}
+		}
+		/* Two back-to-back reads that disagree may be one garbled answer
+		 * rather than a real edge: realign before the next slow read. */
+		if (disagree)
+			zsi_resync_locked();
+	}
+	mutex_unlock(&sd.lock);
+	next = max_t(unsigned long, msecs_to_jiffies(ms),
+		     usecs_to_jiffies((unsigned int)min_t(s64, 3 * us, 1000000)));
+	queue_delayed_work(system_highpri_wq, &dual_mute_work, next);
+}
+
+static int slic_dual_mute_poll_show(struct seq_file *s, void *unused)
+{
+	int i;
+
+	mutex_lock(&sd.lock);
+	seq_printf(s, "poll_ms=%u fast_gap_us=%d zsi_gap_us=%d hook_from_poll=%u unmute_ms=%u pending=%u\n",
+		   READ_ONCE(dual_mute_poll_ms), READ_ONCE(zsi_fast_gap_us), zsi_gap_us,
+		   READ_ONCE(dual_hook_from_poll), READ_ONCE(dual_unmute_ms),
+		   delayed_work_pending(&dual_mute_work));
+	seq_printf(s, "reads=%u errors=%u busy=%u confirm_fail=%u fast_off=%u last_us=%lld max_us=%lld\n",
+		   dmp.reads, dmp.errors, dmp.busy, dmp.confirm_fail, dmp.fast_off,
+		   (long long)dmp.last_us, (long long)dmp.max_us);
+	for (i = 0; i < 2; i++)
+		seq_printf(s, "phone%d opened=%u muted=%u poll_sample=%d mutes=%u unmutes=%u\n",
+			   i + 1, dl[i].opened, dl[i].muted, dl[i].poll_sample,
+			   dl[i].poll_mutes, dl[i].poll_unmutes);
+	mutex_unlock(&sd.lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(slic_dual_mute_poll);
+
+/*
+ * Bus check before lowering zsi_fast_gap_us. ONLY with both lines idle (no
+ * stream open, no bell): `echo "N GAP" > zsi_selftest` reads RCNPCN (0x73,
+ * expected 08 75) N times without the EC prefix and a GAP us settle, then
+ * SIGREG once that way and once the slow way (EC + zsi_gap_us), then RCNPCN
+ * the slow way to prove the bus is still aligned. Reads only; stops after
+ * three errors; result in dmesg. Holds sd.lock for the whole run, so keep N
+ * small (<= 200): the managers' hook reads wait meanwhile.
+ */
+static ssize_t slic_dual_selftest_write(struct file *f, const char __user *ub,
+					size_t len, loff_t *off)
+{
+	unsigned int n, gap, i, bad = 0, errs = 0;
+	u8 id[2] = { 0 }, fast[4] = { 0 }, slow[4] = { 0 };
+	s64 us, total = 0, max_us = 0;
+	u32 ctl, cfg;
+	char buf[32];
+	ktime_t t0;
+	int ret;
+
+	if (len >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ub, len))
+		return -EFAULT;
+	buf[len] = '\0';
+	if (sscanf(buf, "%u %u", &n, &gap) != 2 || !n || n > 2000 || gap > 5000)
+		return -EINVAL;
+	mutex_lock(&sd.lock);
+	if (dl[0].opened || dl[1].opened || dl[0].ringing || dl[1].ringing) {
+		mutex_unlock(&sd.lock);
+		return -EBUSY;
+	}
+	for (i = 0; i < n && errs < 3; i++) {
+		t0 = ktime_get();
+		ret = zsi_dev_read_fast(0x73, id, sizeof(id), gap);
+		us = ktime_us_delta(ktime_get(), t0);
+		total += us;
+		if (us > max_us)
+			max_us = us;
+		if (ret || id[0] != 0x08 || id[1] != 0x75) {
+			if (!ret)
+				bad++;
+			errs++;
+			zsi_resync_locked();
+		}
+	}
+	ret = zsi_dev_read_fast(0x4d, fast, sizeof(fast), gap);
+	if (!ret)
+		ret = zsi_mpi_read(VP886_EC_1, 0x4d, slow, sizeof(slow));
+	if (!ret)
+		ret = zsi_mpi_read(VP886_EC_1, VP886_R_RCNPCN_RD, id, sizeof(id));
+	/* Idle wrapper state. The OEM acks with a read-modify-write of CTL
+	 * (spi.ko spi_wraper_*: ctl |= bit) where this driver writes the bit
+	 * alone: any non-W1C bit set here would be one we keep clearing. */
+	ctl = readl(sd.zsi + ZSI_CTL);
+	cfg = readl(sd.zsi + ZSI_CFG);
+	mutex_unlock(&sd.lock);
+	pr_info("econet-slic: zsi selftest idle ctl=0x%08x cfg=0x%08x\n", ctl, cfg);
+	pr_info("econet-slic: zsi selftest gap=%uus n=%u done=%u bad=%u errors=%u avg=%lldus max=%lldus\n",
+		gap, n, i, bad, errs, i ? (long long)div_s64(total, i) : 0LL,
+		(long long)max_us);
+	pr_info("econet-slic: zsi selftest sigreg fast=%4ph slow=%4ph hook bits %s; slow rcnpcn=%02x %02x ret=%d\n",
+		fast, slow, ((fast[0] ^ slow[0]) | (fast[1] ^ slow[1])) & 1 ? "MISMATCH" : "match",
+		id[0], id[1], ret);
+	return len;
+}
+
+static const struct file_operations slic_dual_selftest_fops = {
+	.owner = THIS_MODULE, .open = simple_open, .write = slic_dual_selftest_write,
+	.llseek = default_llseek,
+};
 
 /* Selected-channel register reads only: never invoke legacy reset/probe nodes. */
 static int slic_dual_status_show(struct seq_file *s, void *unused)
@@ -211,6 +478,14 @@ static int slic_dual_open(struct inode *inode, struct file *file)
 		return ret;
 	mutex_lock(&sd.lock);
 	ret = slic_dual_state(l, 0x23);
+	if (!ret) {
+		/* Under sd.lock: the mute poller reads these with it held. */
+		l->opened = true;
+		l->muted = false;
+		l->poll_sample = -1;
+		l->closed_since = 0;
+		l->open_rx_frame = pcm_en751221_dual_rx_frames();
+	}
 	mutex_unlock(&sd.lock);
 	if (ret) {
 		pcm_en751221_dual_close(l->index);
@@ -218,9 +493,9 @@ static int slic_dual_open(struct inode *inode, struct file *file)
 	}
 	stream_open(inode, file);
 	file->private_data = l;
-	l->opened = true;
-	l->muted = false;
-	pr_info("econet-slic: phone%u stream opened\n", l->index + 1);
+	slic_dual_mute_arm();
+	pr_info("econet-slic: phone%u stream opened (frame %u)\n", l->index + 1,
+		l->open_rx_frame);
 	return 0;
 }
 
@@ -234,6 +509,8 @@ static int slic_dual_release(struct inode *inode, struct file *file)
 	mutex_lock(&sd.lock);
 	l->opened = false;
 	l->muted = false;
+	l->poll_sample = -1;
+	l->closed_since = 0;
 	/* Park the line only when the loop is open. With the handset still
 	 * lifted (the far end hung up) keep the feed: the standby -> active
 	 * bounce the manager did 100 ms later was audible in the handset. */
@@ -273,14 +550,27 @@ static int slic_dual_hook_read(struct slic_dual_line *l)
 	int v;
 
 	if (!l->ringing) {
-		v = slic_dual_hook_sample(l);
+		unsigned int pms = READ_ONCE(dual_mute_poll_ms);
+		bool polled = pms && l->opened && l->poll_sample >= 0;
+
+		if (polled && READ_ONCE(dual_hook_from_poll) &&
+		    time_before(jiffies, l->poll_jiffies + msecs_to_jiffies(2 * pms + 5)))
+			v = l->poll_sample;	/* fresh poller sample: no bus traffic */
+		else
+			v = slic_dual_hook_sample(l);
 		if (v < 0)
 			return v;
 		l->hook_cache = v;
 		if (l->tripped && !v)
 			l->tripped = false;	/* loop open again: the next ring=1 rings */
-		/* First on-hook sample with the stream open: silence the capture
-		 * now, not after the manager's debounce (DC-DC buzz to the far end). */
+		if (pms && l->opened && !delayed_work_pending(&dual_mute_work))
+			slic_dual_mute_arm();	/* enabled mid-call, or stopped */
+		/* While the poller runs and is not stale it owns the mute (it
+		 * holds it through the hang-up contact bounce); otherwise this is
+		 * the manager-driven mute as before: first on-hook sample with the
+		 * stream open silences the capture (DC-DC buzz to the far end). */
+		if (polled && time_before(jiffies, l->poll_jiffies + msecs_to_jiffies(4 * pms + 20)))
+			return v;
 		if ((l->opened && !v) != l->muted) {
 			l->muted = l->opened && !v;
 			pcm_en751221_dual_mute(l->index, l->muted);
@@ -426,6 +716,8 @@ static int slic_dual_init(void)
 	int old_ec = slic_ec, old_slot = slic_slot;
 
 	pcm_en751221_voice_reset();
+	INIT_DELAYED_WORK(&dual_mute_work, slic_dual_mute_poll);
+	dl[0].poll_sample = dl[1].poll_sample = -1;
 	mutex_lock(&sd.lock);
 	zsi_hw_init();
 	zsi_slic_reset();
@@ -454,6 +746,8 @@ static int slic_dual_init(void)
 	if (ret)
 		return ret;
 	sd.dbg = debugfs_create_dir(DRV_NAME, NULL);
+	debugfs_create_file("mute_poll", 0400, sd.dbg, NULL, &slic_dual_mute_poll_fops);
+	debugfs_create_file("zsi_selftest", 0200, sd.dbg, NULL, &slic_dual_selftest_fops);
 	for (i = 0; i < 2; i++) {
 		struct dentry *dir;
 
@@ -485,6 +779,9 @@ static void slic_dual_exit(void)
 {
 	int i;
 
+	/* No stream can be open here (the misc fops pin the module), so the
+	 * poller is idle or about to stop; trylock never blocks on us. */
+	cancel_delayed_work_sync(&dual_mute_work);
 	pcm_en751221_dual_stop();
 	for (i = 0; i < 2; i++) {
 		misc_deregister(&dl[i].misc);
