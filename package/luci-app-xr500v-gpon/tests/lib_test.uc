@@ -103,6 +103,9 @@ eq('detect_rx_warn_stay', length(detect(sample({ rx_nw: 3000 }), sample({ rx_nw:
 ok('detect_resync', 'resync' in types(detect(sample({ sfifo_resync: 0 }), sample({ sfifo_resync: 1 }), 0, th)));
 ok('detect_no_resync_when_null', !('resync' in types(detect(sample({}), sample({}), 0, th))));
 ok('detect_bosa_alarm', 'bosa_alarm' in types(detect(sample({ alarms: 0 }), sample({ alarms: 4 }), 0, th)));
+// An unknown state (omci.agent did not answer) is not a link transition.
+eq('detect_o5_unknown_no_down', types(detect(sample({}), sample({ state: null }), 0, th)), []);
+eq('detect_o5_unknown_no_up', types(detect(sample({ state: null }), sample({}), 0, th)), []);
 
 // aggregate()
 let samples = [];

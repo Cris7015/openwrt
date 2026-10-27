@@ -39,7 +39,7 @@ let sink = null;	// daemon only: event -> overlay
 
 let st = {
 	m1: [], m5: [], m30: [], p5: [], p30: [], events: [],
-	last: null, info: null, serial: null,
+	last: null, known: null, info: null, serial: null,
 	o5_since: null, deact: 0, last_deact_t: null, skipped: 0
 };
 
@@ -91,13 +91,19 @@ function ingest(raw) {
 	if (sample.bip_total != null && prev?.bip_total != null)
 		sample.bip = sample.bip_total >= prev.bip_total
 			? sample.bip_total - prev.bip_total : sample.bip_total;
-	if (sample.state != 5)
+	// Unknown state (no answer from omci.agent) keeps the link timeline;
+	// transitions compare against the last sample the agent answered.
+	if (sample.state == 5) {
+		if (st.o5_since == null)
+			st.o5_since = sample.t;
+	} else if (sample.state != null) {
 		st.o5_since = null;
-	else if (st.o5_since == null)
-		st.o5_since = sample.t;
+	}
 
-	for (let ev in detect(prev, sample, sample.bip, th))
+	for (let ev in detect(st.known, sample, sample.bip, th))
 		add_event(sample.t, ev);
+	if (sample.state != null)
+		st.known = sample;
 	ring_push(st.m1, sample, M1_CAP);
 	bucket(sample);
 	st.last = sample;
@@ -341,7 +347,8 @@ function replay(path) {
 	print(sprintf('%J\n', {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
-		counters: summary(now).counters, skipped: st.skipped, last: st.last
+		counters: summary(now).counters, skipped: st.skipped, last: st.last,
+		o5_since: st.o5_since
 	}));
 }
 
@@ -354,12 +361,15 @@ function daemon() {
 	startup_scan();
 	uloop.init();
 	let bus = ubus.connect();
+	// ucode rejects arguments missing from a method's policy, and rpcd adds
+	// ubus_rpc_session to every call coming from LuCI.
+	let sid = { ubus_rpc_session: '' };
 	bus.publish('xr500v.gpon', {
-		summary: { call: () => summary(time()) },
-		history: { args: { window: '' }, call: (req) => history(req.args.window) },
-		events: { args: { limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
-		persist: { call: () => ({ ok: persist() }) },
-		reload: { call: () => { load_config(); return { ok: true }; } }
+		summary: { args: sid, call: () => summary(time()) },
+		history: { args: { ...sid, window: '' }, call: (req) => history(req.args.window) },
+		events: { args: { ...sid, limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
+		persist: { args: sid, call: () => ({ ok: persist() }) },
+		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});
 	let tick = () => {
 		read_klog();

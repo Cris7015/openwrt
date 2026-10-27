@@ -88,6 +88,19 @@ eq('recorder_replay_survives_missing_status_m1', r.out?.m1_len, 2);
 eq('recorder_replay_survives_missing_status_state', r.out?.last?.state, null);
 eq('recorder_replay_survives_missing_status_health', r.out?.health, 'crit');
 
+// recorder_replay_missing_status_keeps_o5: one unanswered call at O5 is not
+// a link drop: no o5 events, o5_since kept.
+r = replay('gap', { samples: [ sample(T0), sample(T0 + 60, { status: null }),
+	sample(T0 + 120) ] });
+eq('recorder_replay_missing_status_keeps_o5_events', types(r.out?.events), []);
+eq('recorder_replay_missing_status_keeps_o5_since', r.out?.o5_since, T0);
+
+// recorder_replay_missing_status_then_drop: a drop behind a gap is still seen.
+r = replay('gapdrop', { samples: [ sample(T0), sample(T0 + 60, { status: null }),
+	sample(T0 + 120, { status: status({ state: 1 }) }), sample(T0 + 180) ] });
+eq('recorder_replay_missing_status_then_drop_events', types(r.out?.events), [ 'o5_down', 'o5_up' ]);
+eq('recorder_replay_missing_status_then_drop_since', r.out?.o5_since, T0 + 180);
+
 // recorder_replay_without_debugfs: lab counters absent.
 samples = [];
 for (let i = 0; i < 3; i++) {

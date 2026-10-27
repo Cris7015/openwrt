@@ -196,7 +196,8 @@ function event(type, msg) {
 // Events between two consecutive samples. Alerts only fire on entering.
 export function detect(prev, cur, bip_delta, th) {
 	let out = [];
-	if (prev && cur) {
+	// A null state means omci.agent did not answer: not a transition.
+	if (prev?.state != null && cur?.state != null) {
 		if (cur.state == 5 && prev.state != 5)
 			push(out, event('o5_up'));
 		else if (prev.state == 5 && cur.state != 5)
