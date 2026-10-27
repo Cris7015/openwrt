@@ -237,11 +237,12 @@ function on_klog(line, t) {
 	}
 }
 
+// From the newest sample back: the overview asks for the summary every 5 s
+// and the ring holds 24 h, so walking all of it cost ~30 ms each time.
 function bip_last_hour(now) {
 	let sum = 0;
-	for (let s in st.m1)
-		if (s.t > now - 3600)
-			sum += s.bip;
+	for (let i = length(st.m1) - 1; i >= 0 && st.m1[i].t > now - 3600; i--)
+		sum += st.m1[i].bip;
 	return sum;
 }
 
