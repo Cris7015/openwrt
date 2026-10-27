@@ -4,8 +4,8 @@
  * started before calls, and never reset when a second line opens or closes.
  * Slots 4/6 have separate DMA slabs and separate userspace queues. */
 /*
- * Optional capture delay line, in 10 ms frames (0 = off, the default; at most
- * PCM_DUAL_MAX_HOLD). Each line's decoded capture frames wait dual_cap_hold
+ * Capture delay line, in 10 ms frames (0 = off; default 4, the most,
+ * PCM_DUAL_MAX_HOLD, which the hang-up tests of 26-oct needed). Each line's decoded capture frames wait dual_cap_hold
  * frames before they reach the kfifo. When the SLIC side turns the mute on
  * (loop opened), the frames still waiting -- the last dual_cap_hold*10 ms,
  * captured before the debounced hook bit and the poll caught up -- are zeroed
@@ -13,7 +13,7 @@
  * mute also blanks that much of the past. Latched per stream at open.
  */
 #define PCM_DUAL_MAX_HOLD	4
-static unsigned int dual_cap_hold;
+static unsigned int dual_cap_hold = PCM_DUAL_MAX_HOLD;
 module_param(dual_cap_hold, uint, 0644);
 MODULE_PARM_DESC(dual_cap_hold, "capture delay line in 10 ms frames (0-4) so the hang-up mute can blank the frames just before it");
 

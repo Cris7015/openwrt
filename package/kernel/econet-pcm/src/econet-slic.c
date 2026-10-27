@@ -367,13 +367,14 @@ static int zsi_mpi_read(u8 ec, u8 reg, u8 *buf, u8 len)
  * then settle only udelay(10) per byte.
  *
  * zsi_fast_gap_us (0 = keep zsi_gap_us, but with a tight range) applies to
- * READS only. A byte lost in a read garbles the answer, which the callers
+ * READS only. Its 50 us default is re-checked at every load in dual mode
+ * (slic_dual_fast_gap_check_locked) and dropped to 0 if a read fails. A byte lost in a read garbles the answer, which the callers
  * detect; a byte lost in a write could turn a data byte into a command
  * (EC_2 = 0x02 is the VP886 software-reset opcode), so writes never use it.
  */
-static int zsi_fast_gap_us;
+static int zsi_fast_gap_us = 50;
 module_param(zsi_fast_gap_us, int, 0644);
-MODULE_PARM_DESC(zsi_fast_gap_us, "post-ack settle (us) of the mute poller's device-register reads; 0 = zsi_gap_us");
+MODULE_PARM_DESC(zsi_fast_gap_us, "post-ack settle (us) of the mute poller's device-register reads; 0 = zsi_gap_us; checked at load in dual mode");
 
 static void zsi_settle_tight(int gap)
 {

@@ -98,7 +98,7 @@ MODULE_PARM_DESC(ring_trip_reads, "consecutive off-hook samples during the ON bu
  * doing its own slow read. Same bit, fresher; the managers' 40 ms reads stop
  * competing for the bus during calls.
  */
-static unsigned int dual_mute_poll_ms;
+static unsigned int dual_mute_poll_ms = 10;
 module_param(dual_mute_poll_ms, uint, 0644);
 MODULE_PARM_DESC(dual_mute_poll_ms, "in-call SIGREG poll period for the capture mute (ms); 0 = off, manager-driven only");
 static bool dual_hook_from_poll = true;
@@ -735,10 +735,43 @@ static const struct file_operations slic_dual_control_fops = {
 	.write = slic_dual_control_write, .llseek = default_llseek,
 };
 
+/*
+ * zsi_fast_gap_us defaults to 50 us, which was validated on one unit only.
+ * At load, with both lines idle and before any stream can open, read RCNPCN
+ * (expected 08 75) DUAL_FAST_CHECK_READS times the fast way; any error or
+ * wrong answer turns the fast gap off until the next load. Called with
+ * sd.lock held; returns the number of failed reads.
+ */
+#define DUAL_FAST_CHECK_READS	50
+
+static unsigned int slic_dual_fast_gap_check_locked(void)
+{
+	int gap = READ_ONCE(zsi_fast_gap_us);
+	unsigned int i, bad = 0;
+	u8 id[2];
+
+	if (gap <= 0)
+		return 0;
+	for (i = 0; i < DUAL_FAST_CHECK_READS; i++) {
+		if (zsi_dev_read_fast(0x73, id, sizeof(id), gap) ||
+		    id[0] != 0x08 || id[1] != 0x75) {
+			bad++;
+			zsi_resync_locked();
+		}
+	}
+	if (bad) {
+		WRITE_ONCE(zsi_fast_gap_us, 0);
+		dmp.fast_off++;
+	}
+	return bad;
+}
+
 static int slic_dual_init(void)
 {
 	int i, ret, registered = 0;
 	int old_ec = slic_ec, old_slot = slic_slot;
+	int fast_gap = READ_ONCE(zsi_fast_gap_us);
+	unsigned int fast_bad = 0;
 
 	pcm_en751221_voice_reset();
 	INIT_DELAYED_WORK(&dual_mute_work, slic_dual_mute_poll);
@@ -764,9 +797,17 @@ static int slic_dual_init(void)
 	}
 	slic_ec = old_ec;
 	slic_slot = old_slot;
+	if (!ret)
+		fast_bad = slic_dual_fast_gap_check_locked();
 	mutex_unlock(&sd.lock);
 	if (ret)
 		return ret;
+	if (fast_bad)
+		pr_warn("econet-slic: %u of %u fast ZSI reads at %d us failed at load: zsi_fast_gap_us -> 0\n",
+			fast_bad, DUAL_FAST_CHECK_READS, fast_gap);
+	else if (fast_gap > 0)
+		pr_info("econet-slic: fast ZSI reads at %d us checked (%u reads)\n",
+			fast_gap, DUAL_FAST_CHECK_READS);
 	ret = pcm_en751221_dual_start();
 	if (ret)
 		return ret;
