@@ -47,13 +47,25 @@ if [ -f "$stored/contacts" ]; then
 else
 	cp "$source/contacts" "$cfg/contacts"
 fi
-# No lab autodial: use only an explicitly configured per-line speed dial.
-if [ -f "$stored/speeddial" ]; then
-	cp "$stored/speeddial" "$cfg/speeddial"
-else
-	rm -f "$cfg/speeddial"
-fi
 chmod 600 "$cfg/config" "$cfg/accounts" "$cfg/contacts"
-# Never retain a keypad profile or a stale shared-ring-group jack selection
-# left by a previous managed configuration.
-rm -f "$cfg/dialing" "$cfg/audio_device" "$cfg/audio_device.tmp"
+# A managed profile (account_mode set) owns speeddial and dialing: the profile
+# step rewrites both right after this. Deleting them here left the running
+# manager without its dial plan for that window on every reload, and every
+# interface event of the selected network is a reload.
+managed=$(uci -q get "xr500v-voip.phone$line.account_mode" || true)
+if [ -z "$managed" ]; then
+	# No lab autodial: use only an explicitly configured per-line speed dial.
+	if [ -f "$stored/speeddial" ]; then
+		cp "$stored/speeddial" "$cfg/speeddial"
+	else
+		rm -f "$cfg/speeddial"
+	fi
+	# Never retain a keypad profile left by a previous managed configuration.
+	rm -f "$cfg/dialing"
+fi
+# The jack selection belongs to a running shared-ring-group manager, which
+# publishes it at start and before every call; a mode change restarts that
+# manager, so a stale selection cannot survive it.
+if [ "$line" != 1 ] || [ "$(uci -q get xr500v-voip.phone2.account_mode || true)" != shared ]; then
+	rm -f "$cfg/audio_device" "$cfg/audio_device.tmp"
+fi

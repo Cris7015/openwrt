@@ -1,6 +1,6 @@
 #!/usr/bin/ucode
 'use strict';
-import { readfile, writefile, chmod, stat, unlink } from 'fs';
+import { readfile, writefile, chmod, stat, unlink, rename } from 'fs';
 import { cursor } from 'uci';
 import { connect } from 'ubus';
 import { account_defaults, account_validate, account_render } from '/usr/share/xr500v-voip/accounts.uc';
@@ -37,8 +37,15 @@ if (!n?.up || !ip || !dev || !match(ip, /^[0-9.]+$/) || !match(dev, /^[a-zA-Z0-9
 	warn('voip: selected interface is not ready (IPv4 required)\n'); exit(3);
 }
 const dir = '/var/run/xr500v-voip/' + section;
+// Replaced atomically: the running manager reads dialing and speeddial on
+// every off-hook, and a reload re-renders them while it runs.
 function put(name, text) {
-	if (writefile(dir + '/' + name, text) != length(text) || !chmod(dir + '/' + name, 384)) die('runtime_write_failed');
+	let path = dir + '/' + name, tmp = path + '.tmp';
+	unlink(tmp);
+	if (writefile(tmp, text) != length(text) || !chmod(tmp, 384) || !rename(tmp, path)) {
+		unlink(tmp);
+		die('runtime_write_failed');
+	}
 }
 let base = readfile(dir + '/config');
 if (base == null) exit(2);
