@@ -32,8 +32,14 @@ const KLOG_MAX = 65536;
 // ring -> [bucket seconds, capacity, pending list]
 const RINGS = { m5: [ 300, 2016, 'p5' ], m30: [ 1800, 1440, 'p30' ] };
 const M1_CAP = 1440;
+// ±30 min around critical events, kept so "what happened before" still has
+// 1-minute detail once the event is older than the 1-minute ring (24 h).
+const WIN_HALF = 1800;
+const WIN_MAX_SPAN = 7200;	// close events share one window, up to 2 h
+const WIN_KEEP = 20;
+const WINDOWS_FILE = STATE_DIR + '/windows.json.gz';
 
-let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_day: 100 };
+let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_day: 100, windows_per_day: 10 };
 let th = thresholds(null);
 let sink = null;	// daemon only: event -> overlay
 
@@ -45,10 +51,13 @@ let st = {
 	// in O5 at least once since boot; until then an unused fiber port
 	// (WAN over Ethernet, say) raises no alert and no event
 	ever_o5: false,
+	windows: [], win_pending: null, win_dirty: false,
 	skipped: 0
 };
 
 let klog_path = KLOG_FILE, events_path = EVENTS_FILE;
+let windows_path = null;	// set by the daemon only: replays never write /etc
+let win_writes = { day: null, n: 0 };
 
 function num(text) {
 	if (text == null)
@@ -82,6 +91,64 @@ function kernel_up(line) {
 	return m ? int(m[1]) : null;
 }
 
+// gzip a JSON value to path through a synced temporary file.
+function write_gz(path, value) {
+	let raw = '/tmp/xr500v-gpon-write.json';
+	fs.writefile(raw, sprintf('%J', value));
+	let rc = system([ '/bin/sh', '-c', 'gzip -c "$1" > "$2.tmp" && sync && mv "$2.tmp" "$2"',
+		'write_gz', raw, path ]);
+	fs.unlink(raw);
+	return rc == 0;
+}
+
+// The JSON value in a gzip file, or null if missing, truncated or unreadable.
+function read_gz(path) {
+	if (!path || !fs.stat(path))
+		return null;
+	let p = fs.popen(sprintf('gzip -dc %s 2>/dev/null', path));
+	let text = p ? p.read('all') : null;
+	if (p)
+		p.close();
+	let data = null;
+	try { data = json(text); } catch (e) { data = null; }
+	return data;
+}
+
+function save_windows() {
+	st.win_dirty = false;
+	return windows_path ? write_gz(windows_path, { version: 1, windows: st.windows }) : false;
+}
+
+// Closes the pending window with the 1-minute samples it covers; writes the
+// file within the daily budget, otherwise the next persist() does.
+function capture_window(now, write) {
+	let p = st.win_pending, day = int(now / 86400);
+	st.win_pending = null;
+	ring_push(st.windows, { t0: p.t0, t1: p.t1, saved: now,
+		points: filter(st.m1, (s) => s.t >= p.t0 && s.t <= p.t1) }, WIN_KEEP);
+	st.win_dirty = true;
+	if (win_writes.day != day)
+		win_writes = { day, n: 0 };
+	if (write && win_writes.n < cfg.windows_per_day) {
+		win_writes.n++;
+		save_windows();
+	}
+}
+
+// A critical event at t opens a window, or stretches the pending one.
+function open_window(t) {
+	let p = st.win_pending;
+	if (!st.ever_o5)
+		return;		// an unused fiber port writes nothing
+	if (p && t >= p.t0 && t <= p.t1) {
+		p.t1 = (t + WIN_HALF < p.t0 + WIN_MAX_SPAN) ? t + WIN_HALF : p.t0 + WIN_MAX_SPAN;
+		return;
+	}
+	if (p)
+		capture_window(t, true);
+	st.win_pending = { t0: t - WIN_HALF, t1: t + WIN_HALF };
+}
+
 function add_event(t, ev) {
 	let e = { t, type: ev.type, severity: ev.severity, msg: ev.msg };
 	for (let k in [ 'n', 'flags' ])	/* the browser words the event with these */
@@ -90,6 +157,8 @@ function add_event(t, ev) {
 	ring_push(st.events, e, cfg.events_max);
 	if (sink)
 		sink(e);
+	if (e.severity == 'crit')
+		open_window(t);
 }
 
 // Closes the 5/30-min buckets the sample leaves behind, then queues it.
@@ -142,6 +211,10 @@ function ingest(raw) {
 		st.known = sample;
 	ring_push(st.m1, sample, M1_CAP);
 	bucket(sample);
+	// Due, or the clock stepped back before it: capture what there is.
+	let wp = st.win_pending;
+	if (wp && (sample.t >= wp.t1 || sample.t < wp.t0))
+		capture_window(sample.t, true);
 	st.last = sample;
 	st.info = s;
 	if (raw.status?.serial)
@@ -196,6 +269,15 @@ function summary(now) {
 	};
 }
 
+function m1_point(s) {
+	return {
+		t: s.t, n: 1,
+		rx_min: s.rx_nw, rx_avg: s.rx_nw, rx_max: s.rx_nw,
+		temp_min: s.temp_mc, temp_avg: s.temp_mc, temp_max: s.temp_mc,
+		bip: s.bip
+	};
+}
+
 function history(window) {
 	if (window == '7d' || window == '30d') {
 		let ring = (window == '7d') ? 'm5' : 'm30', spec = RINGS[ring];
@@ -204,12 +286,35 @@ function history(window) {
 			push(points, aggregate(st[spec[2]], spec[0])[0]);
 		return { window, step: spec[0], points };
 	}
-	return { window: '24h', step: 60, points: map(st.m1, (s) => ({
-		t: s.t, n: 1,
-		rx_min: s.rx_nw, rx_avg: s.rx_nw, rx_max: s.rx_nw,
-		temp_min: s.temp_mc, temp_avg: s.temp_mc, temp_max: s.temp_mc,
-		bip: s.bip
-	})) };
+	return { window: '24h', step: 60, points: map(st.m1, m1_point) };
+}
+
+function covered(t) {
+	for (let w in st.windows)
+		if (t >= w.t0 && t <= w.t1)
+			return true;
+	return false;
+}
+
+// What happened around t: a saved window that holds it, else the 1-minute
+// ring, else the 5-minute ring; ranges include both ends.
+function around(t) {
+	let r0 = t - WIN_HALF, r1 = t + WIN_HALF, res = null, pts;
+	for (let w in st.windows)
+		if (t >= w.t0 && t <= w.t1)
+			res = { t0: w.t0, t1: w.t1, step: 60, source: 'saved', points: map(w.points, m1_point) };
+	if (!res) {
+		pts = filter(st.m1, (s) => s.t >= r0 && s.t <= r1);
+		if (length(pts))
+			res = { t0: r0, t1: r1, step: 60, source: '1min', points: map(pts, m1_point) };
+	}
+	if (!res) {
+		pts = filter(history('7d').points, (q) => q.t >= r0 && q.t <= r1);
+		res = length(pts) ? { t0: r0, t1: r1, step: RINGS.m5[0], source: '5min', points: pts }
+			: { t0: r0, t1: r1, step: 60, source: 'none', points: [] };
+	}
+	res.events = filter(st.events, (e) => e.t >= res.t0 && e.t <= res.t1);
+	return res;
 }
 
 function events_list(limit) {
@@ -217,32 +322,22 @@ function events_list(limit) {
 	if (!(limit > 0) || limit > n)
 		limit = n;
 	for (let i = n - 1; i >= n - limit; i--)
-		push(out, st.events[i]);
+		push(out, covered(st.events[i].t) ? { ...st.events[i], win: true } : st.events[i]);
 	return out;
 }
 
 function save_snapshot(path) {
-	let raw = '/tmp/xr500v-gpon-snapshot.json';
-	fs.writefile(raw, sprintf('%J', {
+	return write_gz(path, {
 		version: 1, saved: time(),
 		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30
-	}));
-	let rc = system([ '/bin/sh', '-c', 'gzip -c "$1" > "$2.tmp" && sync && mv "$2.tmp" "$2"',
-		'snapshot', raw, path ]);
-	fs.unlink(raw);
-	return rc == 0;
+	});
 }
 
 // A missing, truncated or otherwise unreadable snapshot starts empty rings.
 function load_snapshot(path) {
 	if (!fs.stat(path))
 		return false;
-	let p = fs.popen(sprintf('gzip -dc %s 2>/dev/null', path));
-	let text = p ? p.read('all') : null;
-	if (p)
-		p.close();
-	let data = null;
-	try { data = json(text); } catch (e) { data = null; }
+	let data = read_gz(path);
 	if (type(data) != 'object' || type(data.m1) != 'array') {
 		warn(`xr500v-gpon: ignoring unreadable snapshot ${path}\n`);
 		return false;
@@ -288,6 +383,14 @@ function load_events(now) {
 	}
 }
 
+// A missing or unreadable windows file starts with none.
+function load_windows(now) {
+	let d = read_gz(windows_path), day = int(now / 86400);
+	if (type(d?.windows) == 'array')
+		st.windows = filter(d.windows, (w) => type(w) == 'object' && w.t0 <= w.t1 && type(w.points) == 'array');
+	win_writes = { day, n: length(filter(st.windows, (w) => int(w.saved / 86400) == day)) };
+}
+
 // After a restart: the last answered sample, if recent, so a warning that
 // already fired does not fire again and a link that was up counts as O5.
 function restore_known(now) {
@@ -306,6 +409,10 @@ function restore_known(now) {
 
 function persist() {
 	let ok = save_snapshot(SNAPSHOT);
+	if (st.win_pending)
+		capture_window(time(), false);
+	if (st.win_dirty)
+		save_windows();
 	let tmp = events_path + '.tmp';
 	/* a full overlay must not truncate the file that is there */
 	if (fs.writefile(tmp, join('', map(st.events, (e) => sprintf('%J\n', e)))) != null)
@@ -316,7 +423,7 @@ function persist() {
 function load_config() {
 	let uci = cursor();
 	let m = uci.get_all('xr500v-gpon', 'main') || {};
-	for (let k in [ 'interval', 'persist_hours', 'events_max', 'event_writes_per_day' ]) {
+	for (let k in [ 'interval', 'persist_hours', 'events_max', 'event_writes_per_day', 'windows_per_day' ]) {
 		let n = num(m[k]);
 		if (n > 0)
 			cfg[k] = n;
@@ -397,6 +504,10 @@ function replay(path) {
 	if (fx.boot != null)
 		boot_of = () => fx.boot;
 	let first = length(fx.samples) ? fx.samples[0].t : time();
+	if (fx.windows_file)
+		windows_path = fx.windows_file;
+	if (fx.windows_per_day > 0)
+		cfg.windows_per_day = fx.windows_per_day;
 	if (fx.events_file) {
 		events_path = fx.events_file;
 		if (fx.writes_per_day > 0)
@@ -433,7 +544,10 @@ function replay(path) {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
 		counters: summary(now).counters, skipped: st.skipped, last: st.last,
-		o5_since: wall(st.o5_up, st.o5_t), ever_o5: st.ever_o5
+		o5_since: wall(st.o5_up, st.o5_t), ever_o5: st.ever_o5,
+		windows: map(st.windows, (w) => ({ t0: w.t0, t1: w.t1, n: length(w.points) })),
+		pending: st.win_pending, listed: events_list(0),
+		around: (fx.around != null) ? around(fx.around) : null
 	}));
 }
 
@@ -443,6 +557,8 @@ function daemon() {
 	if (load_snapshot(SNAPSHOT))
 		restore_known(time());
 	load_events(time());
+	windows_path = WINDOWS_FILE;
+	load_windows(time());
 	sink = append_event;
 	klog_init();
 	startup_scan();
@@ -455,6 +571,7 @@ function daemon() {
 		summary: { args: sid, call: () => summary(time()) },
 		history: { args: { ...sid, window: '' }, call: (req) => history(req.args.window) },
 		events: { args: { ...sid, limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
+		around: { args: { ...sid, t: 0 }, call: (req) => around(req.args.t) },
 		persist: { args: sid, call: () => ({ ok: persist() }) },
 		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});

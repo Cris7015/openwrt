@@ -5,6 +5,7 @@ config monitor 'main'
 	option persist_hours '6'
 	option events_max '500'
 	option event_writes_per_day '100'
+	option windows_per_day '10'
 
 config thresholds 'thresholds'
 	option rx_warn_dbm '-25'

@@ -197,6 +197,91 @@ eq('recorder_budget_survives_restart_event', 'resync' in types(r.out?.events), t
 eq('recorder_budget_survives_restart_file',
 	length(filter(split(fs.readfile(`${BASE}/budget2.jsonl`) || '', '\n'), length)), 2);
 
+// --- v2: saved ±30 min windows around critical events ---
+// A Deactivate kernel line at `up` seconds after a boot at T0 + 2300.
+function deact_at(up) {
+	return { t: T0 + 2300 + up, line: sprintf('[%6d.000000] airoha-xpon 1fb60000.xmac: restarting GPON after Deactivate_ONU-ID from the OLT', up) };
+}
+
+function every(step, from, to) {
+	let s = [];
+	for (let t = from; t <= to; t += step)
+		push(s, sample(t));
+	return s;
+}
+
+function gz_windows(path) {
+	let p = fs.popen(`gzip -dc ${path} 2>/dev/null`);
+	let text = p ? p.read('all') : null;
+	if (p)
+		p.close();
+	let d = null;
+	try { d = json(text); } catch (e) { }
+	return d?.windows;
+}
+
+// recorder_window_saved_after_half_hour
+fs.unlink(`${BASE}/win1.json.gz`);
+r = replay('win1', { boot: T0 + 2300, windows_file: `${BASE}/win1.json.gz`,
+	klog: [ deact_at(100) ], samples: every(60, T0, T0 + 5940) });
+eq('recorder_window_saved_after_half_hour_count', length(r.out?.windows), 1);
+eq('recorder_window_saved_after_half_hour_range', [ r.out?.windows?.[0]?.t0, r.out?.windows?.[0]?.t1 ], [ T0 + 600, T0 + 4200 ]);
+eq('recorder_window_saved_after_half_hour_points', r.out?.windows?.[0]?.n, 61);
+eq('recorder_window_saved_after_half_hour_file', length(gz_windows(`${BASE}/win1.json.gz`)), 1);
+eq('recorder_window_marks_event', filter(r.out?.listed || [], (e) => e.type == 'deactivate')[0]?.win, true);
+
+// recorder_window_not_before_half_hour
+r = replay('win2', { boot: T0 + 2300, klog: [ deact_at(100) ], samples: every(60, T0, T0 + 3000) });
+eq('recorder_window_not_before_half_hour', length(r.out?.windows), 0);
+
+// recorder_window_merges_close_events
+r = replay('win3', { boot: T0 + 2300, klog: [ deact_at(100), deact_at(700) ], samples: every(60, T0, T0 + 5940) });
+eq('recorder_window_merges_close_events_count', length(r.out?.windows), 1);
+eq('recorder_window_merges_close_events_range', [ r.out?.windows?.[0]?.t0, r.out?.windows?.[0]?.t1 ], [ T0 + 600, T0 + 4800 ]);
+
+// recorder_window_caps: 25 critical events 2 h apart, 20 windows kept
+let kl = [];
+for (let i = 0; i < 25; i++)
+	push(kl, { t: T0 + 3600 + i * 7200, line: sprintf('[%6d.000000] airoha-xpon 1fb60000.xmac: restarting GPON after Deactivate_ONU-ID from the OLT', 3600 + i * 7200) });
+r = replay('win4', { boot: T0, windows_per_day: 30, klog: kl, samples: every(600, T0, T0 + 3600 + 25 * 7200) });
+eq('recorder_window_caps_count', length(r.out?.windows), 20);
+eq('recorder_window_caps_oldest', r.out?.windows?.[0]?.t0, T0 + 3600 + 5 * 7200 - 1800);
+
+// recorder_window_daily_cap: 3 windows the same day, 2 written
+fs.unlink(`${BASE}/win5.json.gz`);
+r = replay('win5', { boot: T0, windows_file: `${BASE}/win5.json.gz`, windows_per_day: 2,
+	klog: slice(kl, 0, 3), samples: every(600, T0, T0 + 21600) });
+eq('recorder_window_daily_cap_ram', length(r.out?.windows), 3);
+eq('recorder_window_daily_cap_file', length(gz_windows(`${BASE}/win5.json.gz`)), 2);
+
+// recorder_window_after_clock_step: NTP steps the clock while a window is pending
+r = replay('win6', { boot: T0 + 2300, klog: [ deact_at(100) ],
+	samples: [ ...every(60, T0, T0 + 3000), sample(T0 + 90000) ] });
+eq('recorder_window_after_clock_step_count', length(r.out?.windows), 1);
+ok('recorder_window_after_clock_step_range', r.out?.windows?.[0]?.t0 <= r.out?.windows?.[0]?.t1 && r.out?.windows?.[0]?.n <= 61);
+eq('recorder_window_after_clock_step_pending', r.out?.pending, null);
+
+// recorder_nofiber_no_window: a Deactivate while the port never reached O5
+samples = [];
+for (let i = 0; i < 100; i++)
+	push(samples, sample(T0 + 60 * i, { status: NOLIGHT }));
+r = replay('win7', { boot: T0 + 2300, klog: [ deact_at(100) ], samples });
+eq('recorder_nofiber_no_window', length(r.out?.windows), 0);
+
+// recorder_around_fallback: no saved window -> rings, then nothing
+r = replay('around1', { samples: every(60, T0, T0 + 5940), around: T0 + 3000 });
+eq('recorder_around_fallback_1min', [ r.out?.around?.source, length(r.out?.around?.points) ], [ '1min', 61 ]);
+let m5 = [];
+for (let i = 0; i < 24; i++)
+	push(m5, { t: T0 + 300 * i, n: 5, rx_min: 8400, rx_avg: 8400, rx_max: 8400,
+		temp_min: 50000, temp_avg: 50000, temp_max: 50000, bip: 0 });
+fs.writefile(`${BASE}/m5only.json`, sprintf('%J', { version: 1, m1: [], m5, m30: [], p5: [], p30: [] }));
+system(`gzip -c ${BASE}/m5only.json > ${BASE}/m5only.json.gz`);
+r = replay('around2', { snapshot: `${BASE}/m5only.json.gz`, samples: [], around: T0 + 3600 });
+eq('recorder_around_fallback_5min', [ r.out?.around?.source, r.out?.around?.step, length(r.out?.around?.points) ], [ '5min', 300, 13 ]);
+r = replay('around3', { samples: every(60, T0, T0 + 600), around: T0 - 100000 });
+eq('recorder_around_fallback_none', [ r.out?.around?.source, length(r.out?.around?.points) ], [ 'none', 0 ]);
+
 // load_snapshot_tolerates_corrupt_file: power cut during a snapshot write.
 fs.writefile(`${BASE}/bad.json.gz`, '\x1f\x8b\x08\x00garbage');
 r = replay('corrupt', { snapshot: `${BASE}/bad.json.gz`,

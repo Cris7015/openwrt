@@ -29,6 +29,10 @@ c = call('events', { limit: 5, ubus_rpc_session: SID });
 eq('ubus_events_with_session_err', c.err, null);
 ok('ubus_events_with_session_list', type(c.r?.events) == 'array');
 
+c = call('around', { t: time() - 60, ubus_rpc_session: SID });
+eq('ubus_around_with_session_err', c.err, null);
+ok('ubus_around_with_session_points', type(c.r?.points) == 'array');
+
 // ubus_methods_without_session: the CLI and the init script.
 eq('ubus_summary_plain_err', call('summary').err, null);
 
