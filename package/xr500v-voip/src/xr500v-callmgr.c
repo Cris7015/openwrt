@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <json-c/json.h>
+#include "redact.h"
 
 static char hook_path[128] = "/sys/kernel/debug/econet-slic/hook";
 static char ring_path[128] = "/sys/kernel/debug/econet-slic/ring";

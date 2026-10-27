@@ -74,11 +74,15 @@ render_reject() {
 	case "$mode" in off|all|list) ;; *) mode=off ;; esac
 	case "$code" in 404|410|480|486|603|604) ;; *) logger -t voip "reject_code '$code' invalid, rejection off"; mode=off ;; esac
 	mkdir -p "$RUNDIR"
+	# The list holds phone numbers: root-only. A leftover .tmp would keep
+	# its old mode through the redirection, so start from a fresh file.
+	rm -f "$RUNDIR/reject.conf.tmp"
+	( umask 077
 	{
 		echo "mode $mode"
 		echo "code $code"
 		config_list_foreach globals reject_number voip_reject_number
-	} > "$RUNDIR/reject.conf.tmp" && mv "$RUNDIR/reject.conf.tmp" "$RUNDIR/reject.conf"
+	} > "$RUNDIR/reject.conf.tmp" ) && mv "$RUNDIR/reject.conf.tmp" "$RUNDIR/reject.conf"
 }
 
 start_service() {

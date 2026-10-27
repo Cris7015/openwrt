@@ -181,7 +181,15 @@ static void handle_call_event(int s, const char *payload)
 	json_tokener_free(tok);
 	token = event_string(obj, "token");
 	if (event_true(obj, "response")) {
-		if (token && !strncmp(token, "diag-", 5)) logmsg(payload);
+		if (token && !strncmp(token, "diag-", 5)) {
+			char *m = malloc(len + 1);	/* redaction never grows it */
+
+			if (m) {
+				redact_uris(m, len + 1, payload);
+				logmsg(m);
+				free(m);
+			}
+		}
 		if (token && !strcmp(token, "callmgr-reginfo") && event_true(obj, "ok"))
 			reg_reginfo(event_string(obj, "data"));
 		if (token && !strcmp(token, "callmgr-dial") &&

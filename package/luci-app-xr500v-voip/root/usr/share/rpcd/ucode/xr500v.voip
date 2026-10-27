@@ -1,6 +1,6 @@
 'use strict';
 
-import { readfile, stat, lstat, mkdir, open, chmod } from 'fs';
+import { readfile, stat, lstat, mkdir, open, chmod, lsdir, unlink } from 'fs';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 import { account_defaults, account_validate, sip_uri } from '/usr/share/xr500v-voip/accounts.uc';
@@ -253,6 +253,21 @@ function idle_check() {
 	return null;
 }
 
+// Every apply writes a backup, and each one holds every password the
+// accounts ever stored: keep only the newest BACKUPS_KEPT.
+const BACKUPS_KEPT = 10;
+
+function backup_order(a, b) {
+	let x = match(a, /^config-([0-9]+)-([0-9]+)$/), y = match(b, /^config-([0-9]+)-([0-9]+)$/);
+	return (+x[1] - +y[1]) || (+x[2] - +y[2]);
+}
+
+function prune_backups(dir) {
+	let names = sort(filter(lsdir(dir) || [], (n) => match(n, /^config-[0-9]+-[0-9]+$/)), backup_order);
+	while (length(names) > BACKUPS_KEPT)
+		unlink(dir + '/' + shift(names));
+}
+
 function backup_config(raw) {
 	const dir = '/root/xr500v-voip-ui-backups';
 	let info = lstat(dir);
@@ -264,7 +279,10 @@ function backup_config(raw) {
 	let written = f.write(raw);
 	let flushed = f.flush();
 	let closed = f.close();
-	return written == length(raw) && flushed && closed ? path : null;
+	if (written != length(raw) || !flushed || !closed)
+		return null;
+	prune_backups(dir);
+	return path;
 }
 
 function restart_voice() { return system([ '/etc/init.d/voip', 'restart' ]); }

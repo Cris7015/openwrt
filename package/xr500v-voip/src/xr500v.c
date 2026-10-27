@@ -538,7 +538,8 @@ static int io_get(void)
 		}
 	}
 	if (getenv("XR500V_CAPTAP"))
-		io.tap_fd = open("/tmp/xr500v_captap.raw", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		io.tap_fd = open("/tmp/xr500v_captap.raw",
+				 O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
 	memset(&g_dtmf, 0, sizeof(g_dtmf));
 	re_atomic_rlx_set(&io.run, true);
 	err = thread_create_name(&io.cap_thread, "xr500v_cap", cap_thread, NULL);
