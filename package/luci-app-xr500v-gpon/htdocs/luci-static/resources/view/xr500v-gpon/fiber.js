@@ -8,6 +8,7 @@
 'require form';
 'require xr500v-gpon.graph as graph';
 'require xr500v-gpon.analysis as analysis';
+'require xr500v-gpon.heatmap as heatmap';
 
 var callSummary = rpc.declare({
 	object: 'xr500v.gpon',
@@ -130,6 +131,7 @@ function threshold(name, def) {
 return view.extend({
 	window: '24h',
 	seq: 0,		/* bumped by every window change: older replies are dropped */
+	pseq: 0,	/* the same for the Patterns tab */
 
 	load: function() {
 		return Promise.all([
@@ -166,12 +168,69 @@ return view.extend({
 		if (tip.more)
 			rows.push(E('div', {}, [ _('+%d more').format(tip.more) ]));
 
+		this.placeTip(rows, cx, cy);
+	},
+
+	/* Shows the box next to the pointer, inside the window */
+	placeTip: function(rows, cx, cy) {
+		var w, h;
+
 		dom.content(this.tip, rows);
 		this.tip.style.display = 'block';
 		w = this.tip.offsetWidth;
 		h = this.tip.offsetHeight;
 		this.tip.style.left = ((cx + 14 + w > window.innerWidth - 8) ? Math.max(8, cx - 14 - w) : cx + 14) + 'px';
 		this.tip.style.top = ((cy + 14 + h > window.innerHeight - 8) ? Math.max(8, cy - 14 - h) : cy + 14) + 'px';
+	},
+
+	/* The Patterns map's box: one hour of one day */
+	showCell: function(info, cx, cy) {
+		var c, rows;
+
+		if (!info) {
+			this.tip.style.display = 'none';
+			return;
+		}
+		c = info.cell;
+		rows = [ E('strong', {}, [ '%s · %02d:00–%02d:00'.format(info.label, info.hour, (info.hour + 1) % 24) ]) ];
+		if (!c.seen && !c.crit && !c.warn && !c.info) {
+			rows.push(E('div', {}, [ _('No data') ]));
+		} else {
+			rows.push(E('div', {}, [ _('BIP errors') + ': ' + c.bip ]));
+			if (c.crit)
+				rows.push(E('div', {}, [ _('Critical events: %d').format(c.crit) ]));
+			if (c.warn)
+				rows.push(E('div', {}, [ _('Warnings: %d').format(c.warn) ]));
+			if (c.info)
+				rows.push(E('div', {}, [ _('Other events: %d').format(c.info) ]));
+			if (!c.crit && !c.warn && !c.info)
+				rows.push(E('div', {}, [ _('No events') ]));
+		}
+		this.placeTip(rows, cx, cy);
+	},
+
+	/* Last 30 days, fetched when the tab is opened: the 30-day history is
+	 * the largest reply and most visits never look at it. */
+	loadPatterns: function() {
+		var seq = ++this.pseq;
+
+		dom.content(this.patterns, E('em', {}, [ _('Loading…') ]));
+		return Promise.all([
+			L.resolveDefault(callSummary(), {}),
+			L.resolveDefault(callHistory('30d'), {}),
+			L.resolveDefault(callEvents(EVENTS_KEPT), [])
+		]).then(L.bind(function(res) {
+			var now = res[0].now || Math.floor(Date.now() / 1000),
+			    map = analysis.heatmap(res[1].points || [], res[2], now, 30),
+			    any = map.some(function(d) {
+				return d.hours.some(function(c) { return c.seen || c.crit || c.warn || c.info; });
+			    });
+
+			if (seq != this.pseq)
+				return;
+			dom.content(this.patterns, any ? heatmap.render(map, now, L.bind(this.showCell, this))
+				: E('em', {}, [ _('No data yet') ]));
+		}, this));
 	},
 
 	/* zoom: an `around` reply, drawn instead of the chosen window */
@@ -367,6 +426,7 @@ return view.extend({
 		}, this));
 
 		this.tip = E('div', { 'style': TIP_STYLE });
+		this.patterns = E('div', {}, [ E('em', {}, [ _('Loading…') ]) ]);
 		this.evData = events;
 		this.graphs = E('div', {}, this.renderGraphs(history, summary));
 		this.counters = E('div', {}, this.renderCounters(summary));
@@ -379,6 +439,14 @@ return view.extend({
 					E('div', { 'class': 'cbi-section' }, [
 						E('div', {}, [ E('strong', {}, [ _('Window:') ]), ' ' ].concat(this.buttons)),
 						this.graphs
+					])
+				]),
+				E('div', { 'data-tab': 'patterns', 'data-tab-title': _('Patterns') }, [
+					E('div', { 'class': 'cbi-section' }, [
+						E('div', { 'class': 'cbi-section-descr' }, [
+							_('Errors and events per hour over the last 30 days. A problem that comes back at the same time of day shows up as a column.')
+						]),
+						this.patterns
 					])
 				]),
 				E('div', { 'data-tab': 'counters', 'data-tab-title': _('Counters') }, [
@@ -412,6 +480,15 @@ return view.extend({
 
 			/* the tab menu is inserted before the group: it needs a parent */
 			ui.tabs.initTabGroup(tabs.childNodes);
+
+			/* LuCI reopens the last tab: load the map now if that is this one */
+			var ptab = root.querySelector('.cbi-tabmenu li[data-tab="patterns"] a'),
+			    ppane = tabs.querySelector('div[data-tab="patterns"]');
+
+			if (ptab)
+				ptab.addEventListener('click', L.bind(this.loadPatterns, this));
+			if (ppane && ppane.getAttribute('data-tab-active') == 'true')
+				this.loadPatterns();
 			poll.add(L.bind(this.refresh, this), 60);
 
 			return root;
