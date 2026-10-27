@@ -76,6 +76,19 @@ ok('evaluate_deact_old', !has(r.alerts, 'deactivate_recent'));
 r = evaluate(sample({}), { bip_last_hour: 3 }, th);
 ok('evaluate_bip_hour', has(r.alerts, 'bip_hour'));
 
+// v2: BIP burst means MORE than the threshold; 0 is not a valid threshold.
+eq('thresholds_bip_burst_zero_defaults', thresholds({ bip_burst_per_min: '0' }).bip_burst_per_min, 10);
+eq('detect_bip_burst_at_threshold_quiet', types(detect(sample({}), sample({}), 10, th)), []);
+eq('detect_bip_burst_carries_n', detect(sample({}), sample({}), 12, th)[0].n, 12);
+eq('detect_bosa_alarm_carries_flags', filter(detect(sample({ alarms: 0 }), sample({ alarms: 4 }), 0, th),
+	(e) => e.type == 'bosa_alarm')[0].flags, 4);
+
+// v2: never in O5 since boot and no light = no fiber, not a fault.
+r = evaluate(sample({ state: 1, rx_nw: null }), { ever_o5: false }, th);
+eq('evaluate_nofiber_health', r.health, 'nofiber');
+eq('evaluate_nofiber_alerts', length(r.alerts), 0);
+eq('evaluate_drop_after_o5_is_crit', evaluate(sample({ state: 1, rx_nw: null }), { ever_o5: true }, th).health, 'crit');
+
 // An unanswered omci.agent call is "no data", not a link alarm; alerts that
 // do not depend on it still count.
 r = evaluate(normalize_status(null), {}, th);

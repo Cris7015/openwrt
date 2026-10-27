@@ -42,6 +42,9 @@ let st = {
 	last: null, known: null, info: null, serial: null,
 	// moments kept as uptime when known (immune to NTP steps), else wall time
 	o5_up: null, o5_t: null, deact: 0, deact_up: null, deact_t: null,
+	// in O5 at least once since boot; until then an unused fiber port
+	// (WAN over Ethernet, say) raises no alert and no event
+	ever_o5: false,
 	skipped: 0
 };
 
@@ -81,6 +84,9 @@ function kernel_up(line) {
 
 function add_event(t, ev) {
 	let e = { t, type: ev.type, severity: ev.severity, msg: ev.msg };
+	for (let k in [ 'n', 'flags' ])	/* the browser words the event with these */
+		if (ev[k] != null)
+			e[k] = ev[k];
 	ring_push(st.events, e, cfg.events_max);
 	if (sink)
 		sink(e);
@@ -120,6 +126,7 @@ function ingest(raw) {
 	// Unknown state (no answer from omci.agent) keeps the link timeline;
 	// transitions compare against the last sample the agent answered.
 	if (sample.state == 5) {
+		st.ever_o5 = true;
 		if (st.o5_up == null && st.o5_t == null) {
 			st.o5_up = raw.up;
 			st.o5_t = sample.t;
@@ -128,8 +135,9 @@ function ingest(raw) {
 		st.o5_up = st.o5_t = null;
 	}
 
-	for (let ev in detect(st.known, sample, sample.bip, th))
-		add_event(sample.t, ev);
+	if (st.ever_o5)
+		for (let ev in detect(st.known, sample, sample.bip, th))
+			add_event(sample.t, ev);
 	if (sample.state != null)
 		st.known = sample;
 	ring_push(st.m1, sample, M1_CAP);
@@ -152,6 +160,7 @@ function on_klog(line, t) {
 	} else if (index(line, 'GPON netdev link ready') >= 0) {
 		st.o5_up = up;
 		st.o5_t = t;
+		st.ever_o5 = true;
 	}
 }
 
@@ -166,7 +175,7 @@ function bip_last_hour(now) {
 function assess(now) {
 	return evaluate(st.last, {
 		now, bip_last_min: st.last?.bip, bip_last_hour: bip_last_hour(now),
-		last_deact_t: wall(st.deact_up, st.deact_t)
+		last_deact_t: wall(st.deact_up, st.deact_t), ever_o5: st.ever_o5
 	}, th);
 }
 
@@ -174,7 +183,7 @@ function summary(now) {
 	let l = st.last, i = st.info || {}, a = assess(now);
 	return {
 		now, stale: !l || now - l.t > 3 * cfg.interval,
-		health: a.health, alerts: a.alerts,
+		health: a.health, alerts: a.alerts, ever_o5: st.ever_o5,
 		state: l?.state, o5_since: wall(st.o5_up, st.o5_t),
 		olt: { vendor: i.olt_vendor, version: i.olt_version, profile: i.olt_profile },
 		onu_id: i.onu_id, fec: { ds: i.fec_ds, us: i.fec_us },
@@ -218,7 +227,7 @@ function save_snapshot(path) {
 		version: 1, saved: time(),
 		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30
 	}));
-	let rc = system([ '/bin/sh', '-c', 'gzip -c "$1" > "$2.tmp" && mv "$2.tmp" "$2"',
+	let rc = system([ '/bin/sh', '-c', 'gzip -c "$1" > "$2.tmp" && sync && mv "$2.tmp" "$2"',
 		'snapshot', raw, path ]);
 	fs.unlink(raw);
 	return rc == 0;
@@ -264,20 +273,43 @@ function append_event(e) {
 	}
 }
 
-function load_events() {
-	let text = fs.readfile(events_path);
+// Also recounts today's writes, so a restart does not reset the budget.
+function load_events(now) {
+	let text = fs.readfile(events_path), today = int(now / 86400);
+	writes = { day: today, n: 0, crit: 0 };
 	for (let line in split(text || '', '\n')) {
+		let e = null;
 		if (!length(line))
 			continue;
-		try { ring_push(st.events, json(line), cfg.events_max); } catch (e) { }
+		try { e = json(line); } catch (err) { continue; }
+		ring_push(st.events, e, cfg.events_max);
+		if (int(e?.t / 86400) == today)
+			writes[(e.severity == 'crit') ? 'crit' : 'n']++;
+	}
+}
+
+// After a restart: the last answered sample, if recent, so a warning that
+// already fired does not fire again and a link that was up counts as O5.
+function restore_known(now) {
+	for (let i = length(st.m1) - 1; i >= 0; i--) {
+		let s = st.m1[i];
+		if (s.state == null)
+			continue;
+		if (now - s.t <= 3 * cfg.interval) {
+			st.known = s;
+			if (s.state == 5)
+				st.ever_o5 = true;
+		}
+		return;
 	}
 }
 
 function persist() {
 	let ok = save_snapshot(SNAPSHOT);
 	let tmp = events_path + '.tmp';
-	fs.writefile(tmp, join('', map(st.events, (e) => sprintf('%J\n', e))));
-	fs.rename(tmp, events_path);
+	/* a full overlay must not truncate the file that is there */
+	if (fs.writefile(tmp, join('', map(st.events, (e) => sprintf('%J\n', e)))) != null)
+		fs.rename(tmp, events_path);
 	return ok;
 }
 
@@ -305,6 +337,7 @@ function startup_scan() {
 		} else if (index(line, 'GPON netdev link ready') >= 0) {
 			st.o5_up = kernel_up(line);
 			st.o5_t = null;
+			st.ever_o5 = true;
 		}
 	}
 	p.close();
@@ -363,18 +396,20 @@ function replay(path) {
 	let fx = json(fs.readfile(path));
 	if (fx.boot != null)
 		boot_of = () => fx.boot;
+	let first = length(fx.samples) ? fx.samples[0].t : time();
 	if (fx.events_file) {
 		events_path = fx.events_file;
 		if (fx.writes_per_day > 0)
 			cfg.event_writes_per_day = fx.writes_per_day;
+		load_events(first);
 		sink = append_event;
 	}
 	if (fx.klog_file) {
 		klog_path = fx.klog_file;
 		klog_init();
 	}
-	if (fx.snapshot)
-		load_snapshot(fx.snapshot);
+	if (fx.snapshot && load_snapshot(fx.snapshot))
+		restore_known(first);
 	let klog = fx.klog || [], k = 0, extra = fx.klog_append || [], x = 0;
 	for (let raw in fx.samples || []) {
 		for (; k < length(klog) && klog[k].t <= raw.t; k++)
@@ -398,15 +433,16 @@ function replay(path) {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
 		counters: summary(now).counters, skipped: st.skipped, last: st.last,
-		o5_since: wall(st.o5_up, st.o5_t)
+		o5_since: wall(st.o5_up, st.o5_t), ever_o5: st.ever_o5
 	}));
 }
 
 function daemon() {
 	load_config();
 	fs.mkdir(STATE_DIR);
-	load_snapshot(SNAPSHOT);
-	load_events();
+	if (load_snapshot(SNAPSHOT))
+		restore_known(time());
+	load_events(time());
 	sink = append_event;
 	klog_init();
 	startup_scan();

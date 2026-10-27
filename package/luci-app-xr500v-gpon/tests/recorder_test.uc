@@ -153,6 +153,50 @@ eq('recorder_crit_events_bypass_write_budget_warn',
 eq('recorder_crit_events_bypass_write_budget_crit',
 	length(filter(written, (l) => index(l, '"o5_down"') >= 0)), 1);
 
+// recorder_nofiber_quiet: never in O5 and no light (e.g. WAN over Ethernet).
+const NOLIGHT = status({ state: 1, bosa_rx_power_nw: 0 });
+samples = [];
+for (let i = 0; i < 20; i++)
+	push(samples, sample(T0 + 60 * i, { status: NOLIGHT }));
+r = replay('nofiber', { samples });
+eq('recorder_nofiber_quiet_events', types(r.out?.events), []);
+eq('recorder_nofiber_quiet_health', r.out?.health, 'nofiber');
+eq('recorder_nofiber_quiet_ever_o5', r.out?.ever_o5, false);
+
+// recorder_first_o5_ends_nofiber: the first O5 ends the quiet state; a later
+// drop is a real fault.
+samples = [];
+for (let i = 0; i < 5; i++)
+	push(samples, sample(T0 + 60 * i, { status: NOLIGHT }));
+for (let i = 5; i < 10; i++)
+	push(samples, sample(T0 + 60 * i));
+push(samples, sample(T0 + 600, { status: status({ state: 1 }) }));
+r = replay('firsto5', { samples });
+eq('recorder_first_o5_ends_nofiber_events', types(r.out?.events), [ 'o5_up', 'o5_down' ]);
+eq('recorder_first_o5_ends_nofiber_ever_o5', r.out?.ever_o5, true);
+eq('recorder_first_o5_ends_nofiber_health', r.out?.health, 'crit');
+
+// recorder_restart_does_not_refire: a restart keeps the last known sample, so
+// a warning that already fired does not fire again.
+const WEAK = status({ bosa_rx_power_nw: 3000 });
+fs.unlink(`${BASE}/warn.json.gz`);
+r = replay('warn1', { save: `${BASE}/warn.json.gz`,
+	samples: [ sample(T0, { status: WEAK }), sample(T0 + 60, { status: WEAK }) ] });
+eq('recorder_restart_does_not_refire_first', types(r.out?.events), [ 'rx_warn' ]);
+r = replay('warn2', { snapshot: `${BASE}/warn.json.gz`, samples: [ sample(T0 + 120, { status: WEAK }) ] });
+eq('recorder_restart_does_not_refire', types(r.out?.events), []);
+
+// recorder_budget_survives_restart: today's writes already in the file count
+// against the daily budget after a restart.
+fs.writefile(`${BASE}/budget2.jsonl`,
+	sprintf('%J\n%J\n', { t: T0 - 100, type: 'resync', severity: 'warn', msg: 'x' },
+		{ t: T0 - 50, type: 'resync', severity: 'warn', msg: 'x' }));
+r = replay('budget2', { events_file: `${BASE}/budget2.jsonl`, writes_per_day: 2,
+	samples: [ sample(T0, { sfifo_resync: '0\n' }), sample(T0 + 60, { sfifo_resync: '1\n' }) ] });
+eq('recorder_budget_survives_restart_event', 'resync' in types(r.out?.events), true);
+eq('recorder_budget_survives_restart_file',
+	length(filter(split(fs.readfile(`${BASE}/budget2.jsonl`) || '', '\n'), length)), 2);
+
 // load_snapshot_tolerates_corrupt_file: power cut during a snapshot write.
 fs.writefile(`${BASE}/bad.json.gz`, '\x1f\x8b\x08\x00garbage');
 r = replay('corrupt', { snapshot: `${BASE}/bad.json.gz`,

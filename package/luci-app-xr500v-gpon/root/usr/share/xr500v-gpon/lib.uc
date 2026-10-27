@@ -142,6 +142,9 @@ export function thresholds(sec) {
 		let n = (raw == null || raw === '') ? def : +raw;
 		th[k] = (n != n) ? def : n;	// NaN check
 	}
+	// 0 would turn every minute with one BIP error into a "burst".
+	if (th.bip_burst_per_min < 1)
+		th.bip_burst_per_min = DEFAULTS.bip_burst_per_min;
 	return th;
 };
 
@@ -169,6 +172,11 @@ export function evaluate(sample, ctx, th) {
 	// A null state means omci.agent did not answer: the link and optics
 	// alerts cannot be judged, the counter-based ones still can.
 	let known = sample?.state != null;
+	// Never in O5 since boot and no light: the fiber port is not in use
+	// (WAN over Ethernet, say), not a fault. Only an explicit false: callers
+	// that do not track it keep the plain O5 judgement.
+	if (known && ctx.ever_o5 === false && sample.state != 5 && !(sample.rx_nw > 0))
+		return { alerts: [], health: 'nofiber' };
 	if (known) {
 		if (sample.state != 5)
 			push(ids, 'not_o5');
@@ -194,8 +202,12 @@ export function evaluate(sample, ctx, th) {
 	return { alerts, health };
 };
 
-function event(type, msg) {
-	return { type, severity: EVENTS[type][0], msg: msg || EVENTS[type][1] };
+// extra: fields the browser needs to word the event itself (n, flags).
+function event(type, msg, extra) {
+	let e = { type, severity: EVENTS[type][0], msg: msg || EVENTS[type][1] };
+	for (let k, v in extra)
+		e[k] = v;
+	return e;
 }
 
 // Events between two consecutive samples. Alerts only fire on entering.
@@ -208,8 +220,8 @@ export function detect(prev, cur, bip_delta, th) {
 		else if (prev.state == 5 && cur.state != 5)
 			push(out, event('o5_down'));
 	}
-	if (bip_delta != null && bip_delta >= th.bip_burst_per_min)
-		push(out, event('bip_burst', `${bip_delta} BIP errors in one minute`));
+	if (bip_delta != null && bip_delta > th.bip_burst_per_min)
+		push(out, event('bip_burst', `${bip_delta} BIP errors in one minute`, { n: bip_delta }));
 	let was = rx_alert(prev?.rx_nw, th), is = rx_alert(cur?.rx_nw, th);
 	if (is && is != was)
 		push(out, event(is));
@@ -219,7 +231,7 @@ export function detect(prev, cur, bip_delta, th) {
 	    cur.sfifo_resync > prev.sfifo_resync)
 		push(out, event('resync'));
 	if (cur?.alarms > 0 && !(prev?.alarms > 0))
-		push(out, event('bosa_alarm', `Optical module alarm (flags ${cur.alarms})`));
+		push(out, event('bosa_alarm', `Optical module alarm (flags ${cur.alarms})`, { flags: cur.alarms }));
 	return out;
 };
 
