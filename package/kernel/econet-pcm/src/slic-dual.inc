@@ -155,7 +155,16 @@ static void slic_dual_mute_arm(void)
 		queue_delayed_work(system_highpri_wq, &dual_mute_work, 0);
 }
 
-static void slic_dual_poll_set_mute(struct slic_dual_line *l, bool mute, s64 us)
+/* A mute flip, logged after sd.lock is released: a console line at 115200
+ * baud takes ~10 ms, and the other line's poll and the PCM IRQ would wait. */
+struct slic_dual_mute_ev {
+	unsigned int line;
+	bool mute;
+	u32 frames;
+};
+
+static void slic_dual_poll_set_mute(struct slic_dual_line *l, bool mute,
+				    struct slic_dual_mute_ev *ev)
 {
 	l->muted = mute;
 	pcm_en751221_dual_mute(l->index, mute);
@@ -163,20 +172,21 @@ static void slic_dual_poll_set_mute(struct slic_dual_line *l, bool mute, s64 us)
 		l->poll_mutes++;
 	else
 		l->poll_unmutes++;
-	pr_info("econet-slic: phone%u capture %s by poller (frame +%u since open, read %lld us)\n",
-		l->index + 1, mute ? "muted" : "unmuted",
-		pcm_en751221_dual_rx_frames() - l->open_rx_frame, (long long)us);
+	ev->line = l->index + 1;
+	ev->mute = mute;
+	ev->frames = pcm_en751221_dual_rx_frames() - l->open_rx_frame;
 }
 
 static void slic_dual_mute_poll(struct work_struct *w)
 {
 	unsigned int ms = READ_ONCE(dual_mute_poll_ms);
+	struct slic_dual_mute_ev ev[2];
 	u8 sig[4], chk[4];
-	bool edge = false, checked = false;
+	bool edge = false, checked = false, fast_off = false;
 	unsigned long next;
 	ktime_t t0;
 	s64 us;
-	int i, ret, gap;
+	int i, ret, gap, nev = 0;
 
 	if (!ms)
 		return;			/* switched off: the next open re-arms */
@@ -220,8 +230,7 @@ static void slic_dual_mute_poll(struct work_struct *w)
 		    READ_ONCE(zsi_fast_gap_us) > 0) {
 			WRITE_ONCE(zsi_fast_gap_us, 0);
 			dmp.fast_off++;
-			pr_warn("econet-slic: mute poller: %u read errors in a row, zsi_fast_gap_us -> 0\n",
-				dmp.consecutive);
+			fast_off = true;
 		}
 	} else {
 		bool disagree = false;
@@ -233,26 +242,32 @@ static void slic_dual_mute_poll(struct work_struct *w)
 			int v = !!(sig[l->ec - 1] & 1);
 			bool open_loop = !v;
 
-			if (!l->opened || l->ringing)
+			if (l->ringing)
 				continue;
-			if (checked && open_loop != l->muted && !!(chk[l->ec - 1] & 1) != v) {
-				dmp.confirm_fail++;
+			if (checked && !!(chk[l->ec - 1] & 1) != v) {
+				if (l->opened && open_loop != l->muted)
+					dmp.confirm_fail++;
 				disagree = true;
 				continue;	/* reads disagree: next sample decides */
 			}
+			/* The same read serves the idle jack: its manager's hook
+			 * reads then use this sample instead of a slow ~15 ms bus
+			 * transaction every 150 ms that delayed this poller. */
 			l->poll_sample = v;
 			l->poll_jiffies = jiffies;
+			if (!l->opened)
+				continue;	/* idle jack: never muted */
 			if (open_loop) {
 				l->closed_since = 0;
 				if (!l->muted)
-					slic_dual_poll_set_mute(l, true, us);
+					slic_dual_poll_set_mute(l, true, &ev[nev++]);
 			} else if (l->muted) {
 				if (!l->closed_since)
 					l->closed_since = jiffies ?: 1;
 				if (time_after_eq(jiffies, l->closed_since +
 						  msecs_to_jiffies(READ_ONCE(dual_unmute_ms)))) {
 					l->closed_since = 0;
-					slic_dual_poll_set_mute(l, false, us);
+					slic_dual_poll_set_mute(l, false, &ev[nev++]);
 				}
 			}
 		}
@@ -262,6 +277,13 @@ static void slic_dual_mute_poll(struct work_struct *w)
 			zsi_resync_locked();
 	}
 	mutex_unlock(&sd.lock);
+	for (i = 0; i < nev; i++)
+		pr_info("econet-slic: phone%u capture %s by poller (frame +%u since open, read %lld us)\n",
+			ev[i].line, ev[i].mute ? "muted" : "unmuted", ev[i].frames,
+			(long long)us);
+	if (fast_off)
+		pr_warn("econet-slic: mute poller: %u read errors in a row, zsi_fast_gap_us -> 0\n",
+			max(dual_mute_max_errors, 1U));
 	next = max_t(unsigned long, msecs_to_jiffies(ms),
 		     usecs_to_jiffies((unsigned int)min_t(s64, 3 * us, 1000000)));
 	queue_delayed_work(system_highpri_wq, &dual_mute_work, next);
@@ -279,6 +301,7 @@ static int slic_dual_mute_poll_show(struct seq_file *s, void *unused)
 	seq_printf(s, "reads=%u errors=%u busy=%u confirm_fail=%u fast_off=%u last_us=%lld max_us=%lld\n",
 		   dmp.reads, dmp.errors, dmp.busy, dmp.confirm_fail, dmp.fast_off,
 		   (long long)dmp.last_us, (long long)dmp.max_us);
+	seq_printf(s, "zsi_timeouts=%u zsi_stale_bits=%u\n", zsi_timeouts, zsi_stale_bits);
 	for (i = 0; i < 2; i++)
 		seq_printf(s, "phone%d opened=%u muted=%u poll_sample=%d mutes=%u unmutes=%u\n",
 			   i + 1, dl[i].opened, dl[i].muted, dl[i].poll_sample,
@@ -551,7 +574,9 @@ static int slic_dual_hook_read(struct slic_dual_line *l)
 
 	if (!l->ringing) {
 		unsigned int pms = READ_ONCE(dual_mute_poll_ms);
-		bool polled = pms && l->opened && l->poll_sample >= 0;
+		/* The poller samples idle jacks too while the other line has a
+		 * stream open; with no stream it stops and the sample goes stale. */
+		bool polled = pms && l->poll_sample >= 0;
 
 		if (polled && READ_ONCE(dual_hook_from_poll) &&
 		    time_before(jiffies, l->poll_jiffies + msecs_to_jiffies(2 * pms + 5)))

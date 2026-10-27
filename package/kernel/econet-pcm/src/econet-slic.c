@@ -119,6 +119,19 @@ static u32 pcm_tx_slots[4] = { 0x10301020, 0x10501040, 0x10701060, 0x10901080 };
 static u32 pcm_rx_slots[4] = { 0x10301020, 0x10501040, 0x10701060, 0x10901080 };
 static u32 zsi_cfg_val = ZSI_CFG_VAL;	/* debugfs-tunable */
 
+/*
+ * A wait that timed out leaves the wrapper or the SLIC mid-byte. A late
+ * RX_READY would hand the next read the previous byte (and every read after
+ * it, shifted by one), and a retried write could land a data byte as an
+ * opcode (EC_2 = 0x02 is the VP886 software reset). zsi_begin() clears stale
+ * ack/ready bits before every transaction and, after a timeout, re-frames the
+ * SLIC with NOOPs before the next command. The OEM spi.ko waits without a
+ * timeout, so it never reaches this state.
+ */
+static bool zsi_dirty;
+static u32 zsi_timeouts;	/* diag: waits that timed out */
+static u32 zsi_stale_bits;	/* diag: stale ack/ready at a transaction start */
+
 static int zsi_poll_set(u32 mask)
 {
 	int i;
@@ -128,8 +141,10 @@ static int zsi_poll_set(u32 mask)
 			return 0;
 		udelay(1);
 	}
-	pr_err(DRV_NAME ": TIMEOUT @%s waiting ZSI_CTL&0x%x (ctl=0x%08x)\n",
-	       sd.where, mask, readl(sd.zsi + ZSI_CTL));
+	zsi_dirty = true;
+	zsi_timeouts++;
+	pr_err_ratelimited(DRV_NAME ": TIMEOUT @%s waiting ZSI_CTL&0x%x (ctl=0x%08x)\n",
+			   sd.where, mask, readl(sd.zsi + ZSI_CTL));
 	return -ETIMEDOUT;
 }
 
@@ -186,10 +201,34 @@ static int zsi_read_byte(u8 *out)
 	return 0;
 }
 
+/* W1C ack/ready bits a previous transaction left behind. */
+static void zsi_drain_ctl(void)
+{
+	u32 st = readl(sd.zsi + ZSI_CTL) & (ZSI_CTL_TX_ACK | ZSI_CTL_RX_READY);
+
+	if (st) {
+		writel(st, sd.zsi + ZSI_CTL);
+		zsi_stale_bits++;
+	}
+}
+
 static void zsi_begin(void)
 {
+	int i;
+
 	/* OEM stock shows ZSI_CFG = 0x0f030313 with voip running; write it. */
 	writel(zsi_cfg_val, sd.zsi + ZSI_CFG);
+	zsi_drain_ctl();
+	if (likely(!zsi_dirty))
+		return;
+
+	/* re-frame before any new command (see zsi_poll_set) */
+	zsi_dirty = false;
+	usleep_range(2000, 3000);	/* let a late byte complete */
+	zsi_drain_ctl();
+	for (i = 0; i < 8 && !zsi_dirty; i++)
+		zsi_write_byte(0x06);	/* NOOP, at the safe gap */
+	zsi_drain_ctl();
 }
 
 static int zsi_write(u8 cmd, const u8 *buf, u8 len)
@@ -406,13 +445,9 @@ static int zsi_dev_read_fast(u8 reg, u8 *buf, u8 len, int gap)
  */
 static void zsi_resync_locked(void)
 {
-	int i;
-
 	sd.where = "resync";
+	zsi_dirty = true;
 	zsi_begin();
-	for (i = 0; i < 8; i++)
-		if (zsi_write_byte(0x06))
-			break;
 }
 
 static int slic_detect(u8 *buf, u8 n)
