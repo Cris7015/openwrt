@@ -10,6 +10,8 @@
 
 var TIP_EVENTS = 3;
 var CSV_HEADER = 'time,rx_dbm_avg,rx_dbm_min,rx_dbm_max,temp_c_avg,temp_c_min,temp_c_max,bip,events';
+/* not inline after `return`: LuCI's jsmin would take the slash for a division */
+var CSV_QUOTE = /[",\n]/;
 
 function pad(n) {
 	return (n < 10 ? '0' : '') + n;
@@ -40,7 +42,7 @@ function dayKey(d) {
 function csvCell(v) {
 	var s = (v == null) ? '' : String(v);
 
-	return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+	return CSV_QUOTE.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
 function fixed1(v) {
