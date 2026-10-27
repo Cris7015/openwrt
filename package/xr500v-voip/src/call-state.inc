@@ -51,10 +51,30 @@ static void finish_owned_call(void)
 		enter_offhook(answered_ec);
 }
 
-/* The ctrl_tcp connection dropped: baresip exited or was respawned, and
- * every dialog it held went with it, the second one too. */
+/* Dialogs this port owned when the ctrl_tcp connection dropped. A drop is
+ * not always a baresip exit: ctrl_tcp keeps ONE client, so any other local
+ * client that connects displaces us while baresip keeps every call. The port
+ * has already let them go (busy tone or idle) and can no longer track them,
+ * so the reconnect ends them; after a real restart the hangup finds nothing. */
+static char lost_callid[2][sizeof(active_callid)];
+
+static void ctrl_reclaim(int s)
+{
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (*lost_callid[i])
+			ctrl_cmd(s, "hangup", lost_callid[i]);
+		lost_callid[i][0] = 0;
+	}
+}
+
+/* The ctrl_tcp connection dropped: baresip exited or was respawned (every
+ * dialog it held went with it), or another client displaced us. */
 static void ctrl_lost(void)
 {
+	strcpy(lost_callid[0], active_callid);
+	strcpy(lost_callid[1], other_callid);
 	ctrl_s = -1;
 	other_callid[0] = 0; other_kind = OTHER_NONE; recall_pending = 0;
 	finish_owned_call();

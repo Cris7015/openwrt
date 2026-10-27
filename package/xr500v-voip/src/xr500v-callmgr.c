@@ -896,6 +896,7 @@ int main(void)
 			blen = 0;
 			ctrl_s = s;
 			logmsg("connected to ctrl_tcp");
+			ctrl_reclaim(s);
 			/* The accounts may have registered before we connected. */
 			command_token = "callmgr-reginfo";
 			ctrl_cmd(s, "reginfo", NULL);
@@ -942,7 +943,9 @@ int main(void)
 			int n = read(s, buf + blen, sizeof(buf) - 1 - blen);
 			char *q;
 
-			if (n <= 0) { ctrl_lost(); close(s); s = -1; continue; }
+			/* Close first: ctrl_lost() may fork a tone worker, which must
+			 * not inherit the dead connection. */
+			if (n <= 0) { close(s); s = -1; ctrl_lost(); continue; }
 			blen += n;
 			buf[blen] = 0;
 			q = buf;
