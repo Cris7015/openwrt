@@ -331,6 +331,21 @@ static int16_t cw_tone(unsigned *pos, double *phase)
 	return on ? (int16_t)(CW_LEVEL * sin(*phase)) : 0;
 }
 
+/* The driver blanks whole capture frames while the loop is open (hang-up,
+ * hook flash: econet-pcm dual mute). Keep them blank through the chain: for a
+ * zero input the AEC outputs minus its echo estimate, i.e. a faint copy of the
+ * far end's own voice, and the denoiser may smear the previous frame in. An
+ * all-zero frame from a live line is digital silence anyway. */
+static bool frame_blank(const int16_t *s, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (s[i])
+			return false;
+	return true;
+}
+
 /* Capture: 10 ms from the line, the capture chain once, every source. */
 static int cap_thread(void *arg)
 {
@@ -343,12 +358,14 @@ static int cap_thread(void *arg)
 
 	while (re_atomic_rlx(&io.run)) {
 		struct le *le;
+		bool blank;
 
 		if (read_full(io.fd, cap, sizeof(cap))) {
 			if (re_atomic_rlx(&io.run))
 				sys_msleep(5);
 			continue;
 		}
+		blank = frame_blank(cap, IO_FRAME);
 
 		if (g_dtmf_mq)
 			dtmf_scan(cap, IO_FRAME);
@@ -363,6 +380,8 @@ static int cap_thread(void *arg)
 		}
 		if (io.tap_fd >= 0)
 			(void)write(io.tap_fd, cap, sizeof(cap));
+		if (blank)
+			memset(cap, 0, sizeof(cap));	/* driver mute stays exact silence */
 		if (g_dtmf.mute) {
 			memset(cap, 0, sizeof(cap));
 			g_dtmf.mute--;
