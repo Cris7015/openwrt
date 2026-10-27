@@ -1,0 +1,14 @@
+{
+	"luci-app-xr500v-gpon": {
+		"description": "Grant access to the GPON fiber health panel",
+		"read": {
+			"ubus": {
+				"xr500v.gpon": [ "summary", "history", "events" ]
+			},
+			"uci": [ "xr500v-gpon" ]
+		},
+		"write": {
+			"uci": [ "xr500v-gpon" ]
+		}
+	}
+}

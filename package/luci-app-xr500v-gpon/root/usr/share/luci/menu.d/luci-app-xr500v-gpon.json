@@ -1,0 +1,13 @@
+{
+	"admin/network/omci/fiber": {
+		"title": "Fiber",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "xr500v-gpon/fiber"
+		},
+		"depends": {
+			"acl": [ "luci-app-xr500v-gpon" ]
+		}
+	}
+}
