@@ -27,6 +27,12 @@ var callEvents = rpc.declare({
 	expect: { events: [] }
 });
 
+var callAround = rpc.declare({
+	object: 'xr500v.gpon',
+	method: 'around',
+	params: [ 't' ]
+});
+
 var EVENTS_SHOWN = 100;	/* rows in the Events tab */
 var EVENTS_KEPT = 500;	/* the recorder's whole list, for the graphs */
 
@@ -39,6 +45,13 @@ var WINDOWS = [
 	[ '7d', _('7 days'), 604800 ],
 	[ '30d', _('30 days'), 2592000 ]
 ];
+
+var SOURCES = {
+	saved: _('saved 1-minute detail'),
+	'1min': _('1-minute history'),
+	'5min': _('5-minute averages'),
+	none: _('no data')
+};
 
 var ALERTS = {
 	not_o5: _('Link not operational (not in O5)'),
@@ -129,7 +142,7 @@ return view.extend({
 
 	/* The cursor's box: values and events of the point under the cursor */
 	showTip: function(t, cx, cy) {
-		var tip = (t != null) ? analysis.tooltip(this.points, this.evData, t, this.step) : null,
+		var tip = (t != null) ? analysis.tooltip(this.points, this.tipEvents, t, this.step) : null,
 		    spread = this.step > 60, rows, w, h;
 
 		if (!tip) {
@@ -161,15 +174,20 @@ return view.extend({
 		this.tip.style.top = ((cy + 14 + h > window.innerHeight - 8) ? Math.max(8, cy - 14 - h) : cy + 14) + 'px';
 	},
 
-	renderGraphs: function(history, summary) {
+	/* zoom: an `around` reply, drawn instead of the chosen window */
+	renderGraphs: function(history, summary, zoom) {
 		var win = WINDOWS.filter(function(w) { return w[0] == history.window; })[0] || WINDOWS[0],
-		    step = history.step || 60,
-		    common = { span: win[2], step: step, now: summary.now, points: history.points },
+		    step = zoom ? zoom.step : (history.step || 60),
+		    events = zoom ? (zoom.events || []) : (this.evData || []),
+		    common = zoom ? { span: zoom.t1 - zoom.t0, step: step, now: zoom.t1, points: zoom.points }
+			: { span: win[2], step: step, now: summary.now, points: history.points },
 		    per = (step >= 1800) ? _('per 30 minutes') : (step >= 300) ? _('per 5 minutes') : _('per minute'),
-		    point = (step >= 1800) ? _('30-minute averages') : (step >= 300) ? _('5-minute averages') : _('one sample per minute');
+		    point = (step >= 1800) ? _('30-minute averages') : (step >= 300) ? _('5-minute averages') : _('one sample per minute'),
+		    marker = L.bind(this.openAround, this);
 
 		var draw = function(opts) {
-			return graph.render(common.points, Object.assign({ span: common.span, step: common.step, now: common.now }, opts));
+			return graph.render(common.points, Object.assign({ span: common.span, step: common.step,
+				now: common.now, events: events, onMarker: marker }, opts));
 		};
 
 		var charts = [
@@ -181,20 +199,43 @@ return view.extend({
 			draw({ field: 'bip', unit: '', label: _('BIP errors'), color: '#ff0000', height: 120 })
 		];
 
-		this.points = history.points || [];
+		this.points = common.points || [];
 		this.step = step;
+		this.tipEvents = events;
 		this.charts = charts;
 		this.tip.style.display = 'none';
 		graph.cursor(charts, L.bind(this.showTip, this));
 
 		return E('div', {}, [
+			zoom ? E('div', { 'class': 'cbi-section-descr' }, [
+				E('button', { 'class': 'cbi-button', 'click': ui.createHandlerFn(this, 'setWindow', this.window) },
+					[ _('← Back to %s').format(win[1]) ]),
+				' ', _('30 minutes before and after %s').format(analysis.localTime(zoom.t0 + (zoom.t1 - zoom.t0) / 2, true))
+			]) : '',
 			E('h3', {}, [ _('Received power (dBm)') ]), charts[0],
 			E('h3', {}, [ _('Laser temperature (°C)') ]), charts[1],
 			E('h3', {}, [ _('BIP errors %s').format(per) ]), charts[2],
 			E('div', { 'class': 'right' }, E('small', {}, [
-				_('(%s window, %s)').format(win[1], point)
+				zoom ? _('(±30 minutes, %s)').format(SOURCES[zoom.source] || zoom.source)
+					: _('(%s window, %s)').format(win[1], point)
 			]))
 		]);
+	},
+
+	/* The graphs from 30 minutes before t to 30 after, at the best detail
+	 * the recorder still has; t is the event's time. */
+	openAround: function(t) {
+		var seq = ++this.seq, tab = document.querySelector('.cbi-tabmenu li[data-tab="graphs"] a');
+
+		if (tab)
+			tab.click();
+		return L.resolveDefault(callAround(t), null).then(L.bind(function(res) {
+			if (seq != this.seq || !res)
+				return;
+			this.zoom = res;
+			dom.content(this.graphs, this.renderGraphs({ window: this.window }, {}, res));
+			this.graphs.scrollIntoView({ block: 'start' });
+		}, this));
 	},
 
 	renderCounters: function(s) {
@@ -237,9 +278,11 @@ return view.extend({
 	},
 
 	renderEvents: function(events) {
-		return table([ _('Time'), _('Severity'), _('Event') ], (events || []).slice(0, EVENTS_SHOWN).map(function(e) {
-			return [ datetime(e.t), tag(e.severity), analysis.eventText(e) ];
-		}), _('No events recorded yet'));
+		return table([ _('Time'), _('Severity'), _('Event'), '' ], (events || []).slice(0, EVENTS_SHOWN).map(L.bind(function(e) {
+			return [ datetime(e.t), tag(e.severity), analysis.eventText(e),
+				E('button', { 'class': 'cbi-button', 'title': _('Graphs from 30 minutes before to 30 after'),
+					'click': ui.createHandlerFn(this, 'openAround', e.t) }, [ _('±30 min') ]) ];
+		}, this)), _('No events recorded yet'));
 	},
 
 	renderAlerts: function(s) {
@@ -252,6 +295,7 @@ return view.extend({
 		var seq = ++this.seq;
 
 		this.window = id;
+		this.zoom = null;
 
 		this.buttons.forEach(function(b) {
 			b.classList.toggle('cbi-button-action', b.getAttribute('data-window') == id);
@@ -275,8 +319,8 @@ return view.extend({
 			L.resolveDefault(callEvents(EVENTS_KEPT), [])
 		]).then(L.bind(function(res) {
 			this.evData = res[2];
-			/* a window chosen meanwhile has its own, newer reply */
-			if (seq == this.seq)
+			/* a window chosen meanwhile has its own, newer reply; a zoom stays */
+			if (seq == this.seq && !this.zoom)
 				dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
 			dom.content(this.counters, this.renderCounters(res[0]));
 			dom.content(this.events, this.renderEvents(res[2]));

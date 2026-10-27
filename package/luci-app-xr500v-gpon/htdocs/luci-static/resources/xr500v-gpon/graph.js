@@ -8,7 +8,8 @@
  *
  * render(points, opts): points come from the xr500v.gpon history method;
  * opts = { field: 'rx'|'temp'|'bip', unit, label, color,
- *          lines: [ { value, label, color } ], height, span, step, now }
+ *          lines: [ { value, label, color } ], height, span, step, now,
+ *          events, onMarker(t) }
  * The returned node carries `chart` for the cursor: cursor(nodes, onMove)
  * moves one vertical line through every graph at once, by mouse or touch.
  */
@@ -16,6 +17,8 @@
 var NS = 'http://www.w3.org/2000/svg';
 var TEXT_STYLE = 'fill:#eee;font-size:9pt;font-family:sans-serif;text-shadow:1px 1px 1px #000';
 var TICKS = [ 3600, 10800, 21600, 86400, 172800, 604800 ];
+var MARK = { crit: '#f44336', warn: '#ff9800', info: '#9e9e9e' };
+var RANK = { crit: 3, warn: 2, info: 1 };
 
 function svg(tag, attrs, text) {
 	var el = document.createElementNS(NS, tag);
@@ -175,10 +178,39 @@ return baseclass.extend({
 				'%s %s (%s)'.format(num(l.value, digits), opts.unit, l.label)));
 		});
 
+		/* events: one marker per marker-wide strip (8 px), the most severe
+		 * one wins, so markers never overlap and a flapping link cannot bury
+		 * the graph */
+		var cols = {};
+
+		(opts.events || []).forEach(function(e) {
+			var bin, c;
+
+			if (e.t < t0 || e.t > t1)
+				return;
+			bin = Math.floor(x(e.t) / 8);
+			c = cols[bin];
+			if (!c || (RANK[e.severity] || 0) > (RANK[c.severity] || 0))
+				cols[bin] = e;
+		});
+		Object.keys(cols).forEach(function(bin) {
+			var e = cols[bin], px = bin * 8 + 4, color = MARK[e.severity] || MARK.info,
+			    mark = svg('rect', { 'x': px - 4, 'y': 0, 'width': 8, 'height': 8,
+				'style': 'fill:%s;cursor:pointer'.format(color) });
+
+			root.appendChild(svg('line', { 'x1': px, 'y1': 0, 'x2': px, 'y2': '100%',
+				'style': 'stroke:%s;stroke-width:1;stroke-opacity:0.45;pointer-events:none'.format(color) }));
+			if (opts.onMarker)
+				mark.addEventListener('click', function() { opts.onMarker(e.t); });
+			root.appendChild(mark);
+		});
+
 		if (!data.length)
 			root.appendChild(svg('text', { 'x': W / 2, 'y': H / 2, 'text-anchor': 'middle', 'style': TEXT_STYLE }, _('No data yet')));
 
-		var line = svg('line', { 'x1': 0, 'y1': 0, 'x2': 0, 'y2': '100%', 'style': 'stroke:#333;stroke-width:1;display:none' }),
+		/* the cursor line sits under the pointer: it must not take the clicks
+		 * meant for the event markers */
+		var line = svg('line', { 'x1': 0, 'y1': 0, 'x2': 0, 'y2': '100%', 'style': 'stroke:#333;stroke-width:1;display:none;pointer-events:none' }),
 		    box = E('div', { 'style': 'width:100%%;height:%dpx;border:1px solid #000;background:#fff'.format(H) }, root),
 		    node = E('div', {}, [ box, legend(data, opts, digits) ]);
 
