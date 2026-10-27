@@ -3,6 +3,20 @@
 /* Two FXS streams share one continuously running PCM ring. The engine is
  * started before calls, and never reset when a second line opens or closes.
  * Slots 4/6 have separate DMA slabs and separate userspace queues. */
+/*
+ * Optional capture delay line, in 10 ms frames (0 = off, the default; at most
+ * PCM_DUAL_MAX_HOLD). Each line's decoded capture frames wait dual_cap_hold
+ * frames before they reach the kfifo. When the SLIC side turns the mute on
+ * (loop opened), the frames still waiting -- the last dual_cap_hold*10 ms,
+ * captured before the debounced hook bit and the poll caught up -- are zeroed
+ * as well. Costs exactly that much extra uplink delay on every call; a false
+ * mute also blanks that much of the past. Latched per stream at open.
+ */
+#define PCM_DUAL_MAX_HOLD	4
+static unsigned int dual_cap_hold;
+module_param(dual_cap_hold, uint, 0644);
+MODULE_PARM_DESC(dual_cap_hold, "capture delay line in 10 ms frames (0-4) so the hang-up mute can blank the frames just before it");
+
 struct pcm_dual_line {
 	struct kfifo cap, play;
 	spinlock_t lock;
@@ -11,6 +25,11 @@ struct pcm_dual_line {
 	bool mute_cap;		/* on-hook seen while open: send silence (DC-DC buzz) */
 	u32 read_bytes, write_bytes;
 	u32 tx_short_frames, cap_drop_frames;
+	/* Delay line; all under lock. */
+	s16 hold[PCM_DUAL_MAX_HOLD][PCM_SAMP_PER_FRAME];
+	unsigned int hold_depth, hold_n, hold_head;
+	bool hold_muted;	/* mute_cap as the capture side last saw it */
+	u32 retro_frames;	/* frames blanked retroactively */
 };
 
 static struct {
@@ -76,16 +95,18 @@ static int pcm_dual_status_show(struct seq_file *s, void *unused)
 			READ_ONCE(pd.rx_min[i]), READ_ONCE(pd.rx_max[i]));
 	for (i = 0; i < 2; i++) {
 		struct pcm_dual_line *l = &pd.line[i];
-		u32 cap, play, rd, wr, shorts, drops;
+		u32 cap, play, rd, wr, shorts, drops, depth, retro;
 		bool opened;
 
 		spin_lock_irqsave(&l->lock, flags);
 		cap = kfifo_len(&l->cap); play = kfifo_len(&l->play);
 		rd = l->read_bytes; wr = l->write_bytes; opened = l->opened;
 		shorts = l->tx_short_frames; drops = l->cap_drop_frames;
+		depth = l->hold_depth; retro = l->retro_frames;
 		spin_unlock_irqrestore(&l->lock, flags);
-		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u\n",
-			i + 1, opened, dual_rx_ch[i], dual_tx_ch[i], cap, play, rd, wr, shorts, drops, READ_ONCE(l->mute_cap));
+		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u hold=%u retro_frames=%u\n",
+			i + 1, opened, dual_rx_ch[i], dual_tx_ch[i], cap, play, rd, wr, shorts, drops, READ_ONCE(l->mute_cap),
+			depth, retro);
 	}
 	return 0;
 }
@@ -95,7 +116,7 @@ static int pcm_dual_thread(void *unused)
 {
 	struct pcm_dev *p = g_pcm;
 	int rx = 0, tx = 0, line, i, ch;
-	s16 frame[PCM_SAMP_PER_FRAME];
+	s16 frame[PCM_SAMP_PER_FRAME], hold_out[PCM_SAMP_PER_FRAME];
 	unsigned long flags;
 	bool opened;
 
@@ -120,17 +141,43 @@ static int pcm_dual_thread(void *unused)
 				s16 *src = (s16 *)pd.rx +
 					(rx * VOICE_CHANS + dual_rx_ch[line]) * PCM_SAMP_PER_FRAME;
 
+				s16 *out = frame;
+				bool mute;
+
 				if (!READ_ONCE(l->opened))
 					continue;	/* nobody captures: skip the decode */
-				if (READ_ONCE(l->mute_cap))
+				mute = READ_ONCE(l->mute_cap);
+				if (mute)
 					memset(frame, 0, sizeof(frame));
 				else
 					for (i = 0; i < PCM_SAMP_PER_FRAME; i++)
 						frame[i] = ulaw_decode(src[i] & 0xff);
 				spin_lock_irqsave(&l->lock, flags);
-				if (l->opened && kfifo_avail(&l->cap) >= VOICE_FB)
-					kfifo_in(&l->cap, frame, VOICE_FB);
-				else if (l->opened)
+				if (l->opened && l->hold_depth) {
+					/* Loop just opened: what still waits here was
+					 * captured before the mute caught up. */
+					if (mute && !l->hold_muted) {
+						memset(l->hold, 0, sizeof(l->hold));
+						l->retro_frames += l->hold_n;
+					}
+					l->hold_muted = mute;
+					if (l->hold_n < l->hold_depth) {
+						/* Filling up after open: nothing leaves yet. */
+						memcpy(l->hold[(l->hold_head + l->hold_n) % l->hold_depth],
+						       frame, VOICE_FB);
+						l->hold_n++;
+						out = NULL;
+					} else {
+						/* Oldest frame out, this one into its slot. */
+						memcpy(hold_out, l->hold[l->hold_head], VOICE_FB);
+						memcpy(l->hold[l->hold_head], frame, VOICE_FB);
+						l->hold_head = (l->hold_head + 1) % l->hold_depth;
+						out = hold_out;
+					}
+				}
+				if (out && l->opened && kfifo_avail(&l->cap) >= VOICE_FB)
+					kfifo_in(&l->cap, out, VOICE_FB);
+				else if (out && l->opened)
 					l->cap_drop_frames++;
 				spin_unlock_irqrestore(&l->lock, flags);
 				wake_up_interruptible(&l->cap_wq);
@@ -337,6 +384,10 @@ int pcm_en751221_dual_open(unsigned int index)
 		kfifo_reset(&l->cap);
 		kfifo_reset(&l->play);
 		l->tx_short_frames = l->cap_drop_frames = 0;
+		l->hold_depth = min_t(unsigned int, READ_ONCE(dual_cap_hold), PCM_DUAL_MAX_HOLD);
+		l->hold_n = l->hold_head = 0;
+		l->hold_muted = false;
+		l->retro_frames = 0;
 		l->opened = true;
 	l->mute_cap = false;
 	}
