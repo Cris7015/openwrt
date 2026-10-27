@@ -1240,12 +1240,26 @@ static const struct file_operations mpi_rd_fops = {
  * on-hook, hook=0 idle, hook=1 on lift, calls work. Driven by xr500v-callmgr:
  * standby at IDLE, active on off-hook / in-call.
  */
+/*
+ * LOOPSUP byte 1 = ground-key debounce (bits 7-5, kept at 4 = 16 ms) and the
+ * switch-hook debounce in 2 ms steps (bits 4-0). 4 = 8 ms is both the value
+ * written so far and the DC profile's ("Switch Hook Debounce = 8 ms",
+ * DC_FXS_miSLIC_BB_DEF); VP-API: debounce_ms = 2 * (loopSup[1] & 0x1f)
+ * (vp886_events.c, vp886_timers.c). Lower = the SIGREG hook bit, and so the
+ * hang-up mute, reacts up to 6 ms sooner but chatters more on a noisy loop;
+ * call control is unaffected (the manager debounces 450 ms on top). Read when
+ * the line is armed (module load in dual mode).
+ */
+static unsigned int hook_dbnc_2ms = 4;
+module_param(hook_dbnc_2ms, uint, 0444);
+MODULE_PARM_DESC(hook_dbnc_2ms, "SLIC switch-hook debounce in 2 ms steps (0-31, default 4 = 8 ms)");
+
 static void slic_lpm_arm_locked(void)
 {
 	u8 ss[3] = { 0x68, 0, 0 };
 	/* LOOPSUP: byte3=0x8e LPM_HOOK_THRESH(~22V) + byte4=0x03 HOOK_AVG_EN|HSH_CTL_DBNC
 	 * -> arms the SS_LOWPOWER voltage hook comparator (API-init value). */
-	{ static const u8 ls[] = { 0xc2, 0x5b, 0x84, 0xb3, 0x8e, 0x03 };
+	{ u8 ls[] = { 0xc2, 0x5b, 0x80 | (min(hook_dbnc_2ms, 31U) & 0x1f), 0xb3, 0x8e, 0x03 };
 	  slic_write_mpi("lpm-loopsup", ls, sizeof(ls)); }
 	/* SSCFG read-modify-write: set AUTO_SYSSTATE_LPM_DIS (byte1 bit0x02) so the
 	 * silicon will not auto-exit LPM back to the (whining) active feed. */
