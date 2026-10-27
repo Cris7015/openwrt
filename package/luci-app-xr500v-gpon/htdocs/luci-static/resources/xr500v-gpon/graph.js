@@ -9,6 +9,8 @@
  * render(points, opts): points come from the xr500v.gpon history method;
  * opts = { field: 'rx'|'temp'|'bip', unit, label, color,
  *          lines: [ { value, label, color } ], height, span, step, now }
+ * The returned node carries `chart` for the cursor: cursor(nodes, onMove)
+ * moves one vertical line through every graph at once, by mouse or touch.
  */
 
 var NS = 'http://www.w3.org/2000/svg';
@@ -176,9 +178,60 @@ return baseclass.extend({
 		if (!data.length)
 			root.appendChild(svg('text', { 'x': W / 2, 'y': H / 2, 'text-anchor': 'middle', 'style': TEXT_STYLE }, _('No data yet')));
 
-		return E('div', {}, [
-			E('div', { 'style': 'width:100%%;height:%dpx;border:1px solid #000;background:#fff'.format(H) }, root),
-			legend(data, opts, digits)
-		]);
+		var line = svg('line', { 'x1': 0, 'y1': 0, 'x2': 0, 'y2': '100%', 'style': 'stroke:#333;stroke-width:1;display:none' }),
+		    box = E('div', { 'style': 'width:100%%;height:%dpx;border:1px solid #000;background:#fff'.format(H) }, root),
+		    node = E('div', {}, [ box, legend(data, opts, digits) ]);
+
+		root.appendChild(line);
+		node.chart = {
+			t0: t0, t1: t1, step: opts.step || 60, box: box,
+			/* the drawing is W pixels wide from the SVG's left edge */
+			timeAt: function(clientX) {
+				return t0 + (clientX - root.getBoundingClientRect().left) / W * opts.span;
+			},
+			setCursor: function(t) {
+				if (t == null || t < t0 || t > t1) {
+					line.style.display = 'none';
+					return;
+				}
+				line.setAttribute('x1', x(t));
+				line.setAttribute('x2', x(t));
+				line.style.display = '';
+			}
+		};
+
+		return node;
+	},
+
+	/* onMove(t, clientX, clientY) with t = null when the pointer leaves */
+	cursor: function(nodes, onMove) {
+		var charts = nodes.filter(function(n) { return n && n.chart; }).map(function(n) { return n.chart; });
+
+		var move = function(chart, cx, cy) {
+			var t = chart.timeAt(cx);
+
+			if (t < chart.t0 || t > chart.t1)
+				t = null;
+			charts.forEach(function(c) { c.setCursor(t); });
+			onMove(t, cx, cy);
+		};
+
+		var touch = function(chart) {
+			return function(ev) {
+				if (ev.touches && ev.touches[0])
+					move(chart, ev.touches[0].clientX, ev.touches[0].clientY);
+			};
+		};
+
+		charts.forEach(function(c) {
+			c.box.addEventListener('mousemove', function(ev) { move(c, ev.clientX, ev.clientY); });
+			c.box.addEventListener('mouseleave', function() {
+				charts.forEach(function(o) { o.setCursor(null); });
+				onMove(null);
+			});
+			/* a tap shows the same box; it stays until the next touch */
+			c.box.addEventListener('touchstart', touch(c), { passive: true });
+			c.box.addEventListener('touchmove', touch(c), { passive: true });
+		});
 	}
 });

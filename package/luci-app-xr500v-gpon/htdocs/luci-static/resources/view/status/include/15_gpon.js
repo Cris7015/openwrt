@@ -110,7 +110,9 @@ return baseclass.extend({
 		for (var i = 0; i < rows.length; i += 2) {
 			table.appendChild(E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td left', 'width': '33%' }, [ rows[i] ]),
-				E('td', { 'class': 'td left' }, rows[i + 1])
+				/* a bare string would be parsed as HTML: the OLT vendor id comes
+				 * from the network */
+				E('td', { 'class': 'td left' }, (typeof rows[i + 1] == 'string') ? [ rows[i + 1] ] : rows[i + 1])
 			]));
 		}
 

@@ -7,6 +7,7 @@
 'require uci';
 'require form';
 'require xr500v-gpon.graph as graph';
+'require xr500v-gpon.analysis as analysis';
 
 var callSummary = rpc.declare({
 	object: 'xr500v.gpon',
@@ -26,7 +27,12 @@ var callEvents = rpc.declare({
 	expect: { events: [] }
 });
 
-var EVENTS_SHOWN = 100;
+var EVENTS_SHOWN = 100;	/* rows in the Events tab */
+var EVENTS_KEPT = 500;	/* the recorder's whole list, for the graphs */
+
+var TIP_STYLE = 'position:fixed;z-index:1000;display:none;pointer-events:none;max-width:320px;' +
+	'padding:6px 8px;border-radius:4px;background:rgba(32,32,32,.92);color:#fff;' +
+	'font-size:12px;line-height:1.45;box-shadow:0 2px 6px rgba(0,0,0,.4)';
 
 var WINDOWS = [
 	[ '24h', _('24 hours'), 86400 ],
@@ -93,6 +99,15 @@ function table(head, rows, empty) {
 	return t;
 }
 
+/* "−20.8 dBm", or "−20.8 dBm (−21.0 … −20.7)" for an averaged point */
+function triple(v, unit, spread) {
+	var f = function(x) { return (x < 0 ? '−' : '') + Math.abs(x).toFixed(1); };
+
+	if (!v)
+		return '—';
+	return f(v.avg) + ' ' + unit + ((spread && v.min != null) ? ' (%s … %s)'.format(f(v.min), f(v.max)) : '');
+}
+
 function threshold(name, def) {
 	var v = parseFloat(uci.get('xr500v-gpon', 'thresholds', name));
 
@@ -101,14 +116,49 @@ function threshold(name, def) {
 
 return view.extend({
 	window: '24h',
+	seq: 0,		/* bumped by every window change: older replies are dropped */
 
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callSummary(), {}),
 			L.resolveDefault(callHistory(this.window), {}),
-			L.resolveDefault(callEvents(EVENTS_SHOWN), []),
+			L.resolveDefault(callEvents(EVENTS_KEPT), []),
 			uci.load('xr500v-gpon')
 		]);
+	},
+
+	/* The cursor's box: values and events of the point under the cursor */
+	showTip: function(t, cx, cy) {
+		var tip = (t != null) ? analysis.tooltip(this.points, this.evData, t, this.step) : null,
+		    spread = this.step > 60, rows, w, h;
+
+		if (!tip) {
+			this.tip.style.display = 'none';
+			return;
+		}
+
+		rows = [
+			E('strong', {}, [ analysis.localTime(tip.t, true) ]),
+			E('div', {}, [ _('Received power') + ': ' + triple(tip.rx, 'dBm', spread) ]),
+			E('div', {}, [ _('Temperature') + ': ' + triple(tip.temp, '°C', spread) ]),
+			E('div', {}, [ _('BIP errors') + ': ' + ((tip.bip != null) ? tip.bip : '—') ])
+		];
+		tip.events.forEach(function(e) {
+			rows.push(E('div', { 'style': 'margin-top:3px' }, [
+				E('span', { 'style': 'color:' + ((e.severity == 'crit') ? '#ff8a80' : (e.severity == 'warn') ? '#ffd54f' : '#b0bec5') },
+					[ '● ' ]),
+				analysis.eventText(e)
+			]));
+		});
+		if (tip.more)
+			rows.push(E('div', {}, [ _('+%d more').format(tip.more) ]));
+
+		dom.content(this.tip, rows);
+		this.tip.style.display = 'block';
+		w = this.tip.offsetWidth;
+		h = this.tip.offsetHeight;
+		this.tip.style.left = ((cx + 14 + w > window.innerWidth - 8) ? Math.max(8, cx - 14 - w) : cx + 14) + 'px';
+		this.tip.style.top = ((cy + 14 + h > window.innerHeight - 8) ? Math.max(8, cy - 14 - h) : cy + 14) + 'px';
 	},
 
 	renderGraphs: function(history, summary) {
@@ -122,16 +172,25 @@ return view.extend({
 			return graph.render(common.points, Object.assign({ span: common.span, step: common.step, now: common.now }, opts));
 		};
 
-		return E('div', {}, [
-			E('h3', {}, [ _('Received power (dBm)') ]),
+		var charts = [
 			draw({ field: 'rx', unit: 'dBm', label: _('Received power'), color: '#0069d6', height: 220, lines: [
 				{ value: threshold('rx_warn_dbm', -25), label: _('warning'), color: '#ff9800' },
 				{ value: threshold('rx_crit_dbm', -27), label: _('sensitivity limit'), color: '#f44336' }
 			] }),
-			E('h3', {}, [ _('Laser temperature (°C)') ]),
 			draw({ field: 'temp', unit: '°C', label: _('Temperature'), color: '#ff6600', height: 160 }),
-			E('h3', {}, [ _('BIP errors %s').format(per) ]),
-			draw({ field: 'bip', unit: '', label: _('BIP errors'), color: '#ff0000', height: 120 }),
+			draw({ field: 'bip', unit: '', label: _('BIP errors'), color: '#ff0000', height: 120 })
+		];
+
+		this.points = history.points || [];
+		this.step = step;
+		this.charts = charts;
+		this.tip.style.display = 'none';
+		graph.cursor(charts, L.bind(this.showTip, this));
+
+		return E('div', {}, [
+			E('h3', {}, [ _('Received power (dBm)') ]), charts[0],
+			E('h3', {}, [ _('Laser temperature (°C)') ]), charts[1],
+			E('h3', {}, [ _('BIP errors %s').format(per) ]), charts[2],
 			E('div', { 'class': 'right' }, E('small', {}, [
 				_('(%s window, %s)').format(win[1], point)
 			]))
@@ -146,7 +205,8 @@ return view.extend({
 		    AGENT = 'omci.agent status',
 		    rows = [
 			[ _('PON state'), (s.state != null) ? 'O' + s.state : null, AGENT ],
-			[ _('In O5 since'), s.o5_since ? '%s (%t)'.format(datetime(s.o5_since), s.now - s.o5_since) : null, _('kernel log') ],
+			[ _('In O5 since'), !s.o5_since ? null : (s.now >= s.o5_since)
+				? '%s (%t)'.format(datetime(s.o5_since), s.now - s.o5_since) : datetime(s.o5_since), _('kernel log') ],
 			[ _('ONU ID'), s.onu_id, AGENT ],
 			[ _('OLT vendor / version'), olt.vendor ? '%s / %s'.format(olt.vendor, olt.version || '—') : null, AGENT ],
 			[ _('OMCI profile'), olt.profile, AGENT ],
@@ -177,8 +237,8 @@ return view.extend({
 	},
 
 	renderEvents: function(events) {
-		return table([ _('Time'), _('Severity'), _('Event') ], (events || []).map(function(e) {
-			return [ datetime(e.t), tag(e.severity), e.msg ];
+		return table([ _('Time'), _('Severity'), _('Event') ], (events || []).slice(0, EVENTS_SHOWN).map(function(e) {
+			return [ datetime(e.t), tag(e.severity), analysis.eventText(e) ];
 		}), _('No events recorded yet'));
 	},
 
@@ -189,6 +249,8 @@ return view.extend({
 	},
 
 	setWindow: function(id, ev) {
+		var seq = ++this.seq;
+
 		this.window = id;
 
 		this.buttons.forEach(function(b) {
@@ -199,17 +261,23 @@ return view.extend({
 			L.resolveDefault(callSummary(), {}),
 			L.resolveDefault(callHistory(id), {})
 		]).then(L.bind(function(res) {
-			dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
+			if (seq == this.seq)
+				dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
 		}, this));
 	},
 
 	refresh: function() {
+		var seq = this.seq;
+
 		return Promise.all([
 			L.resolveDefault(callSummary(), {}),
 			L.resolveDefault(callHistory(this.window), {}),
-			L.resolveDefault(callEvents(EVENTS_SHOWN), [])
+			L.resolveDefault(callEvents(EVENTS_KEPT), [])
 		]).then(L.bind(function(res) {
-			dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
+			this.evData = res[2];
+			/* a window chosen meanwhile has its own, newer reply */
+			if (seq == this.seq)
+				dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
 			dom.content(this.counters, this.renderCounters(res[0]));
 			dom.content(this.events, this.renderEvents(res[2]));
 			dom.content(this.alerts, this.renderAlerts(res[0]));
@@ -254,6 +322,8 @@ return view.extend({
 			}, [ w[1] ]);
 		}, this));
 
+		this.tip = E('div', { 'style': TIP_STYLE });
+		this.evData = events;
 		this.graphs = E('div', {}, this.renderGraphs(history, summary));
 		this.counters = E('div', {}, this.renderCounters(summary));
 		this.events = E('div', {}, this.renderEvents(events));
@@ -284,8 +354,17 @@ return view.extend({
 				E('div', { 'class': 'cbi-map-descr' }, [
 					_('Health of the GPON link, sampled every minute by the xr500v-gpon monitor. History survives reboots.')
 				]),
-				tabs
+				tabs,
+				this.tip
 			]);
+
+			/* a tap outside the graphs closes the box a tap opened */
+			document.addEventListener('touchstart', L.bind(function(ev) {
+				if (this.graphs.contains(ev.target))
+					return;
+				this.tip.style.display = 'none';
+				(this.charts || []).forEach(function(c) { c.chart.setCursor(null); });
+			}, this), { passive: true });
 
 			/* the tab menu is inserted before the group: it needs a parent */
 			ui.tabs.initTabGroup(tabs.childNodes);
