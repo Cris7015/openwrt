@@ -50,13 +50,14 @@ let st = {
 	o5_up: null, o5_t: null, deact: 0, deact_up: null, deact_t: null,
 	// in O5 at least once since boot; until then an unused fiber port
 	// (WAN over Ethernet, say) raises no alert and no event
-	ever_o5: false,
+	ever_o5: false, snap_boot: null,
 	windows: [], win_pending: null, win_dirty: false,
 	skipped: 0
 };
 
-let klog_path = KLOG_FILE, events_path = EVENTS_FILE;
-let windows_path = null;	// set by the daemon only: replays never write /etc
+let klog_path = KLOG_FILE;
+// set by the daemon only: replays never write /etc
+let snapshot_path = null, events_path = null, windows_path = null;
 let win_writes = { day: null, n: 0 };
 
 function num(text) {
@@ -79,6 +80,12 @@ function boot_time() {
 }
 
 let boot_of = boot_time;	// replay: the fixture's boot time
+
+function boot_id() {
+	return trim(fs.readfile('/proc/sys/kernel/random/boot_id') || '');
+}
+
+let boot_id_of = boot_id;	// replay: the fixture's
 
 // Wall-clock time of a moment, converted with the clock as it is now.
 function wall(up, t) {
@@ -114,9 +121,15 @@ function read_gz(path) {
 	return data;
 }
 
+// A window still open goes to the file as far as it has got (a power cut
+// keeps that much); its final capture replaces it.
 function save_windows() {
+	let all = slice(st.windows), p = st.win_pending;
 	st.win_dirty = false;
-	return windows_path ? write_gz(windows_path, { version: 1, windows: st.windows }) : false;
+	if (p)
+		push(all, { t0: p.t0, t1: p.t1, saved: time(), partial: true,
+			points: filter(st.m1, (s) => s.t >= p.t0 && s.t <= p.t1) });
+	return windows_path ? write_gz(windows_path, { version: 1, windows: all }) : false;
 }
 
 // Closes the pending window with the 1-minute samples it covers; writes the
@@ -329,7 +342,7 @@ function events_list(limit) {
 
 function save_snapshot(path) {
 	return write_gz(path, {
-		version: 1, saved: time(),
+		version: 1, saved: time(), boot_id: boot_id_of(),
 		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30
 	});
 }
@@ -346,6 +359,7 @@ function load_snapshot(path) {
 	for (let k in [ 'm1', 'm5', 'm30', 'p5', 'p30' ])
 		if (type(data[k]) == 'array')
 			st[k] = data[k];
+	st.snap_boot = data.boot_id;
 	return true;
 }
 
@@ -399,21 +413,32 @@ function restore_known(now) {
 		let s = st.m1[i];
 		if (s.state == null)
 			continue;
-		if (now - s.t <= 3 * cfg.interval) {
+		if (now - s.t > 3 * cfg.interval)
+			return;
+		if (st.snap_boot && st.snap_boot == boot_id_of()) {
 			st.known = s;
 			if (s.state == 5)
 				st.ever_o5 = true;
+		} else {
+			/* Another boot (after a reboot sysfixtime makes the snapshot look
+			 * recent): the link went down with the router. Keep the readings,
+			 * so warnings do not fire again, not the link state. */
+			st.known = { ...s, state: null };
 		}
 		return;
 	}
 }
 
-function persist() {
-	let ok = save_snapshot(SNAPSHOT);
-	if (st.win_pending)
+// closing: the service stops, so a pending window is closed with what it
+// has; the 6-hourly save leaves it pending (its capture comes later).
+function persist(closing) {
+	let ok = snapshot_path ? save_snapshot(snapshot_path) : true;
+	if (st.win_pending && closing)
 		capture_window(time(), false);
-	if (st.win_dirty)
+	if (st.win_dirty || st.win_pending)
 		save_windows();
+	if (!events_path)
+		return ok;
 	let tmp = events_path + '.tmp';
 	/* a full overlay must not truncate the file that is there */
 	if (fs.writefile(tmp, join('', map(st.events, (e) => sprintf('%J\n', e)))) != null)
@@ -504,6 +529,8 @@ function replay(path) {
 	let fx = json(fs.readfile(path));
 	if (fx.boot != null)
 		boot_of = () => fx.boot;
+	let bid = (fx.boot_id != null) ? fx.boot_id : 'replay';
+	boot_id_of = () => bid;
 	let first = length(fx.samples) ? fx.samples[0].t : time();
 	if (fx.windows_file)
 		windows_path = fx.windows_file;
@@ -522,7 +549,7 @@ function replay(path) {
 	}
 	if (fx.snapshot && load_snapshot(fx.snapshot))
 		restore_known(first);
-	let klog = fx.klog || [], k = 0, extra = fx.klog_append || [], x = 0;
+	let klog = fx.klog || [], k = 0, extra = fx.klog_append || [], x = 0, saves = fx.persist_at || [];
 	for (let raw in fx.samples || []) {
 		for (; k < length(klog) && klog[k].t <= raw.t; k++)
 			on_klog(klog[k].line, klog[k].t);
@@ -535,6 +562,8 @@ function replay(path) {
 			read_klog(raw.t);
 		}
 		ingest(raw);
+		if (raw.t in saves)
+			persist();	// the 6-hourly save, at this sample
 	}
 	for (; k < length(klog); k++)
 		on_klog(klog[k].line, klog[k].t);
@@ -555,6 +584,8 @@ function replay(path) {
 function daemon() {
 	load_config();
 	fs.mkdir(STATE_DIR);
+	snapshot_path = SNAPSHOT;
+	events_path = EVENTS_FILE;
 	if (load_snapshot(SNAPSHOT))
 		restore_known(time());
 	load_events(time());
@@ -573,7 +604,7 @@ function daemon() {
 		history: { args: { ...sid, window: '' }, call: (req) => history(req.args.window) },
 		events: { args: { ...sid, limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
 		around: { args: { ...sid, t: 0 }, call: (req) => around(req.args.t) },
-		persist: { args: sid, call: () => ({ ok: persist() }) },
+		persist: { args: sid, call: () => ({ ok: persist(true) }) },	/* stop_service */
 		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});
 	let tick = () => {

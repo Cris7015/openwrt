@@ -282,6 +282,27 @@ eq('recorder_around_fallback_5min', [ r.out?.around?.source, r.out?.around?.step
 r = replay('around3', { samples: every(60, T0, T0 + 600), around: T0 - 100000 });
 eq('recorder_around_fallback_none', [ r.out?.around?.source, length(r.out?.around?.points) ], [ 'none', 0 ]);
 
+// recorder_periodic_persist_keeps_window_pending (final review, Important 2):
+// the 6-hourly save lands 10 min after the event; the window must still end
+// 30 min after it, with its full detail.
+fs.unlink(`${BASE}/win8.json.gz`);
+r = replay('win8', { boot: T0 + 2300, windows_file: `${BASE}/win8.json.gz`, klog: [ deact_at(100) ],
+	persist_at: [ T0 + 3000 ], samples: every(60, T0, T0 + 5940) });
+eq('recorder_periodic_persist_keeps_window_pending_count', length(r.out?.windows), 1);
+eq('recorder_periodic_persist_keeps_window_pending_points', r.out?.windows?.[0]?.n, 61);
+eq('recorder_periodic_persist_keeps_window_pending_file', length(gz_windows(`${BASE}/win8.json.gz`)?.[0]?.points), 61);
+
+// recorder_reboot_does_not_fake_drop (final review, Important 3): after a
+// reboot the snapshot looks recent (sysfixtime), but its last sample is from
+// another boot: the link not being up yet is not a drop.
+fs.unlink(`${BASE}/boot.json.gz`);
+replay('bootA', { boot_id: 'A', save: `${BASE}/boot.json.gz`, samples: [ sample(T0, { status: WEAK }), sample(T0 + 60, { status: WEAK }) ] });
+r = replay('bootB', { boot_id: 'B', snapshot: `${BASE}/boot.json.gz`, samples: [ sample(T0 + 120, { status: status({ state: 1 }) }) ] });
+eq('recorder_reboot_does_not_fake_drop_events', types(r.out?.events), []);
+eq('recorder_reboot_does_not_fake_drop_ever_o5', r.out?.ever_o5, false);
+r = replay('bootC', { boot_id: 'B', snapshot: `${BASE}/boot.json.gz`, samples: [ sample(T0 + 120, { status: WEAK }) ] });
+eq('recorder_reboot_does_not_refire', types(r.out?.events), []);
+
 // load_snapshot_tolerates_corrupt_file: power cut during a snapshot write.
 fs.writefile(`${BASE}/bad.json.gz`, '\x1f\x8b\x08\x00garbage');
 r = replay('corrupt', { snapshot: `${BASE}/bad.json.gz`,
