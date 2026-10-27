@@ -39,6 +39,23 @@ voip_idle_feed() {
 	echo "$value"
 }
 
+# voip_number <var> <option> <default> <min> <max>: a malformed or out of range
+# globals option is logged and replaced by its default. Before, one bad value
+# made start_service return 1 silently and kept BOTH phones down.
+voip_number() {
+	local value
+	config_get value globals "$2" "$3"
+	case "$value" in
+		''|*[!0-9]*) ;;
+		*) if [ "${#value}" -le 5 ] && [ "$value" -ge "$4" ] && [ "$value" -le "$5" ]; then
+			eval "$1=\$value"
+			return 0
+		   fi ;;
+	esac
+	logger -t voip "globals.$2 '$value' invalid, using $3"
+	eval "$1=\$3"
+}
+
 # Incoming call rejection (reject.inc in the call manager): the manager reads
 # $RUNDIR/reject.conf on every incoming call. incoming_reject: off, all or
 # list (only the reject_number entries); reject_code: the SIP status sent.
@@ -75,22 +92,18 @@ start_service() {
 	render_reject
 	config_get_bool aec globals echo_cancel 1
 	config_get_bool denoise globals noise_suppress 1
-	config_get gain globals playback_percent 50
-	case "$gain" in ''|*[!0-9]*) return 1 ;; esac
-	[ "$gain" -ge 25 ] && [ "$gain" -le 100 ] || return 1
-	config_get ring_on globals ring_on_ms 1000
-	config_get ring_off globals ring_off_ms 4000
-	config_get ring_prefeed globals ring_prefeed_ms 1500
+	voip_number gain playback_percent 50 25 100
+	voip_number ring_on ring_on_ms 1000 300 10000
+	voip_number ring_off ring_off_ms 4000 300 10000
+	voip_number ring_prefeed ring_prefeed_ms 1500 0 5000
+	voip_number flash_min flash_min_ms 80 40 1500
+	voip_number flash_max flash_max_ms 750 40 1500
 	config_get emergency globals emergency_numbers ''
 	config_get cid globals caller_id off
-	case "$cid" in off|v23|bell202) ;; *) return 1 ;; esac
+	case "$cid" in off|v23|bell202) ;; *) logger -t voip "caller_id '$cid' invalid, using off"; cid=off ;; esac
 	config_get_bool cw globals call_waiting 1
-	config_get flash_min globals flash_min_ms 80
-	config_get flash_max globals flash_max_ms 750
-	case "$flash_min$flash_max" in ''|*[!0-9]*) return 1 ;; esac
-	case "$ring_on$ring_off$ring_prefeed" in ''|*[!0-9]*) return 1 ;; esac
 	# Empty is valid (no emergency numbers, the shipped default).
-	case "$emergency" in *[!0-9*#\ ,\;]*) return 1 ;; esac
+	case "$emergency" in *[!0-9*#\ ,\;]*) logger -t voip 'emergency_numbers invalid, none used'; emergency= ;; esac
 	ip=$(uci -q get network.lan.ipaddr)
 	ip=${ip%%/*}
 	# The legacy template needs a placeholder, but a managed profile resolves
