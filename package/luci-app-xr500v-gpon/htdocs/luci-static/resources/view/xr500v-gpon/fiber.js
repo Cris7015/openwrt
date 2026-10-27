@@ -281,6 +281,21 @@ return view.extend({
 		]);
 	},
 
+	/* Downloads what the graphs show (the window, or the zoom) as CSV */
+	exportCsv: function() {
+		var d = new Date(),
+		    name = 'xr500v-gpon-%s-%04d%02d%02d-%02d%02d.csv'.format(this.zoom ? 'event' : this.window,
+			d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes()),
+		    url = URL.createObjectURL(new Blob([ analysis.csv(this.points, this.tipEvents, this.step) ],
+			{ type: 'text/csv' })),
+		    link = E('a', { 'href': url, 'download': name, 'style': 'display:none' });
+
+		document.body.appendChild(link);
+		link.click();
+		document.body.removeChild(link);
+		window.setTimeout(function() { URL.revokeObjectURL(url); }, 10000);
+	},
+
 	/* The graphs from 30 minutes before t to 30 after, at the best detail
 	 * the recorder still has; t is the event's time. */
 	openAround: function(t) {
@@ -437,7 +452,9 @@ return view.extend({
 			var tabs = E('div', {}, [
 				E('div', { 'data-tab': 'graphs', 'data-tab-title': _('Graphs') }, [
 					E('div', { 'class': 'cbi-section' }, [
-						E('div', {}, [ E('strong', {}, [ _('Window:') ]), ' ' ].concat(this.buttons)),
+						E('div', {}, [ E('strong', {}, [ _('Window:') ]), ' ' ].concat(this.buttons, [ ' ',
+							E('button', { 'class': 'cbi-button', 'title': _('Download what the graphs show, for a spreadsheet'),
+								'click': ui.createHandlerFn(this, 'exportCsv') }, [ _('Export CSV') ]) ])),
 						this.graphs
 					])
 				]),
