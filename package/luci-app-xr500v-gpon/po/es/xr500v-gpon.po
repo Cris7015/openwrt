@@ -1,0 +1,578 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Project-Id-Version: luci-app-xr500v-gpon\n"
+"Language: es\n"
+"MIME-Version: 1.0\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\n"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:126
+msgid "%d BIP errors in one minute"
+msgstr "%d errores BIP en un minuto"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:83
+msgid "%s GEM delineation losses"
+msgstr "%s pérdidas de delineación GEM"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:37
+msgid "%s · healthy range −27 … −8 dBm"
+msgstr "%s · rango sano −27 … −8 dBm"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:288
+msgid "(%s window, %s)"
+msgstr "(ventana de %s, %s)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:287
+msgid "(±30 minutes, %s)"
+msgstr "(±30 minutos, %s)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:169
+msgid "+%d more"
+msgstr "+%d más"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:52
+msgid "1-minute history"
+msgstr "historial de 1 minuto"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:45
+msgid "24 hours"
+msgstr "24 horas"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:47
+msgid "30 days"
+msgstr "30 días"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:281
+msgid "30 minutes before and after %s"
+msgstr "30 minutos antes y después de %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:253
+msgid "30-minute averages"
+msgstr "promedios de 30 minutos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:53
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:253
+msgid "5-minute averages"
+msgstr "promedios de 5 minutos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:46
+msgid "7 days"
+msgstr "7 días"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:372
+msgid "Active alert"
+msgstr "Alerta activa"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:485
+msgid "Active alerts"
+msgstr "Alertas activas"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:484
+msgid "Alerts"
+msgstr "Alertas"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:421
+msgid ""
+"Alerts and graph lines use these limits. Changes apply to the next sample."
+msgstr "Las alertas y las líneas de los gráficos usan estos límites. Los cambios rigen desde la próxima muestra."
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:88
+msgid "Average:"
+msgstr "Promedio:"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:76
+msgid "BIP %s"
+msgstr "BIP %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:440
+msgid "BIP burst (errors per minute)"
+msgstr "Ráfaga de BIP (errores por minuto)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:126
+msgid "BIP error burst"
+msgstr "Ráfaga de errores BIP"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:159
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:199
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:267
+msgid "BIP errors"
+msgstr "Errores BIP"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:285
+msgid "BIP errors %s"
+msgstr "Errores BIP %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:63
+msgid "BIP errors in the last hour"
+msgstr "Errores BIP en la última hora"
+
+#: htdocs/luci-static/resources/xr500v-gpon/heatmap.js:72
+msgid "BIP errors or warnings"
+msgstr "errores BIP o avisos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:345
+msgid "BIP errors since boot"
+msgstr "Errores BIP desde el arranque"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:346
+msgid "BIP errors this session"
+msgstr "Errores BIP en esta sesión"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:428
+msgid "Class B+ receiver sensitivity is −27 dBm."
+msgstr "La sensibilidad de un receptor clase B+ es de −27 dBm."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:478
+msgid "Counters"
+msgstr "Contadores"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:201
+msgid "Critical events: %d"
+msgstr "Eventos críticos: %d"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:358
+msgid "Current"
+msgstr "Actual"
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:86
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:88
+msgid "Current:"
+msgstr "Actual:"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:77
+msgid "Deactivate %s"
+msgstr "Deactivate %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:350
+msgid "Deactivate from the OLT"
+msgstr "Deactivate de la OLT"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:64
+msgid "Deactivate from the OLT in the last 10 minutes"
+msgstr "Deactivate de la OLT en los últimos 10 minutos"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:123
+msgid "Details and graphs →"
+msgstr "Detalles y gráficos →"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:465
+msgid "Download what the graphs show, for a spreadsheet"
+msgstr "Descarga lo que muestran los gráficos, para una planilla"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:473
+msgid ""
+"Errors and events per hour over the last 30 days. A problem that comes back "
+"at the same time of day shows up as a column."
+msgstr "Errores y eventos por hora en los últimos 30 días. Un problema que vuelve a la misma hora del día se ve como una columna."
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:109
+msgid "Errors since boot"
+msgstr "Errores desde el arranque"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:364
+msgid "Event"
+msgstr "Evento"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:481
+msgid "Events"
+msgstr "Eventos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:466
+msgid "Export CSV"
+msgstr "Exportar CSV"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:337
+msgid "FEC downstream / upstream"
+msgstr "FEC de bajada / subida"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:491
+#: root/usr/share/luci/menu.d/luci-app-xr500v-gpon.json:3
+msgid "Fiber"
+msgstr "Fibra"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:89
+msgid "Fiber (GPON)"
+msgstr "Fibra (GPON)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Fri"
+msgstr "vie"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:347
+msgid "GEM delineation losses"
+msgstr "Pérdidas de delineación GEM"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:349
+msgid "Grant FIFO glitches"
+msgstr "Glitches de la FIFO de grants"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:124
+msgid "Grant FIFO resync"
+msgstr "Resync de la FIFO de grants"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:348
+msgid "Grant FIFO resyncs"
+msgstr "Resyncs de la FIFO de grants"
+
+#: root/usr/share/rpcd/acl.d/luci-app-xr500v-gpon.json:3
+msgid "Grant access to the GPON fiber health panel"
+msgstr "Dar acceso al panel de salud de la fibra GPON"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:462
+msgid "Graphs"
+msgstr "Gráficos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:366
+msgid "Graphs from 30 minutes before to 30 after"
+msgstr "Gráficos desde 30 minutos antes hasta 30 después"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:493
+msgid ""
+"Health of the GPON link, sampled every minute by the xr500v-gpon monitor. "
+"History survives reboots."
+msgstr "Salud del enlace GPON, medida cada minuto por el monitor xr500v-gpon. El historial sobrevive a los reinicios."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:332
+msgid "In O5 since"
+msgstr "En O5 desde"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:341
+msgid "Laser bias current"
+msgstr "Corriente de polarización del láser"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:342
+msgid "Laser temperature"
+msgstr "Temperatura del láser"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:284
+msgid "Laser temperature (°C)"
+msgstr "Temperatura del láser (°C)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:62
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:123
+msgid "Laser temperature above the warning threshold"
+msgstr "Temperatura del láser por encima del umbral de aviso"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:436
+msgid "Laser temperature warning (°C)"
+msgstr "Aviso de temperatura del láser (°C)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:118
+msgid "Link lost: left O5"
+msgstr "Enlace perdido: salió de O5"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:58
+msgid "Link not operational (not in O5)"
+msgstr "Enlace no operativo (fuera de O5)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:117
+msgid "Link operational (O5)"
+msgstr "Enlace operativo (O5)"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:100
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:102
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:105
+msgid "Link state"
+msgstr "Estado del enlace"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:217
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:453
+msgid "Loading…"
+msgstr "Cargando…"
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:89
+msgid "Maximum:"
+msgstr "Máximo:"
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:89
+msgid "Minimum:"
+msgstr "Mínimo:"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Mon"
+msgstr "lun"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:374
+msgid "No active alerts"
+msgstr "Sin alertas activas"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:51
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:100
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:197
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:374
+msgid "No data"
+msgstr "Sin datos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:232
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:209
+msgid "No data yet"
+msgstr "Todavía sin datos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:207
+msgid "No events"
+msgstr "Sin eventos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:368
+msgid "No events recorded yet"
+msgstr "Todavía no hay eventos registrados"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:102
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:242
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:374
+msgid "No fiber"
+msgstr "Sin fibra"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:53
+msgid "O%d · Not operational"
+msgstr "O%d · No operativo"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:45
+msgid "O5 · Operational"
+msgstr "O5 · Operativo"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:106
+msgid "OLT"
+msgstr "OLT"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:335
+msgid "OLT vendor / version"
+msgstr "Fabricante / versión de la OLT"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:336
+msgid "OMCI profile"
+msgstr "Perfil OMCI"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:61
+msgid "OMCI profile \"%s\""
+msgstr "perfil OMCI \"%s\""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:334
+msgid "ONU ID"
+msgstr "ID de ONU"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:62
+msgid "ONU ID %d"
+msgstr "ID de ONU %d"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:130
+msgid "Optical module alarm"
+msgstr "Alarma del módulo óptico"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:129
+msgid "Optical module alarm (flags 0x%s)"
+msgstr "Alarma del módulo óptico (flags 0x%s)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:344
+msgid "Optical module alarms"
+msgstr "Alarmas del módulo óptico"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:343
+msgid "Optical module supply"
+msgstr "Alimentación del módulo óptico"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:205
+msgid "Other events: %d"
+msgstr "Otros eventos: %d"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:331
+msgid "PON state"
+msgstr "Estado PON"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:470
+msgid "Patterns"
+msgstr "Patrones"
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:86
+msgid "Peak:"
+msgstr "Pico:"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:107
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:157
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:262
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:339
+msgid "Received power"
+msgstr "Potencia recibida"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:283
+msgid "Received power (dBm)"
+msgstr "Potencia recibida (dBm)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:61
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:122
+msgid "Received power above the overload warning"
+msgstr "Potencia recibida por encima del aviso de saturación"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:59
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:120
+msgid "Received power below the critical threshold"
+msgstr "Potencia recibida por debajo del umbral crítico"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:60
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:121
+msgid "Received power below the warning threshold"
+msgstr "Potencia recibida por debajo del umbral de aviso"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:427
+msgid "Received power critical (dBm)"
+msgstr "Potencia recibida crítica (dBm)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:432
+msgid "Received power overload warning (dBm)"
+msgstr "Aviso de saturación de la potencia recibida (dBm)"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:423
+msgid "Received power warning (dBm)"
+msgstr "Aviso de potencia recibida (dBm)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Sat"
+msgstr "sáb"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:338
+msgid "Serial number"
+msgstr "Número de serie"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:364
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:372
+msgid "Severity"
+msgstr "Gravedad"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:358
+msgid "Source"
+msgstr "Origen"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Sun"
+msgstr "dom"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:158
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:266
+msgid "Temperature"
+msgstr "Temperatura"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:119
+msgid "The OLT sent Deactivate_ONU-ID; the GPON link restarted"
+msgstr "La OLT mandó Deactivate_ONU-ID; el enlace GPON se reinició"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:420
+msgid "Thresholds"
+msgstr "Umbrales"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Thu"
+msgstr "jue"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:364
+msgid "Time"
+msgstr "Hora"
+
+#: htdocs/luci-static/resources/xr500v-gpon/graph.js:86
+msgid "Total:"
+msgstr "Total:"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:108
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:340
+msgid "Transmitted power"
+msgstr "Potencia transmitida"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Tue"
+msgstr "mar"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:358
+msgid "Value"
+msgstr "Valor"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:203
+msgid "Warnings: %d"
+msgstr "Avisos: %d"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js:163
+msgid "Wed"
+msgstr "mié"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:464
+msgid "Window:"
+msgstr "Ventana:"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:89
+msgid "critical"
+msgstr "crítico"
+
+#: htdocs/luci-static/resources/xr500v-gpon/heatmap.js:71
+msgid "critical event"
+msgstr "evento crítico"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:94
+msgid "info"
+msgstr "info"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:333
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:350
+msgid "kernel log"
+msgstr "log del kernel"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:69
+msgid "laser %s"
+msgstr "láser %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:54
+#: htdocs/luci-static/resources/xr500v-gpon/heatmap.js:74
+msgid "no data"
+msgstr "sin datos"
+
+#: htdocs/luci-static/resources/xr500v-gpon/heatmap.js:73
+msgid "no errors"
+msgstr "sin errores"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:253
+msgid "one sample per minute"
+msgstr "una muestra por minuto"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:252
+msgid "per 30 minutes"
+msgstr "cada 30 minutos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:252
+msgid "per 5 minutes"
+msgstr "cada 5 minutos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:252
+msgid "per minute"
+msgstr "por minuto"
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:81
+msgid "resyncs %d"
+msgstr "resyncs %d"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:51
+msgid "saved 1-minute detail"
+msgstr "detalle de 1 minuto guardado"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:264
+msgid "sensitivity limit"
+msgstr "límite de sensibilidad"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:243
+msgid ""
+"the GPON port has not reached O5 since the router started and receives no "
+"light. Nothing is recorded until it does."
+msgstr "el puerto GPON no llegó a O5 desde que arrancó el router y no recibe luz. No se registra nada hasta que lo haga."
+
+#: htdocs/luci-static/resources/view/status/include/15_gpon.js:46
+msgid "up %s"
+msgstr "desde hace %s"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:92
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:263
+msgid "warning"
+msgstr "aviso"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:367
+msgid "±30 min"
+msgstr "±30 min"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:280
+msgid "← Back to %s"
+msgstr "← Volver a %s"

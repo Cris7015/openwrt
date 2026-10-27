@@ -98,6 +98,8 @@ return baseclass.extend({
 
 		if (!L.isObject(s) || s.stale)
 			rows = [ _('Link state'), _('No data') ];
+		else if (s.health == 'nofiber')	/* never in O5 and no light: port not in use */
+			rows = [ _('Link state'), [ dot('nofiber'), _('No fiber') ] ];
 		else
 			rows = [
 				_('Link state'),        linkState(s),

@@ -235,6 +235,15 @@ return view.extend({
 
 	/* zoom: an `around` reply, drawn instead of the chosen window */
 	renderGraphs: function(history, summary, zoom) {
+		if (!zoom && summary.health == 'nofiber') {
+			this.points = [];
+			this.tipEvents = [];
+			return E('div', { 'class': 'cbi-section-descr' }, [
+				E('strong', {}, [ _('No fiber') ]), ' — ',
+				_('the GPON port has not reached O5 since the router started and receives no light. Nothing is recorded until it does.')
+			]);
+		}
+
 		var win = WINDOWS.filter(function(w) { return w[0] == history.window; })[0] || WINDOWS[0],
 		    step = zoom ? zoom.step : (history.step || 60),
 		    events = zoom ? (zoom.events || []) : (this.evData || []),
@@ -362,7 +371,7 @@ return view.extend({
 	renderAlerts: function(s) {
 		return table([ _('Severity'), _('Active alert') ], (s.alerts || []).map(function(a) {
 			return [ tag(a.severity), ALERTS[a.id] || a.id ];
-		}), (s.stale || s.health == 'unknown') ? _('No data') : _('No active alerts'));
+		}), (s.health == 'nofiber') ? _('No fiber') : (s.stale || s.health == 'unknown') ? _('No data') : _('No active alerts'));
 	},
 
 	setWindow: function(id, ev) {
