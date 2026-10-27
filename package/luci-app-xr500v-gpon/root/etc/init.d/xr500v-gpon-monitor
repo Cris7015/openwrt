@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+# GPON fiber health recorder (luci-app-xr500v-gpon). The "klog" instance
+# appends the xPON driver's kernel log lines to /tmp for the recorder:
+# logread -e takes a basic regex, so it matches the driver's device name
+# and the recorder picks the Deactivate and link-ready lines.
+
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	local enabled
+
+	config_load xr500v-gpon
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = 1 ] || return 0
+	mkdir -p /tmp/xr500v-gpon
+
+	procd_open_instance recorder
+	procd_set_param command /usr/bin/ucode -L /usr/share/xr500v-gpon /usr/share/xr500v-gpon/recorder.uc
+	procd_set_param respawn 3600 5 5
+	procd_set_param stderr 1
+	procd_close_instance
+
+	procd_open_instance klog
+	procd_set_param command /bin/sh -c 'exec logread -f -e "1fb60000.xmac" >> /tmp/xr500v-gpon/klog.log'
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
+}
+
+stop_service() {
+	ubus -t 10 call xr500v.gpon persist >/dev/null 2>&1
+}
+
+reload_service() {
+	ubus -t 5 call xr500v.gpon reload >/dev/null 2>&1 || restart
+}
+
+service_triggers() {
+	procd_add_reload_trigger xr500v-gpon
+}

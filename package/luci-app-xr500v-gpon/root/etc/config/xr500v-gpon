@@ -1,0 +1,14 @@
+
+config monitor 'main'
+	option enabled '1'
+	option interval '60'
+	option persist_hours '6'
+	option events_max '500'
+	option event_writes_per_day '100'
+
+config thresholds 'thresholds'
+	option rx_warn_dbm '-25'
+	option rx_crit_dbm '-27'
+	option rx_high_dbm '-9'
+	option temp_warn_c '70'
+	option bip_burst_per_min '10'
