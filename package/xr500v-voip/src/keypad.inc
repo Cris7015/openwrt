@@ -26,6 +26,27 @@ enum { TONE_DIAL, TONE_SIT, TONE_BUSY };
 static const struct tone_step { short hz, ms; }
 	busy_cadence[] = { { 425, 300 }, { 0, 200 } },	/* not measured on the HGU */
 	sit_cadence[] = { { 950, 330 }, { 1400, 330 }, { 1800, 330 }, { 0, 1000 } };
+/* Every tone frequency used here repeats exactly every 320 samples (40 ms):
+ * 425 Hz -> 17 cycles, 950 -> 38, 1400 -> 56, 1800 -> 72. One table per
+ * frequency, filled once by the manager before any worker forks, replaces
+ * 8000 soft-float sin() calls per second in every tone worker (the 34Kc has
+ * no FPU). Same samples as sin(2*pi*f*t/8000) for any t. */
+#define TONE_TAB	320
+#define TONE_RAMP	64	/* 8 ms fade in/out: no click where a tone starts or stops */
+static const short tone_freqs[] = { 425, 950, 1400, 1800 };
+static int16_t tone_tab[4][TONE_TAB];
+static int tone_tab_ready;
+
+static void tone_tab_init(void)
+{
+	unsigned k, i;
+
+	for (k = 0; k < 4; k++)
+		for (i = 0; i < TONE_TAB; i++)
+			tone_tab[k][i] = (int16_t)(TONE_LEVEL *
+				sin(2 * 3.141592653589793 * tone_freqs[k] * i / 8000.0));
+	tone_tab_ready = 1;
+}
 static int keypad_tone = TONE_DIAL;
 static long tone_limit_ms;		/* 0: play until stopped */
 static int worker_diag_fd = -1;		/* the diagnostic FIFO, closed in workers */
@@ -51,7 +72,12 @@ static int16_t tone_at(int kind, unsigned long long t)
 			ms -= c[i].ms;
 		hz = c[i].hz;
 	}
-	return hz ? (int16_t)(TONE_LEVEL * sin(2 * 3.141592653589793 * hz * t / 8000.0)) : 0;
+	if (!tone_tab_ready)
+		tone_tab_init();
+	for (i = 0; hz && i < 4; i++)
+		if (tone_freqs[i] == hz)
+			return tone_tab[i][t % TONE_TAB];
+	return 0;
 }
 
 static long long clock_ms(void)
@@ -86,12 +112,31 @@ static int frame_io(int fd, void *buf, size_t size, int playback)
 	return 0;
 }
 
+/* The next DTMF_SAMPLES of the line tone, faded in and out over TONE_RAMP
+ * samples so that neither its start nor a stop (first digit, time limit)
+ * cuts the waveform at an arbitrary point. */
+static void tone_block(int16_t *out, unsigned long long *t, int *ramp, int on,
+		       unsigned long long limit)
+{
+	int i;
+
+	for (i = 0; i < DTMF_SAMPLES; i++, (*t)++) {
+		int want = on && !(limit && *t >= limit);
+
+		if (want && *ramp < TONE_RAMP)
+			(*ramp)++;
+		else if (!want && *ramp > 0)
+			(*ramp)--;
+		out[i] = *ramp ? (int16_t)(tone_at(keypad_tone, *t) * *ramp / TONE_RAMP) : 0;
+	}
+}
+
 /* output < 0: a tone-only worker, nothing is collected. */
 static void keypad_worker(int output, int ctrl, int diagnostic)
 {
 	struct dtmf_detector d = {0};
 	int16_t samples[DTMF_SAMPLES], tone[DTMF_SAMPLES];
-	int fd, i, quiet = 0;
+	int fd, i, quiet = 0, ramp = 0;
 	unsigned long long t = 0, limit = (unsigned long long)tone_limit_ms * 8;
 	pid_t parent = getppid();
 	signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);
@@ -105,6 +150,14 @@ static void keypad_worker(int output, int ctrl, int diagnostic)
 	for (i = 0; (fd = open(keypad_device, O_RDWR | O_CLOEXEC)) < 0 && i < 20; i++)
 		usleep(50000);
 	if (fd < 0) _exit(1);
+	/* 40 ms queued before the first capture read. In lockstep (20 ms read,
+	 * then 20 ms write) the playback FIFO otherwise runs down to empty every
+	 * cycle, and one wake-up a few ms late leaves a 10 ms hole -- a click --
+	 * in the tone. dual_play_limit (640 B) holds exactly these 4 frames. */
+	for (i = 0; i < 2; i++) {
+		tone_block(tone, &t, &ramp, 1, limit);
+		if (frame_io(fd, tone, sizeof(tone), 1)) goto out;
+	}
 	for (;;) {
 		char digit;
 		if (frame_io(fd, samples, sizeof(samples), 0)) break;
@@ -115,10 +168,10 @@ static void keypad_worker(int output, int ctrl, int diagnostic)
 		/* Conservative local tones; preserve existing call audio/AEC. Past
 		 * the limit the device stays open and silent: closing it parks the
 		 * SLIC, which can read as a false on-hook. */
-		for (i = 0; i < DTMF_SAMPLES; i++, t++)
-			tone[i] = quiet || (limit && t >= limit) ? 0 : tone_at(keypad_tone, t);
+		tone_block(tone, &t, &ramp, !quiet, limit);
 		if (frame_io(fd, tone, sizeof(tone), 1)) break;
 	}
+out:
 	close(fd); if (output >= 0) close(output); _exit(0);
 }
 

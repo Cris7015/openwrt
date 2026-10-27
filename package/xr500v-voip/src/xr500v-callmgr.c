@@ -877,6 +877,7 @@ int main(void)
 		}
 	}
 
+	tone_tab_init();	/* before any worker forks: they share the table */
 	logmsg(shared_mode ? "starting (release 9, shared ring group on phone1)" :
 			     "starting (release 9, off-hook busy policy)");
 	if (call_waiting)

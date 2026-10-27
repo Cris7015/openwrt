@@ -190,7 +190,7 @@ static void cid_worker(const char *device, int ctrl, int diagnostic)
 	int16_t frame[DTMF_SAMPLES], in[DTMF_SAMPLES];
 	size_t pos = 0;
 	pid_t parent = getppid();
-	int fd;
+	int fd, primed = 0;
 
 	signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);
 	prctl(PR_SET_PDEATHSIG, SIGTERM);
@@ -204,7 +204,12 @@ static void cid_worker(const char *device, int ctrl, int diagnostic)
 		memset(frame, 0, sizeof(frame));
 		memcpy(frame, cid_wave + pos, k * sizeof(int16_t));
 		pos += k;
-		if (frame_io(fd, in, sizeof(in), 0)) break;
+		/* The first 40 ms go out before any read, as in keypad_worker:
+		 * a 10 ms playback underrun in the middle of the FSK is lost bits. */
+		if (primed < 2)
+			primed++;
+		else if (frame_io(fd, in, sizeof(in), 0))
+			break;
 		if (frame_io(fd, frame, sizeof(frame), 1)) break;
 	}
 	close(fd); _exit(0);
