@@ -1,0 +1,101 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] cfg80211: XR500v lab: A-MSDU subframes keep page_pool references
+
+amsdu_pp_ref (0644, off by default): __frame_add_frag took get_page() on
+page_pool pages, so the pool released them on every A-MSDU (xarray +
+dma_map, ~3 % of the RX CPU). With pool references that cost is gone.
+Plus the agents' B-08 behind amsdu_napi_cache (napi skb cache for the
+subframes, off by default and not enabled on the router). Lab, 25-oct.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -20,9 +20,20 @@
+ #include <linux/gcd.h>
+ #include <linux/bitfield.h>
+ #include <linux/nospec.h>
++#include <net/page_pool/helpers.h>
+ #include "core.h"
+ #include "rdev-ops.h"
+ 
++static bool amsdu_pp_ref;
++module_param(amsdu_pp_ref, bool, 0644);
++MODULE_PARM_DESC(amsdu_pp_ref,
++		 "Share page pool pages with A-MSDU subframes through page pool references (lab)");
++
++static bool amsdu_napi_cache;
++module_param(amsdu_napi_cache, bool, 0644);
++MODULE_PARM_DESC(amsdu_napi_cache,
++		 "Take A-MSDU subframe skbs from, and return the A-MSDU to, the per-CPU NAPI skb cache when running in softirq (lab)");
++
+ 
+ const struct ieee80211_rate *
+ ieee80211_get_response_rate(struct ieee80211_supported_band *sband,
+@@ -681,9 +692,20 @@
+ 		 void *ptr, int len, int size)
+ {
+ 	struct skb_shared_info *sh = skb_shinfo(skb);
++	struct page *head = compound_head(page);
+ 	int page_offset;
+ 
+-	get_page(page);
++	/*
++	 * A plain reference on a page pool page keeps the pool from
++	 * recycling it when the A-MSDU is freed: the page is unmapped and
++	 * dropped, and the driver maps a new one for every RX buffer. When the
++	 * subframe takes page pool references instead (pp_recycle set by the
++	 * caller), the page goes back to the pool once all of them are gone.
++	 */
++	if (skb->pp_recycle && page_pool_page_is_pp(head))
++		page_pool_ref_page(head);
++	else
++		get_page(page);
+ 	page_offset = ptr - page_address(page);
+ 	skb_add_rx_frag(skb, sh->nr_frags, page, page_offset, len, size);
+ }
+@@ -753,11 +775,27 @@
+ 	 * Allocate and reserve two bytes more for payload
+ 	 * alignment since sizeof(struct ethhdr) is 14.
+ 	 */
+-	frame = dev_alloc_skb(hlen + sizeof(struct ethhdr) + 2 + cur_len);
++	if (reuse_frag && READ_ONCE(amsdu_napi_cache) && in_softirq()) {
++		/*
++		 * Same head as dev_alloc_skb() gives for this small size (a
++		 * kmalloc head with NET_SKB_PAD reserved), but the sk_buff
++		 * comes from the per-CPU NAPI cache, refilled in bulk.
++		 */
++		frame = __alloc_skb(NET_SKB_PAD + hlen + sizeof(struct ethhdr) +
++				    2 + cur_len, GFP_ATOMIC | __GFP_NOWARN,
++				    SKB_ALLOC_RX | SKB_ALLOC_NAPI, NUMA_NO_NODE);
++		if (frame)
++			skb_reserve(frame, NET_SKB_PAD);
++	} else {
++		frame = dev_alloc_skb(hlen + sizeof(struct ethhdr) + 2 +
++				      cur_len);
++	}
+ 	if (!frame)
+ 		return NULL;
+ 
+ 	frame->priority = skb->priority;
++	if (READ_ONCE(amsdu_pp_ref))
++		frame->pp_recycle = skb->pp_recycle;
+ 	skb_reserve(frame, hlen + sizeof(struct ethhdr) + 2);
+ 	skb_copy_bits(skb, offset, skb_put(frame, cur_len), cur_len);
+ 
+@@ -949,8 +987,13 @@
+ 		__skb_queue_tail(list, frame);
+ 	}
+ 
+-	if (!reuse_skb)
+-		dev_kfree_skb(skb);
++	if (!reuse_skb) {
++		/* Its sk_buff can serve the driver's next napi_build_skb(). */
++		if (READ_ONCE(amsdu_napi_cache) && in_softirq())
++			napi_consume_skb(skb, 1);
++		else
++			dev_kfree_skb(skb);
++	}
+ 
+ 	return;
+ 

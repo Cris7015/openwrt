@@ -1,0 +1,96 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: whnat: drop on a full LAN ring instead of a reordering fallback
+
+When the LAN QDMA ring is full the stack fallback reached the WAN by
+another ring and overtook the flow's frames still queued (fallback 3-4 %
+under load). whnat_busy_drop drops it as a full egress queue would; the
+whnat_handed_zc and whnat_fallback_busy counters show both. Agents' B-04.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_whnat.c b/drivers/net/ethernet/airoha/airoha_whnat.c
+--- a/drivers/net/ethernet/airoha/airoha_whnat.c
++++ b/drivers/net/ethernet/airoha/airoha_whnat.c
+@@ -131,6 +131,16 @@
+ module_param_cb(whnat_ingress_gso, &counter_ops, &ingress_gso, 0444);
+ module_param_cb(whnat_ingress_tc, &counter_ops, &ingress_tc, 0444);
+ 
++/* Frames handed without a copy, and fallbacks caused by a full LAN ring. */
++static atomic_t handed_zc = ATOMIC_INIT(0);
++static atomic_t fallback_busy = ATOMIC_INIT(0);
++module_param_cb(whnat_handed_zc, &counter_ops, &handed_zc, 0444);
++module_param_cb(whnat_fallback_busy, &counter_ops, &fallback_busy, 0444);
++
++static bool whnat_busy_drop;
++module_param(whnat_busy_drop, bool, 0644);
++MODULE_PARM_DESC(whnat_busy_drop, "Drop upstream frames that find the LAN QDMA ring full instead of routing them through the stack (lab)");
++
+ static bool airoha_whnat_upstream(struct sk_buff *skb);
+ 
+ #if IS_ENABLED(CONFIG_NETFILTER_INGRESS)
+@@ -544,7 +554,7 @@
+ 	struct airoha_ppe *ppe;
+ 	bool taken = false;
+ 	bool ipv6;
+-	int idx;
++	int idx, ret;
+ 
+ 	if (!READ_ONCE(whnat_enable) || !skb || !skb->dev ||
+ 	    skb_is_gso(skb) || skb_vlan_tag_present(skb))
+@@ -574,14 +584,19 @@
+ 		frame = airoha_whnat_rx_page_frame(skb, idx, &len);
+ 		if (frame) {
+ 			skb->dev = NULL;
+-			if (airoha_whnat_qdma_xmit_buf(qdma, skb, frame, len) >= 0) {
++			ret = airoha_whnat_qdma_xmit_buf(qdma, skb, frame, len);
++			if (ret >= 0) {
+ 				atomic_inc(&handed);
++				atomic_inc(&handed_zc);
+ 				if (ipv6)
+ 					atomic_inc(&handed6);
+ 				taken = true;
+ 				goto out;
+ 			}
+ 			skb->dev = vif_dev;
++			/* A full ring stays full: do not copy for a retry. */
++			if (ret == -EBUSY || ret == -EAGAIN)
++				goto busy;
+ 		}
+ 		if (skb_linearize(skb))
+ 			goto out;
+@@ -597,15 +612,30 @@
+ 
+ 	/* The frame no longer belongs to a netdev queue (no BQL accounting). */
+ 	skb->dev = NULL;
+-	if (airoha_whnat_qdma_xmit(qdma, skb) >= 0) {
++	ret = airoha_whnat_qdma_xmit(qdma, skb);
++	if (ret >= 0) {
+ 		atomic_inc(&handed);
+ 		if (ipv6)
+ 			atomic_inc(&handed6);
+ 		taken = true;
+-	} else {
+-		memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+-		skb_pull(skb, VLAN_HLEN + ETH_HLEN);
+-		skb->dev = vif_dev;
++		goto out;
++	}
++	memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
++	skb_pull(skb, VLAN_HLEN + ETH_HLEN);
++	skb->dev = vif_dev;
++	if (ret != -EBUSY && ret != -EAGAIN)
++		goto out;
++busy:
++	/*
++	 * The LAN QDMA ring is full. Through the stack the frame reaches the
++	 * WAN by another ring and can overtake the frames of its flow still
++	 * queued here; whnat_busy_drop drops it instead, as a full egress
++	 * queue would.
++	 */
++	atomic_inc(&fallback_busy);
++	if (READ_ONCE(whnat_busy_drop)) {
++		kfree_skb_reason(skb, SKB_DROP_REASON_FULL_RING);
++		taken = true;
+ 	}
+ out:
+ 	if (!taken)

@@ -1,0 +1,1209 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] mt76: XR500v WiFi lab of 25-oct (TX status, completions, RX)
+
+Lab state of the 25-oct WiFi work, which the wifiagents image carried
+only as build_dir edits (lost when 190/191 made the package re-prepare).
+Most of it is behind parameters (the deferred TX status queue added
+unconditionally stays empty unless txs_defer_batch is set); the lab
+profile is turned on by /etc/modules.conf on the router:
+
+mt76x02-lib: rx_buf_size (4096: one A-MSDU of 2x1500 per buffer, so the
+WHNAT zero copy takes every subframe), tx_status_interval, tx_delay_int
+(completions from TXDELAYINT), tx_stat_irq, txs_complete_poll (poll the
+status FIFO one frame in N), tx_wb_ddone (TX DMA_DONE writeback).
+mt76: txs_defer_batch (TX status deferred out of rx_lock), rx_batch,
+tx_ddone. Also the agents' A01-07 and B05/06/09 (fewer uncached reads,
+RX batching, small A-MSDU linearised) and diagnostic counters.
+
+Measured on 25-oct (Samsung SM-A566E, Ookla Movistar Mendoza): 494-513
+down / 440 up, against ~400/330 without.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff -ruN a/dma.c b/dma.c
+--- a/dma.c
++++ b/dma.c
+@@ -216,6 +216,7 @@
+ 
+ 	q->head = mt76_dma_read_dma_idx(q, 0);
+ 	q->tail = q->head;
++	q->kicked = q->head;
+ }
+ 
+ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+@@ -417,35 +418,160 @@
+ 		*q->emi_cpu_idx = cpu_to_le16(q->head);
+ 	else
+ 		Q_WRITE(q, cpu_idx, q->head);
++	/* After the barrier: see mt76_dma_tx_ddone_last() */
++	WRITE_ONCE(q->kicked, q->head);
++}
++
++static unsigned int txc_reread, txc_reread_more;
++module_param(txc_reread, uint, 0444);
++module_param(txc_reread_more, uint, 0444);
++
++static int tx_max_reread = -1;
++module_param(tx_max_reread, int, 0644);
++MODULE_PARM_DESC(tx_max_reread,
++		 "TX cleanup: read the DMA index again at most N times per sweep once it is reached, -1 no limit (lab)");
++
++static bool tx_ddone;
++module_param(tx_ddone, bool, 0644);
++MODULE_PARM_DESC(tx_ddone,
++		 "TX cleanup: take completions from the DMA_DONE bit the DMA writes back into TX descriptors, if the driver enables that, and read the DMA index only when none is set (lab)");
++
++/* lab: descriptors completed from DMA_DONE; DMA index reads in that mode, and
++ * those that found completions DMA_DONE had not shown (yet).
++ */
++static unsigned int txc_ddone, txc_verify, txc_verify_more;
++module_param(txc_ddone, uint, 0444);
++module_param(txc_verify, uint, 0444);
++module_param(txc_verify_more, uint, 0444);
++
++/*
++ * lab safety check: on one sweep in N that DMA_DONE served, read the index
++ * after the scan and count the sweeps where DMA_DONE claimed descriptors the
++ * index had not passed yet. Anything but 0 means DMA_DONE is written before
++ * the DMA is done with the buffers: do not use tx_ddone then.
++ */
++static unsigned int tx_ddone_check = 64;
++module_param(tx_ddone_check, uint, 0644);
++static unsigned int txc_ddone_sweeps, txc_ddone_ahead;
++module_param(txc_ddone_ahead, uint, 0444);
++
++/*
++ * First descriptor from @tail on that the DMA has not marked done. Only
++ * descriptors before the last kick are looked at: they were complete (and
++ * their old DMA_DONE overwritten) before q->kicked moved past them, while the
++ * enqueue path on the other CPU may still be writing the ones after it. The
++ * descriptors are coherent (uncached) memory: a DRAM read each, not PCIe.
++ */
++static int
++mt76_dma_tx_ddone_last(struct mt76_queue *q, int tail, int max)
++{
++	int kicked = READ_ONCE(q->kicked);
++	int n = 0;
++
++	smp_rmb();
++	while (n < max && tail != kicked &&
++	       (READ_ONCE(q->desc[tail].ctrl) &
++		cpu_to_le32(MT_DMA_CTL_DMA_DONE))) {
++		tail = (tail + 1) % q->ndesc;
++		n++;
++	}
++	txc_ddone += n;
++
++	return tail;
+ }
+ 
+ static void
+ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ {
+ 	struct mt76_queue_entry entry;
+-	int last;
++	int last, tail, done = 0, rereads = 0;
++	int max_reread = READ_ONCE(tx_max_reread);
++	bool ddone;
+ 
+ 	if (!q || !q->ndesc)
+ 		return;
+ 
++	/*
++	 * The TX interrupt sweeps every queue, mostly idle ones. Reading their
++	 * DMA index is an uncached MMIO access each time: skip it when there
++	 * is nothing to clean.
++	 */
++	if (!flush && !READ_ONCE(q->queued))
++		return;
++
++	ddone = !flush && READ_ONCE(tx_ddone) &&
++		(q->flags & MT_QFLAG_TX_DDONE) && q->desc &&
++		!mt76_queue_is_emi(q) && !mt76_queue_is_npu(q);
++
+ 	spin_lock_bh(&q->cleanup_lock);
+-	if (flush)
++	tail = q->tail;
++	if (flush) {
+ 		last = -1;
+-	else
++	} else if (ddone) {
++		last = mt76_dma_tx_ddone_last(q, tail, q->queued);
++		/*
++		 * Nothing marked: the write-back may be off, or not visible
++		 * yet. One read of the index then, as without DMA_DONE.
++		 */
++		if (last == tail) {
++			last = mt76_dma_read_dma_idx(q, -1);
++			txc_verify++;
++			txc_verify_more += last != tail;
++		} else if (READ_ONCE(tx_ddone_check) &&
++			   !(++txc_ddone_sweeps % READ_ONCE(tx_ddone_check))) {
++			int idx = mt76_dma_read_dma_idx(q, -1);
++
++			if (idx >= 0 &&
++			    (last - tail + q->ndesc) % q->ndesc >
++			    (idx - tail + q->ndesc) % q->ndesc)
++				txc_ddone_ahead++;
++		}
++	} else {
+ 		last = mt76_dma_read_dma_idx(q, -1);
++	}
+ 
+-	while (q->queued > 0 && q->tail != last) {
+-		mt76_dma_tx_cleanup_idx(dev, q, q->tail, &entry);
+-		mt76_npu_txdesc_cleanup(q, q->tail);
+-		mt76_queue_tx_complete(dev, q, &entry);
++	/*
++	 * Only this function moves the tail, under cleanup_lock. Advance it
++	 * once per sweep instead of taking q->lock, which the enqueue path
++	 * holds on the other CPU, for every completed frame.
++	 */
++	while (q->queued > done && tail != last) {
++		mt76_dma_tx_cleanup_idx(dev, q, tail, &entry);
++		mt76_npu_txdesc_cleanup(q, tail);
++		if (entry.skb)
++			dev->drv->tx_complete_skb(dev, &entry);
+ 
+ 		if (entry.txwi) {
+ 			if (!(dev->drv->drv_flags & MT_DRV_TXWI_NO_FREE))
+ 				mt76_put_txwi(dev, entry.txwi);
+ 		}
+ 
+-		if (!flush && q->tail == last)
++		tail = (tail + 1) % q->ndesc;
++		done++;
++		if (flush || tail != last)
++			continue;
++
++		/*
++		 * Reached the bound: look again for frames completed while
++		 * these were processed. A DMA_DONE scan costs DRAM reads; a
++		 * new read of the index costs a PCIe read and, with the TX
++		 * delay interrupt, finds a few frames that the next interrupt
++		 * would bring anyway.
++		 */
++		if (ddone) {
++			last = mt76_dma_tx_ddone_last(q, tail, q->queued - done);
++		} else if (max_reread < 0 || rereads < max_reread) {
++			rereads++;
+ 			last = mt76_dma_read_dma_idx(q, -1);
++			txc_reread++;
++			txc_reread_more += last != tail && q->queued > done;
++		}
++	}
++	if (done) {
++		spin_lock_bh(&q->lock);
++		q->tail = tail;
++		q->queued -= done;
++		spin_unlock_bh(&q->lock);
+ 	}
+ 	spin_unlock_bh(&q->cleanup_lock);
+ 
+@@ -456,7 +582,7 @@
+ 		spin_unlock_bh(&q->lock);
+ 	}
+ 
+-	if (!q->queued)
++	if (!q->queued && wq_has_sleeper(&dev->tx_wait))
+ 		wake_up(&dev->tx_wait);
+ }
+ 
+@@ -505,7 +631,8 @@
+ 
+ static void *
+ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+-		 int *len, u32 *info, bool *more, bool *drop, bool flush)
++		 int *len, u32 *info, bool *more, bool *drop, bool flush,
++		 const u32 *ctrl_read)
+ {
+ 	struct mt76_queue_entry *e = &q->entry[idx];
+ 	struct mt76_desc *desc = &q->desc[idx];
+@@ -518,17 +645,32 @@
+ 	if (mt76_queue_is_wed_rro(q))
+ 		goto done;
+ 
+-	ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
++	/* The ring is uncached memory: reuse the ctrl word dequeue read. */
++	ctrl = ctrl_read ? *ctrl_read : le32_to_cpu(READ_ONCE(desc->ctrl));
+ 	if (len) {
+ 		*len = FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl);
+ 		*more = !(ctrl & MT_DMA_CTL_LAST_SEC0);
+ 	}
+ 
+-	desc_info = le32_to_cpu(desc->info);
++	/*
++	 * info and buf1 only carry WED/RRO data (descriptor version >= 1).
++	 * Drivers whose rx_skb() ignores info can skip two more uncached
++	 * reads per buffer on their data queues. Not on the MCU queue:
++	 * mt76x02 matches MCU responses by the sequence number that info
++	 * carries (skb->cb, mt76x02_mcu_parse_response()).
++	 */
++	if ((dev->drv->drv_flags & MT_DRV_RX_NO_DMA_INFO) &&
++	    q != &dev->q_rx[MT_RXQ_MCU] &&
++	    !mt76_queue_is_wed_rx(q) && !(ctrl & MT_DMA_CTL_VER_MASK)) {
++		desc_info = 0;
++		buf1 = 0;
++	} else {
++		desc_info = le32_to_cpu(desc->info);
++		buf1 = le32_to_cpu(desc->buf1);
++	}
+ 	if (info)
+ 		*info = desc_info;
+ 
+-	buf1 = le32_to_cpu(desc->buf1);
+ 	mt76_dma_should_drop_buf(drop, ctrl, buf1, desc_info);
+ 
+ 	if (mt76_queue_is_wed_rx(q)) {
+@@ -569,7 +711,9 @@
+ mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
+ 		 int *len, u32 *info, bool *more, bool *drop)
+ {
++	const u32 *ctrl_read = NULL;
+ 	int idx = q->tail;
++	u32 ctrl;
+ 
+ 	*more = false;
+ 	if (!q->queued)
+@@ -608,26 +752,31 @@
+ 
+ 		if (q->tail == q->ndesc - 1)
+ 			q->magic_cnt = (q->magic_cnt + 1) % MT_DMA_MAGIC_CNT;
++	} else if (flush) {
++		q->desc[idx].ctrl |= cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+ 	} else {
+-		if (flush)
+-			q->desc[idx].ctrl |= cpu_to_le32(MT_DMA_CTL_DMA_DONE);
+-		else if (!(q->desc[idx].ctrl & cpu_to_le32(MT_DMA_CTL_DMA_DONE)))
++		__le32 c = READ_ONCE(q->desc[idx].ctrl);
++
++		if (!(c & cpu_to_le32(MT_DMA_CTL_DMA_DONE)))
+ 			return NULL;
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 		/* on WED v3 the M_DONE bit signals that WED is done reading
+ 		 * the txfree descriptor; WED v2 does not set it
+ 		 */
+-		else if (dev->mmio.wed.version > 2 &&
+-			 mt76_queue_is_wed_tx_free(q) &&
+-			 !(q->desc[idx].ctrl & cpu_to_le32(MT_DMA_CTL_M_DONE)))
++		if (dev->mmio.wed.version > 2 &&
++		    mt76_queue_is_wed_tx_free(q) &&
++		    !(c & cpu_to_le32(MT_DMA_CTL_M_DONE)))
+ 			return NULL;
+ #endif
++		ctrl = le32_to_cpu(c);
++		ctrl_read = &ctrl;
+ 	}
+ done:
+ 	q->tail = (q->tail + 1) % q->ndesc;
+ 	q->queued--;
+ 
+-	return mt76_dma_get_buf(dev, q, idx, len, info, more, drop, flush);
++	return mt76_dma_get_buf(dev, q, idx, len, info, more, drop, flush,
++				ctrl_read);
+ }
+ 
+ static int
+@@ -663,6 +812,12 @@
+ 	return -ENOMEM;
+ }
+ 
++static unsigned int tx_linearize_small;
++module_param(tx_linearize_small, uint, 0644);
++MODULE_PARM_DESC(tx_linearize_small, "lab: copy A-MSDUs of at most this many bytes into one TX buffer (0: off)");
++static unsigned int tx_linearized_small;
++module_param(tx_linearized_small, uint, 0444);
++
+ static int
+ mt76_dma_tx_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 		      enum mt76_txq_id qid, struct sk_buff *skb,
+@@ -716,6 +871,20 @@
+ 		mt76_insert_hdr_pad(skb);
+ 	}
+ 
++	/*
++	 * lab: a software A-MSDU of short subframes (typically TCP ACKs)
++	 * reaches the PDMA as many small buffers. Both MT7612 TX stalls seen
++	 * with amsdu_no_odd were frames like that (6 and 16 ACK subframes).
++	 * Copying up to tx_linearize_small bytes into one buffer is cheap and
++	 * keeps the A-MSDU, unlike linear_tx=1.
++	 */
++	if (skb_has_frag_list(skb) &&
++	    skb->len <= READ_ONCE(tx_linearize_small)) {
++		if (__skb_linearize(skb))
++			goto free;
++		tx_linearized_small++;
++	}
++
+ 	len = skb_headlen(skb);
+ 	addr = dma_map_single(dev->dma_dev, skb->data, len, DMA_TO_DEVICE);
+ 	if (unlikely(dma_mapping_error(dev->dma_dev, addr)))
+@@ -1113,8 +1282,20 @@
+ 	return done;
+ }
+ 
++/*
++ * lab: hand the frames to mac80211 and the WHNAT hook in batches of at most
++ * rx_batch DMA buffers instead of the whole NAPI budget. A 64-buffer batch
++ * of A-MSDUs touches more than the 32 KiB D-cache before the first subframe
++ * reaches the hook, which then misses again on its headers. It also bounds
++ * how long mt76_rx_complete() holds rx_lock. 0 keeps the old behaviour.
++ */
++static unsigned int rx_batch;
++module_param(rx_batch, uint, 0644);
++MODULE_PARM_DESC(rx_batch, "lab: RX buffers per mac80211 batch inside a NAPI poll (0: the whole budget)");
++
+ int mt76_dma_rx_poll(struct napi_struct *napi, int budget)
+ {
++	unsigned int batch = READ_ONCE(rx_batch);
+ 	struct mt76_dev *dev;
+ 	int qid, done = 0, cur;
+ 
+@@ -1124,7 +1305,11 @@
+ 	rcu_read_lock();
+ 
+ 	do {
+-		cur = mt76_dma_rx_process(dev, &dev->q_rx[qid], budget - done);
++		int n = budget - done;
++
++		if (batch && n > batch)
++			n = batch;
++		cur = mt76_dma_rx_process(dev, &dev->q_rx[qid], n);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done += cur;
+ 	} while (cur && done < budget);
+diff -ruN a/mac80211.c b/mac80211.c
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -693,6 +693,7 @@
+ 	dev->phys[phy->band_idx] = phy;
+ 
+ 	spin_lock_init(&dev->rx_lock);
++	skb_queue_head_init(&dev->tx_status_defer);
+ 	spin_lock_init(&dev->lock);
+ 	spin_lock_init(&dev->cc_lock);
+ 	spin_lock_init(&dev->status_lock);
+@@ -1557,6 +1558,10 @@
+ 	}
+ 	spin_unlock(&dev->rx_lock);
+ 
++	/* Take over a backlog the tx completion could not report. */
++	if (skb_queue_len_lockless(&dev->tx_status_defer) >= 32)
++		mt76_tx_status_flush_deferred(dev, false);
++
+ 	if (!napi) {
+ 		netif_receive_skb_list(&list);
+ 		return;
+diff -ruN a/mt76.h b/mt76.h
+--- a/mt76.h
++++ b/mt76.h
+@@ -44,6 +44,8 @@
+ #define MT_QFLAG_WED_RRO_EN	BIT(7)
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
++/* the DMA writes DMA_DONE back into this TX ring's descriptors (lab) */
++#define MT_QFLAG_TX_DDONE	BIT(10)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+@@ -252,6 +254,8 @@
+ 	u16 first;
+ 	u16 head;
+ 	u16 tail;
++	/* head at the last kick: descriptors before it are complete */
++	u16 kicked;
+ 	u8 hw_idx;
+ 	u8 ep;
+ 	int ndesc;
+@@ -549,6 +553,8 @@
+ #define MT_DRV_AMSDU_OFFLOAD		BIT(5)
+ #define MT_DRV_IGNORE_TXS_FAILED	BIT(6)
+ #define MT_DRV_HW_PS_BUFFERING		BIT(7)
++/* rx_skb() ignores the DMA info word: skip reading info/buf1 (lab) */
++#define MT_DRV_RX_NO_DMA_INFO		BIT(8)
+ 
+ struct mt76_driver_ops {
+ 	u32 drv_flags;
+@@ -963,6 +969,10 @@
+ 	struct net_device *napi_dev;
+ 	struct net_device *tx_napi_dev;
+ 	spinlock_t rx_lock;
++	/* tx status reports waiting for rx_lock, see mt76_tx_status_flush_deferred() */
++	struct sk_buff_head tx_status_defer;
++	/* the driver flushes tx_status_defer at the end of every TX poll */
++	bool tx_status_batch;
+ 	struct napi_struct napi[__MT_RXQ_MAX];
+ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
+ 	struct tasklet_struct irq_tasklet;
+@@ -1589,6 +1599,7 @@
+ 				       struct sk_buff_head *list);
+ void mt76_tx_status_skb_done(struct mt76_dev *dev, struct sk_buff *skb,
+ 			     struct sk_buff_head *list);
++void mt76_tx_status_flush_deferred(struct mt76_dev *dev, bool wait);
+ void __mt76_tx_complete_skb(struct mt76_dev *dev, u16 wcid, struct sk_buff *skb,
+ 			    struct list_head *free_list);
+ static inline void
+diff -ruN a/mt76x02.h b/mt76x02.h
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -98,6 +98,8 @@
+ 	DECLARE_KFIFO_PTR(txstatus_fifo, struct mt76x02_tx_status);
+ 	spinlock_t txstatus_fifo_lock;
+ 	u32 tx_airtime;
++	u32 tx_status_skip;
++	u32 txs_poll_skip;
+ 	u32 ampdu_ref;
+ 
+ 	struct sk_buff *rx_head;
+@@ -187,6 +189,7 @@
+ int mt76x02_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx, u32 val);
+ void mt76x02_remove_hdr_pad(struct sk_buff *skb, int len);
+ bool mt76x02_tx_status_data(struct mt76_dev *mdev, u8 *update);
++unsigned int mt76x02_tx_status_interval(void);
+ void mt76x02_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 			  struct sk_buff *skb, u32 *info);
+ void mt76x02_rx_poll_complete(struct mt76_dev *mdev, enum mt76_rxq_id q);
+diff -ruN a/mt76x02_irq_ack.h b/mt76x02_irq_ack.h
+--- a/mt76x02_irq_ack.h
++++ b/mt76x02_irq_ack.h
+@@ -1,10 +1,14 @@
+ /* SPDX-License-Identifier: BSD-3-Clause-Clear */
+ #ifndef __MT76X02_IRQ_ACK_H
+ #define __MT76X02_IRQ_ACK_H
+-/* Keep masked NAPI completion latches; clear other unhandled INTx sources. */
+-static inline u32 mt76x02_irq_ack_sources(u32 pending, u32 enabled)
++/*
++ * Keep masked NAPI completion latches; clear other unhandled INTx sources.
++ * tx_done is the source TX completions are taken from (TX done or the
++ * WPDMA TX delay interrupt): the other one is always cleared.
++ */
++static inline u32 mt76x02_irq_ack_sources(u32 pending, u32 enabled, u32 tx_done)
+ {
+-	u32 deferred = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL;
++	u32 deferred = MT_INT_RX_DONE_ALL | tx_done;
+ 	return pending & (enabled | ~deferred);
+ }
+ #endif
+diff -ruN a/mt76x02_mac.c b/mt76x02_mac.c
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -5,6 +5,29 @@
+  */
+ 
+ #include "mt76x02.h"
++
++/* lab: tx status FIFO entries carrying a tracked packet id */
++static unsigned int txs_fifo_skb, txs_fifo_skb_nomatch, txs_fifo_skb_ok, txs_fifo_skb_aggr;
++module_param(txs_fifo_skb, uint, 0444);
++module_param(txs_fifo_skb_nomatch, uint, 0444);
++module_param(txs_fifo_skb_ok, uint, 0444);
++module_param(txs_fifo_skb_aggr, uint, 0444);
++static int txs_probe_print;
++module_param(txs_probe_print, int, 0644);
++static unsigned int txs_probe_absorbed;
++module_param(txs_probe_absorbed, uint, 0444);
++static unsigned int txs_fifo_total, txs_fifo_pid0;
++module_param(txs_fifo_total, uint, 0444);
++module_param(txs_fifo_pid0, uint, 0444);
++
++/* lab: status FIFO polls that found it empty (each one cost two PCIe reads) */
++static unsigned int txs_fifo_empty;
++module_param(txs_fifo_empty, uint, 0444);
++
++static unsigned int txs_complete_poll = 1;
++module_param(txs_complete_poll, uint, 0644);
++MODULE_PARM_DESC(txs_complete_poll,
++		 "Poll the TX status FIFO from the TX completion of one frame in N: 1 every frame (as before), 0 one in tx_status_interval (lab)");
+ #include "mt76x02_trace.h"
+ #include "trace.h"
+ 
+@@ -277,8 +300,10 @@
+ 	stat1 = mt76_rr(dev, MT_TX_STAT_FIFO);
+ 
+ 	stat->valid = !!(stat1 & MT_TX_STAT_FIFO_VALID);
+-	if (!stat->valid)
++	if (!stat->valid) {
++		txs_fifo_empty++;
+ 		return false;
++	}
+ 
+ 	stat->success = !!(stat1 & MT_TX_STAT_FIFO_SUCCESS);
+ 	stat->aggr = !!(stat1 & MT_TX_STAT_FIFO_AGGR);
+@@ -288,6 +313,8 @@
+ 
+ 	stat->retry = FIELD_GET(MT_TX_STAT_FIFO_EXT_RETRY, stat2);
+ 	stat->pktid = FIELD_GET(MT_TX_STAT_FIFO_EXT_PKTID, stat2);
++	txs_fifo_total++;
++	txs_fifo_pid0 += !stat->pktid;
+ 
+ 	trace_mac_txstat_fetch(dev, stat);
+ 
+@@ -553,6 +580,14 @@
+ 					dev->mphy.chandef.chan->band))
+ 		return;
+ 
++	if (!(st->pktid & MT_PACKET_ID_HAS_RATE) && READ_ONCE(txs_probe_print) > 0) {
++		txs_probe_print--;
++		pr_info("txsdbg probe=%d sent idx=%02x fl=%04x final idx=%02x fl=%04x retry=%u aggr=%u ok=%u\n",
++			!!(info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE),
++			rate[0].idx, rate[0].flags, last_rate.idx, last_rate.flags,
++			st->retry, st->aggr, st->success);
++	}
++
+ 	/*
+ 	 * A tracked frame (a rate probe) that went out inside another frame's
+ 	 * A-MPDU says nothing about the rate it asked for: report the rate it
+@@ -560,6 +595,7 @@
+ 	 */
+ 	if (!(st->pktid & MT_PACKET_ID_HAS_RATE) && st->aggr &&
+ 	    mt76x02_tx_rate_absorbed(&rate[0], &last_rate, st->retry)) {
++		txs_probe_absorbed++;
+ 		rate[0] = last_rate;
+ 		rate[0].count = st->retry + 1;
+ 		i = 0;
+@@ -637,9 +673,14 @@
+ 	mt76_tx_status_lock(mdev, &list);
+ 
+ 	if (wcid) {
+-		if (mt76_is_skb_pktid(stat->pktid))
++		if (mt76_is_skb_pktid(stat->pktid)) {
+ 			status.skb = mt76_tx_status_skb_get(mdev, wcid,
+ 							    stat->pktid, &list);
++			txs_fifo_skb++;
++			txs_fifo_skb_nomatch += !status.skb;
++			txs_fifo_skb_ok += stat->success;
++			txs_fifo_skb_aggr += stat->aggr;
++		}
+ 		if (status.skb)
+ 			status.info = IEEE80211_SKB_CB(status.skb);
+ 	}
+@@ -684,7 +725,13 @@
+ 		ac = skb_get_queue_mapping(status.skb);
+ 		mt76_tx_status_skb_done(mdev, status.skb, &list);
+ 	} else if (msta) {
+-		len = status.info->status.ampdu_len * ewma_pktlen_read(&msta->pktlen);
++		/*
++		 * With tx_status_interval=N only one data frame in N asks for
++		 * this report: account the airtime of the other N - 1 too, or
++		 * the survey TX time and the airtime scheduler see 1/N of it.
++		 */
++		len = status.info->status.ampdu_len * ewma_pktlen_read(&msta->pktlen) *
++		      max_t(u32, READ_ONCE(msta->txs_interval), 1);
+ 		ac = FIELD_GET(MT_PKTID_AC, cur_pktid);
+ 	}
+ 
+@@ -980,6 +1027,7 @@
+ {
+ 	struct mt76x02_dev *dev = container_of(mdev, struct mt76x02_dev, mt76);
+ 	struct mt76x02_txwi *txwi;
++	unsigned int n;
+ 	u8 *txwi_ptr;
+ 
+ 	if (!e->txwi) {
+@@ -987,7 +1035,20 @@
+ 		return;
+ 	}
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
++	/*
++	 * A DMA completion comes before the frame is on the air, so it
++	 * rarely finds its own status; the poll mostly keeps the hardware
++	 * FIFO from filling up. With one data frame in N asking for a
++	 * status, polling on one completion in N keeps up with the FIFO
++	 * at 1/N of the cost: an empty poll is two uncached PCIe reads,
++	 * and it ran for every frame. The TX NAPI and the worker still
++	 * poll once per run.
++	 */
++	n = READ_ONCE(txs_complete_poll);
++	if (!n)
++		n = mt76x02_tx_status_interval();
++	if (n <= 1 || !(++dev->txs_poll_skip % n))
++		mt76x02_mac_poll_tx_status(dev, false);
+ 
+ 	txwi_ptr = mt76_get_txwi_ptr(mdev, e->txwi);
+ 	txwi = (struct mt76x02_txwi *)txwi_ptr;
+@@ -1277,6 +1338,14 @@
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
++	/*
++	 * Without the TX status interrupt (tx_stat_irq=0) the FIFO is only
++	 * read on TX activity: the status of the last frames before the link
++	 * goes idle would wait there until the 250 ms timeout below.
++	 */
++	if (mt76_is_mmio(&dev->mt76))
++		mt76x02_mac_poll_tx_status(dev, false);
++
+ 	mt76_tx_status_check(&dev->mt76, false);
+ 
+ 	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
+diff -ruN a/mt76x02_mac.h b/mt76x02_mac.h
+--- a/mt76x02_mac.h
++++ b/mt76x02_mac.h
+@@ -41,6 +41,10 @@
+ 	int n_frames;
+ 
+ 	struct ewma_pktlen pktlen;
++
++	/* tx_status_interval sampling: own counter, interval in use */
++	u32 txs_skip;
++	u32 txs_interval;
+ };
+ 
+ #define MT_RXINFO_BA			BIT(0)
+diff -ruN a/mt76x02_mmio.c b/mt76x02_mmio.c
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -18,6 +18,47 @@
+  * other interrupt, so a later snapshot cannot see them. [0] RX, [1] TX,
+  * [2] ANY. Counted in the interrupt handler only.
+  */
++static unsigned int rx_buf_size = MT_RX_BUF_SIZE;
++module_param(rx_buf_size, uint, 0444);
++MODULE_PARM_DESC(rx_buf_size,
++		 "Data RX buffer size, 2048 or 4096: in a full page an A-MSDU of two 1500 byte frames arrives in one buffer (lab)");
++
++static unsigned int tx_delay_int;
++module_param(tx_delay_int, uint, 0644);
++MODULE_PARM_DESC(tx_delay_int,
++		 "Take TX completions from the WPDMA TX delay interrupt, batched per MT_WPDMA_DELAY_INT_CFG, instead of every TX done (lab)");
++
++static unsigned int tx_stat_irq = 1;
++module_param(tx_stat_irq, uint, 0644);
++MODULE_PARM_DESC(tx_stat_irq,
++		 "Drain the TX status FIFO on its own interrupt; 0 leaves it to the TX NAPI and worker, only safe with tx_status_interval >= 4 (lab)");
++
++/* Interrupts seen per cause: TX done, TX delay, TX status, RX done. */
++static unsigned int irq_cause[4];
++module_param_array(irq_cause, uint, NULL, 0444);
++
++#define MT_INT_TX_ANY	(MT_INT_TX_DONE_ALL | MT_INT_TXDELAYINT)
++
++/*
++ * With the delay interrupt, keep the MCU and PSD/MGMT rings on their own TX
++ * done: whether MT_WPDMA_DELAY_INT_CFG counts them is not documented, and on
++ * a radio without data traffic the MCU ring (32 entries, calibration commands
++ * every second) would otherwise only be reclaimed by some later data frame.
++ * Both carry few frames.
++ */
++static u32 mt76x02_tx_done_irq(void)
++{
++	return READ_ONCE(tx_delay_int) ?
++	       MT_INT_TXDELAYINT | MT_INT_TX_DONE(MT_TX_HW_QUEUE_MCU) |
++	       MT_INT_TX_DONE(MT_TX_HW_QUEUE_MGMT) :
++	       MT_INT_TX_DONE_ALL;
++}
++
++static u32 mt76x02_tx_stat_irq(void)
++{
++	return READ_ONCE(tx_stat_irq) ? MT_INT_TX_STAT : 0;
++}
++
+ static unsigned int irq_coherent[3];
+ module_param_array(irq_coherent, uint, NULL, 0444);
+ MODULE_PARM_DESC(irq_coherent, "XR500v lab: latched RX/TX/ANY coherent DMA error sources");
+@@ -147,16 +188,38 @@
+ 		mt76x02_send_tx_status(dev, &stat, &update);
+ }
+ 
++static bool txw_poll_fifo = true;
++module_param(txw_poll_fifo, bool, 0644);
++MODULE_PARM_DESC(txw_poll_fifo,
++		 "TX worker: read the TX status FIFO (two PCIe reads) on every run; N leaves it to the TX NAPI and the completions (lab)");
++
++/* lab: worker runs, and runs that did not put a single frame on a ring */
++static unsigned int txw_runs, txw_idle_runs;
++module_param(txw_runs, uint, 0444);
++module_param(txw_idle_runs, uint, 0444);
++
+ static void mt76x02_tx_worker(struct mt76_worker *w)
+ {
+ 	struct mt76x02_dev *dev;
++	u16 head[IEEE80211_NUM_ACS];
++	int i;
+ 
+ 	dev = container_of(w, struct mt76x02_dev, mt76.tx_worker);
+ 
+-	mt76x02_mac_poll_tx_status(dev, false);
++	if (READ_ONCE(txw_poll_fifo))
++		mt76x02_mac_poll_tx_status(dev, false);
+ 	mt76x02_process_tx_status_fifo(dev);
+ 
++	for (i = 0; i < IEEE80211_NUM_ACS; i++)
++		head[i] = READ_ONCE(dev->mphy.q_tx[i]->head);
++
+ 	mt76_txq_schedule_all(&dev->mphy);
++
++	txw_runs++;
++	for (i = 0; i < IEEE80211_NUM_ACS; i++)
++		if (READ_ONCE(dev->mphy.q_tx[i]->head) != head[i])
++			break;
++	txw_idle_runs += i == IEEE80211_NUM_ACS;
+ }
+ 
+ static int mt76x02_poll_tx(struct napi_struct *napi, int budget)
+@@ -171,18 +234,43 @@
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
+ 
++	/*
++	 * Compare with the mask itself, not with a copy of the last decision:
++	 * mt76x02_mac_start() (device start, watchdog reset) enables
++	 * MT_INT_TX_STAT behind our back, which left tx_stat_irq=0 given at
++	 * load time without effect. A stale read only costs one more write.
++	 */
++	if ((READ_ONCE(dev->mt76.mmio.irqmask) & MT_INT_TX_STAT) !=
++	    mt76x02_tx_stat_irq()) {
++		if (mt76x02_tx_stat_irq())
++			mt76x02_irq_enable(dev, MT_INT_TX_STAT);
++		else
++			mt76x02_irq_disable(dev, MT_INT_TX_STAT);
++	}
++
+ 	if (napi_complete_done(napi, 0))
+-		mt76x02_irq_enable(dev, MT_INT_TX_DONE_ALL);
++		mt76x02_irq_enable(dev, mt76x02_tx_done_irq());
+ 
+ 	mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[MT_MCUQ_WM], false);
+ 	for (i = MT_TXQ_PSD; i >= 0; i--)
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], false);
+ 
++	mt76_tx_status_flush_deferred(&dev->mt76, false);
+ 	mt76_worker_schedule(&dev->mt76.tx_worker);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * mt76x02 has always turned the TX DMA_DONE write-back off and read each
++ * ring's DMA index over PCIe instead; mt7603 and rt2800, with the same kind
++ * of WPDMA, turn it on. Load time only.
++ */
++static bool tx_wb_ddone;
++module_param(tx_wb_ddone, bool, 0444);
++MODULE_PARM_DESC(tx_wb_ddone,
++		 "Have the WPDMA write DMA_DONE back into TX descriptors (MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE), for mt76.tx_ddone (lab)");
++
+ int mt76x02_dma_init(struct mt76x02_dev *dev)
+ {
+ 	int i, ret, fifo_size;
+@@ -225,6 +313,15 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/* Rings whose DMA_DONE mt76.tx_ddone may trust (the 2.4 GHz mt7603
++	 * radio, which always has the write-back on, stays as it is).
++	 */
++	if (tx_wb_ddone) {
++		for (i = 0; i <= MT_TXQ_PSD; i++)
++			dev->mphy.q_tx[i]->flags |= MT_QFLAG_TX_DDONE;
++		dev->mt76.q_mcu[MT_MCUQ_WM]->flags |= MT_QFLAG_TX_DDONE;
++	}
++
+ 	mt76x02_irq_enable(dev,
+ 			   MT_INT_TX_DONE(IEEE80211_AC_VO) |
+ 			   MT_INT_TX_DONE(IEEE80211_AC_VI) |
+@@ -241,7 +338,7 @@
+ 	q = &dev->mt76.q_rx[MT_RXQ_MAIN];
+ 	q->buf_offset = MT_RX_HEADROOM - sizeof(struct mt76x02_rxwi);
+ 	ret = mt76x02_init_rx_queue(dev, q, 0, MT76X02_RX_RING_SIZE,
+-				    MT_RX_BUF_SIZE);
++				    rx_buf_size == 4096 ? 4096 : MT_RX_BUF_SIZE);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -252,6 +349,8 @@
+ 	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+ 			  mt76x02_poll_tx);
+ 	napi_enable(&dev->mt76.tx_napi);
++	/* mt76x02_poll_tx() ends with mt76_tx_status_flush_deferred() */
++	dev->mt76.tx_status_batch = true;
+ 
+ 	return 0;
+ }
+@@ -276,8 +375,13 @@
+ 	spin_lock_irqsave(&dev->mt76.mmio.irq_lock, flags);
+ 	pending = mt76_rr(dev, MT_INT_SOURCE_CSR);
+ 	enabled = dev->mt76.mmio.irqmask;
+-	mt76_wr(dev, MT_INT_SOURCE_CSR, mt76x02_irq_ack_sources(pending, enabled));
++	mt76_wr(dev, MT_INT_SOURCE_CSR,
++		mt76x02_irq_ack_sources(pending, enabled, mt76x02_tx_done_irq()));
+ 	intr = pending & enabled;
++	irq_cause[0] += !!(intr & MT_INT_TX_DONE_ALL);
++	irq_cause[1] += !!(intr & MT_INT_TXDELAYINT);
++	irq_cause[2] += !!(intr & MT_INT_TX_STAT);
++	irq_cause[3] += !!(intr & MT_INT_RX_DONE_ALL);
+ 	if (unlikely(pending & (MT_INT_RX_COHERENT | MT_INT_TX_COHERENT |
+ 				MT_INT_ANY_COHERENT))) {
+ 		irq_coherent[0] += !!(pending & MT_INT_RX_COHERENT);
+@@ -292,8 +396,8 @@
+ 	trace_dev_irq(&dev->mt76, intr, dev->mt76.mmio.irqmask);
+ 
+ 	mask = intr & (MT_INT_RX_DONE_ALL | MT_INT_GPTIMER);
+-	if (intr & (MT_INT_TX_DONE_ALL | MT_INT_TX_STAT))
+-		mask |= MT_INT_TX_DONE_ALL;
++	if (intr & (MT_INT_TX_ANY | MT_INT_TX_STAT))
++		mask |= MT_INT_TX_ANY;
+ 
+ 	mt76x02_irq_disable(dev, mask);
+ 
+@@ -317,7 +421,7 @@
+ 	if (intr & MT_INT_TX_STAT)
+ 		mt76x02_mac_poll_tx_status(dev, true);
+ 
+-	if (intr & (MT_INT_TX_STAT | MT_INT_TX_DONE_ALL))
++	if (intr & (MT_INT_TX_STAT | MT_INT_TX_ANY))
+ 		napi_schedule(&dev->mt76.tx_napi);
+ 
+ 	if (intr & MT_INT_GPTIMER)
+@@ -339,8 +443,12 @@
+ 	      MT_WPDMA_GLO_CFG_TX_DMA_EN |
+ 	      MT_WPDMA_GLO_CFG_RX_DMA_EN;
+ 	mt76_set(dev, MT_WPDMA_GLO_CFG, val);
+-	mt76_clear(dev, MT_WPDMA_GLO_CFG,
+-		   MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
++	if (tx_wb_ddone)
++		mt76_set(dev, MT_WPDMA_GLO_CFG,
++			 MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
++	else
++		mt76_clear(dev, MT_WPDMA_GLO_CFG,
++			   MT_WPDMA_GLO_CFG_TX_WRITEBACK_DONE);
+ }
+ 
+ void mt76x02_dma_disable(struct mt76x02_dev *dev)
+@@ -363,9 +471,10 @@
+ 	mt76_wr(dev, MT_MAC_SYS_CTRL,
+ 		MT_MAC_SYS_CTRL_ENABLE_TX |
+ 		MT_MAC_SYS_CTRL_ENABLE_RX);
++	/* The same TX sources mt76x02_poll_tx() re-enables. */
+ 	mt76x02_irq_enable(dev,
+-			   MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
+-			   MT_INT_TX_STAT);
++			   MT_INT_RX_DONE_ALL | mt76x02_tx_done_irq() |
++			   mt76x02_tx_stat_irq());
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_mac_start);
+ 
+diff -ruN a/mt76x02_qsel_policy.h b/mt76x02_qsel_policy.h
+--- a/mt76x02_qsel_policy.h
++++ b/mt76x02_qsel_policy.h
+@@ -9,7 +9,7 @@
+ {
+ 	if (requested == -1)
+ 		return xr500v;
+-	if (requested == 0 || (requested == 1 && xr500v))
++	if (requested == 0 || ((requested == 1 || requested == 2) && xr500v))
+ 		return requested;
+ 	return -1;
+ }
+diff -ruN a/mt76x02_txrx.c b/mt76x02_txrx.c
+--- a/mt76x02_txrx.c
++++ b/mt76x02_txrx.c
+@@ -16,13 +16,26 @@
+  */
+ static int qsel_edca = -1;
+ module_param(qsel_edca, int, 0444);
+-MODULE_PARM_DESC(qsel_edca, "XR500v tracked AMPDU queue: -1 auto, 0 original, 1 EDCA");
++MODULE_PARM_DESC(qsel_edca, "XR500v tracked AMPDU queue: -1 auto, 0 original, 1 EDCA, 2 EDCA not aggregated");
++
++static unsigned int tx_status_interval = 1;
++module_param(tx_status_interval, uint, 0644);
++MODULE_PARM_DESC(tx_status_interval,
++		 "Ask for a tx status report on one data frame in N (lab)");
++
++unsigned int mt76x02_tx_status_interval(void)
++{
++	return max(READ_ONCE(tx_status_interval), 1U);
++}
+ 
+ static unsigned int probe_mgmt_max_queued = 16;
+ module_param(probe_mgmt_max_queued, uint, 0644);
+ MODULE_PARM_DESC(probe_mgmt_max_queued,
+ 		 "EDCA policy: send a rate probe through the MGMT queue while fewer frames than this are queued ahead of it (0: never)");
+ 
++static unsigned int txs_probe_mgmt;
++module_param(txs_probe_mgmt, uint, 0444);
++
+ static int __init mt76x02_qsel_init(void)
+ {
+ 	qsel_edca = mt76x02_resolve_qsel(
+@@ -186,15 +199,44 @@
+ 
+ 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
+ 
+-	/* encode packet rate for no-skb packet id to fix up status reporting */
+-	if (pid == MT_PACKET_ID_NO_SKB)
+-		pid = MT_PACKET_ID_HAS_RATE |
+-		      (le16_to_cpu(txwi->rate) & MT_RXWI_RATE_INDEX) |
+-		      FIELD_PREP(MT_PKTID_AC,
+-				 skb_get_queue_mapping(tx_info->skb));
++	/*
++	 * Each status report costs two uncached reads of the status FIFO.
++	 * With tx_status_interval > 1, only one data frame in N asks for one;
++	 * rate control probes always do.
++	 */
++	if (pid == MT_PACKET_ID_NO_SKB) {
++		unsigned int n = READ_ONCE(tx_status_interval);
++		struct mt76x02_sta *msta = sta ? (void *)sta->drv_priv : NULL;
++		/*
++		 * Count per station: with one device-wide counter, stations
++		 * served in turn by bursts of a multiple of N frames could get
++		 * every sample, or none, and minstrel no feedback but probes.
++		 */
++		u32 *skip = msta ? &msta->txs_skip : &dev->tx_status_skip;
++
++		if (msta)
++			WRITE_ONCE(msta->txs_interval, max(n, 1U));
++		if (n > 1 && !(info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) &&
++		    ++*skip % n)
++			pid = MT_PACKET_ID_NO_ACK;
++		else
++			/* encode packet rate for no-skb packet id to fix up status reporting */
++			pid = MT_PACKET_ID_HAS_RATE |
++			      (le16_to_cpu(txwi->rate) & MT_RXWI_RATE_INDEX) |
++			      FIELD_PREP(MT_PKTID_AC,
++					 skb_get_queue_mapping(tx_info->skb));
++	}
+ 
+ 	txwi->pktid = pid;
+ 
++	/*
++	 * A tracked frame (a rate probe) inside an A-MPDU gets no status of
++	 * its own, times out and counts as lost, which keeps minstrel at low
++	 * rates. Keep it in EDCA order, but send it on its own.
++	 */
++	if (qsel_edca == 2 && ampdu && mt76_is_skb_pktid(pid))
++		txwi->flags &= ~cpu_to_le16(MT_TXWI_FLAGS_AMPDU);
++
+ 	if (mt76x02_use_mgmt_qsel(mt76_is_skb_pktid(pid), ampdu, qsel_edca)) {
+ 		qsel = MT_QSEL_MGMT;
+ 	} else if (qsel_edca == 1 && ampdu && mt76_is_skb_pktid(pid) &&
+@@ -210,6 +252,7 @@
+ 		 * inside the peer's block ack window.
+ 		 */
+ 		qsel = MT_QSEL_MGMT;
++		txs_probe_mgmt++;
+ 	}
+ 
+ 	tx_info->info = FIELD_PREP(MT_TXD_INFO_QSEL, qsel) |
+diff -ruN a/mt76x2/init.c b/mt76x2/init.c
+--- a/mt76x2/init.c
++++ b/mt76x2/init.c
+@@ -8,6 +8,17 @@
+ #include "eeprom.h"
+ #include "../mt76x02_phy.h"
+ 
++/*
++ * MT_WPDMA_DELAY_INT_CFG is 0x94ff0000: TX delay interrupt on, after 20 TX
++ * done events (bits 30:24) or 255 x 20 us (bits 23:16). mt76x02-lib's
++ * tx_delay_int=1 takes completions from it. Load time only (it is part of
++ * the MAC init values); 0 keeps 20.
++ */
++static unsigned int tx_dly_pint;
++module_param(tx_dly_pint, uint, 0444);
++MODULE_PARM_DESC(tx_dly_pint,
++		 "TX done events per WPDMA TX delay interrupt, 1-127 (0: 20) (lab)");
++
+ int mt76x2_set_sar_specs(struct ieee80211_hw *hw,
+ 			 const struct cfg80211_sar_specs *sar)
+ {
+@@ -174,6 +185,11 @@
+ 
+ 	mt76_wr_rp(dev, 0, vals, ARRAY_SIZE(vals));
+ 	mt76_wr_rp(dev, 0, prot_vals, ARRAY_SIZE(prot_vals));
++
++	/* TX_MAX_PINT, bits 30:24: TX done events per delay interrupt */
++	if (tx_dly_pint)
++		mt76_rmw(dev, MT_WPDMA_DELAY_INT_CFG, GENMASK(30, 24),
++			 FIELD_PREP(GENMASK(30, 24), min(tx_dly_pint, 127U)));
+ }
+ EXPORT_SYMBOL_GPL(mt76_write_mac_initvals);
+ 
+diff -ruN a/mt76x2/pci.c b/mt76x2/pci.c
+--- a/mt76x2/pci.c
++++ b/mt76x2/pci.c
+@@ -23,7 +23,8 @@
+ 		.txwi_size = sizeof(struct mt76x02_txwi),
+ 		.drv_flags = MT_DRV_TX_ALIGNED4_SKBS |
+ 			     MT_DRV_SW_RX_AIRTIME |
+-			     MT_DRV_IGNORE_TXS_FAILED,
++			     MT_DRV_IGNORE_TXS_FAILED |
++			     MT_DRV_RX_NO_DMA_INFO,
+ 		.survey_flags = SURVEY_INFO_TIME_TX,
+ 		.update_survey = mt76x02_update_channel,
+ 		.set_channel = mt76x2e_set_channel,
+diff -ruN a/tx.c b/tx.c
+--- a/tx.c
++++ b/tx.c
+@@ -5,6 +5,13 @@
+ 
+ #include "mt76.h"
+ 
++/* lab: tracked tx status matching */
++static unsigned int txs_tracked, txs_alloc_fail, txs_match, txs_timeout;
++module_param(txs_tracked, uint, 0444);
++module_param(txs_alloc_fail, uint, 0444);
++module_param(txs_match, uint, 0444);
++module_param(txs_timeout, uint, 0444);
++
+ static int
+ mt76_txq_get_qid(struct ieee80211_txq *txq)
+ {
+@@ -155,9 +162,11 @@
+ 	pid = idr_alloc(&wcid->pktid, skb, MT_PACKET_ID_FIRST,
+ 			MT_PACKET_ID_MASK, GFP_ATOMIC);
+ 	if (pid < 0) {
++		txs_alloc_fail++;
+ 		pid = MT_PACKET_ID_NO_SKB;
+ 		goto out;
+ 	}
++	txs_tracked++;
+ 
+ 	cb->wcid = wcid->idx;
+ 	cb->pktid = pid;
+@@ -182,8 +191,10 @@
+ 	lockdep_assert_held(&dev->status_lock);
+ 
+ 	skb = idr_remove(&wcid->pktid, pktid);
+-	if (skb)
++	if (skb) {
++		txs_match++;
+ 		goto out;
++	}
+ 
+ 	/* look for stale entries in the wcid idr queue */
+ 	idr_for_each_entry(&wcid->pktid, skb, id) {
+@@ -202,6 +213,7 @@
+ 		 * and stop waiting for TXS callback.
+ 		 */
+ 		idr_remove(&wcid->pktid, cb->pktid);
++		txs_timeout++;
+ 		__mt76_tx_status_skb_done(dev, skb, MT_TX_CB_TXS_FAILED |
+ 						    MT_TX_CB_TXS_DONE, list);
+ 	}
+@@ -224,6 +236,9 @@
+ 	list_for_each_entry_safe(wcid, tmp, &dev->wcid_list, list)
+ 		mt76_tx_status_skb_get(dev, wcid, flush ? -1 : 0, &list);
+ 	mt76_tx_status_unlock(dev, &list);
++
++	/* The periodic MAC work gets here too: send what is still queued. */
++	mt76_tx_status_flush_deferred(dev, true);
+ }
+ EXPORT_SYMBOL_GPL(mt76_tx_status_check);
+ 
+@@ -257,6 +272,94 @@
+ 	}
+ }
+ 
++static bool txs_defer_batch;
++module_param(txs_defer_batch, bool, 0644);
++MODULE_PARM_DESC(txs_defer_batch,
++		 "Drivers that report deferred TX status at the end of their TX poll: do not try on every completed frame (lab)");
++
++static bool txs_prefetch;
++module_param(txs_prefetch, bool, 0644);
++MODULE_PARM_DESC(txs_prefetch,
++		 "Prefetch the next skb while reporting deferred TX status (lab)");
++
++static void
++mt76_tx_status_report_deferred(struct mt76_dev *dev, struct sk_buff *skb,
++			       struct list_head *free_list)
++{
++	struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
++	struct ieee80211_tx_status status = {
++		.skb = skb,
++		.free_list = free_list,
++	};
++	struct ieee80211_rate_status rs = {};
++	struct mt76_wcid *wcid;
++	struct ieee80211_hw *hw;
++
++	wcid = __mt76_wcid_ptr(dev, cb->wcid);
++	hw = mt76_tx_status_get_hw(dev, skb);
++	status.sta = wcid_to_sta(wcid);
++	if (status.sta && (wcid->rate.flags || wcid->rate.legacy)) {
++		rs.rate_idx = wcid->rate;
++		status.rates = &rs;
++		status.n_rates = 1;
++	}
++	ieee80211_tx_status_ext(hw, &status);
++}
++
++/*
++ * mac80211 must not report tx status while it processes rx, so the report
++ * takes rx_lock, which the rx path holds for a whole batch. The tx
++ * completion, on another CPU, spun on it for every frame. Queue the report
++ * instead and send the queue whenever rx_lock can be had: from the next
++ * completion, from the rx path once the queue grows, or, with @wait, from
++ * the periodic MAC work, so that no report is left behind.
++ */
++void mt76_tx_status_flush_deferred(struct mt76_dev *dev, bool wait)
++{
++	struct sk_buff *skb, *tmp;
++	struct sk_buff_head list;
++	LIST_HEAD(free_list);
++	unsigned long flags;
++
++	__skb_queue_head_init(&list);
++	while (!skb_queue_empty_lockless(&dev->tx_status_defer)) {
++		if (wait)
++			spin_lock_bh(&dev->rx_lock);
++		else if (!spin_trylock_bh(&dev->rx_lock))
++			break;
++
++		/* One irqsave round trip for the whole backlog, not two per skb. */
++		spin_lock_irqsave(&dev->tx_status_defer.lock, flags);
++		skb_queue_splice_init(&dev->tx_status_defer, &list);
++		spin_unlock_irqrestore(&dev->tx_status_defer.lock, flags);
++
++		rcu_read_lock();
++		while ((skb = __skb_dequeue(&list)) != NULL) {
++			struct sk_buff *next = skb_peek(&list);
++
++			/* mac80211 reads its cb, destructor and shinfo */
++			if (next && READ_ONCE(txs_prefetch)) {
++				prefetch(next->cb);
++				prefetch(&next->destructor);
++				prefetch(&next->head);
++			}
++			mt76_tx_status_report_deferred(dev, skb, &free_list);
++		}
++		rcu_read_unlock();
++		spin_unlock_bh(&dev->rx_lock);
++	}
++
++	/*
++	 * mac80211 is done with them. From the TX NAPI or with BH off they go
++	 * back through the per-CPU NAPI skb cache, freed in bulk.
++	 */
++	list_for_each_entry_safe(skb, tmp, &free_list, list) {
++		skb_list_del_init(skb);
++		napi_consume_skb(skb, in_softirq() ? 1 : 0);
++	}
++}
++EXPORT_SYMBOL_GPL(mt76_tx_status_flush_deferred);
++
+ void __mt76_tx_complete_skb(struct mt76_dev *dev, u16 wcid_idx, struct sk_buff *skb,
+ 			    struct list_head *free_list)
+ {
+@@ -303,6 +406,20 @@
+ 	}
+ #endif
+ 
++	if (cb->pktid < MT_PACKET_ID_FIRST && !free_list) {
++		cb->wcid = wcid_idx;
++		skb_queue_tail(&dev->tx_status_defer, skb);
++		/*
++		 * A driver that flushes at the end of its TX poll gets the
++		 * whole sweep reported there under one rx_lock; the AQL
++		 * airtime comes back a sweep later. Bound the backlog anyway.
++		 */
++		if (!dev->tx_status_batch || !READ_ONCE(txs_defer_batch) ||
++		    skb_queue_len_lockless(&dev->tx_status_defer) >= 128)
++			mt76_tx_status_flush_deferred(dev, false);
++		goto out;
++	}
++
+ 	if (cb->pktid < MT_PACKET_ID_FIRST) {
+ 		struct ieee80211_rate_status rs = {};
+ 

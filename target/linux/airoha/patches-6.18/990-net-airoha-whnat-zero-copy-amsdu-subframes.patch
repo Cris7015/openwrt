@@ -1,0 +1,346 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: whnat: hand A-MSDU subframes over in their RX page
+
+cfg80211 gives each A-MSDU subframe a short copied head and the rest in
+the RX page, where the head is preceded by the subframe's own header and
+LLC/SNAP. Write DA, SA, 0x8100 and the VID there and queue the frame
+from the page (data, len) instead of linearising it: one copy less per
+byte on the WiFi upload. With 4 KB mt76 RX buffers every subframe
+qualifies. Lab 25-oct: upload 314 -> 336 (2 KB) and 461-472 (4 KB).
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1059,11 +1059,15 @@
+ 	return done;
+ }
+ 
+-static int econet_qdma_xmit_mips(struct airoha_qdma_mips *qdma, struct sk_buff *skb,
+-		   union desc_msg *msg, int qid)
++/*
++ * Queue @len bytes at @data as one frame; the descriptor keeps @skb, which
++ * owns that memory, until the completion unmaps and frees it.
++ */
++static int econet_qdma_xmit_mips_buf(struct airoha_qdma_mips *qdma,
++				     struct sk_buff *skb, void *data, int len,
++				     union desc_msg *msg, int qid)
+ {
+ 	struct econet_q_tx *q = &qdma->q_tx[qid];
+-	int len = skb_headlen(skb);
+ 	struct econet_q_tx_ent *e;
+ 	u16 index, next_index;
+ 	struct desc *desc;
+@@ -1088,7 +1092,7 @@
+ 	if (next_index == 0xffff)
+ 		return -EBUSY;
+ 
+-	addr = dma_map_single(qdma->qdma->eth->dev, skb->data, len, DMA_TO_DEVICE);
++	addr = dma_map_single(qdma->qdma->eth->dev, data, len, DMA_TO_DEVICE);
+ 	ret = dma_mapping_error(qdma->qdma->eth->dev, addr);
+ 	if (unlikely(ret))
+ 		return ret;
+@@ -1133,6 +1137,13 @@
+ 		EBUSY : 0;
+ }
+ 
++static int econet_qdma_xmit_mips(struct airoha_qdma_mips *qdma, struct sk_buff *skb,
++		   union desc_msg *msg, int qid)
++{
++	return econet_qdma_xmit_mips_buf(qdma, skb, skb->data, skb_headlen(skb),
++					 msg, qid);
++}
++
+ /* Init functions, no locks, assumed non-concurrent */
+ 
+ static int econet_init_rx_queue(struct econet_q_rx *q,
+@@ -2082,7 +2093,8 @@
+  * Hand a WHNAT frame to the PPE the way the vendor driver does: LAN QDMA,
+  * channel 7, queue 0. A return value >= 0 means the frame was queued.
+  */
+-int airoha_whnat_qdma_xmit(struct airoha_qdma *qdma, struct sk_buff *skb)
++int airoha_whnat_qdma_xmit_buf(struct airoha_qdma *qdma, struct sk_buff *skb,
++			       void *data, int len)
+ {
+ 	union desc_msg msg = {};
+ 	int ret;
+@@ -2094,10 +2106,16 @@
+ 	set_etx_queue(&msg.etx, 0);
+ 	set_etx_fport(&msg.etx, ETX_FPORT_PPE);
+ 
+-	ret = econet_qdma_xmit_mips(qdma->econet, skb, &msg, 0);
++	ret = econet_qdma_xmit_mips_buf(qdma->econet, skb, data, len, &msg, 0);
+ 	/* Only zero and EBUSY denote an skb consumed by the descriptor ring. */
+ 	return ret == 0 || ret == EBUSY ? ret : ret < 0 ? ret : -EIO;
+ }
++
++int airoha_whnat_qdma_xmit(struct airoha_qdma *qdma, struct sk_buff *skb)
++{
++	return airoha_whnat_qdma_xmit_buf(qdma, skb, skb->data,
++					  skb_headlen(skb));
++}
+ #endif
+ 
+ static int airoha_qdma_mips_set_xpon_irq(struct airoha_qdma *qdma,
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c.orig b/drivers/net/ethernet/airoha/airoha_eth.c.orig
+--- a/drivers/net/ethernet/airoha/airoha_eth.c.orig
++++ b/drivers/net/ethernet/airoha/airoha_eth.c.orig
+@@ -415,6 +415,11 @@
+ static u16 econet_rx_ingress_gem(struct airoha_qdma *qdma,
+ 				 const union desc_msg *msg);
+ 
++/* EN751221: RX descriptors dropped for the overflow bit, per QDMA. */
++static unsigned int rx_overflow[2];
++module_param_array(rx_overflow, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_overflow, "EN751221 RX descriptors with the overflow bit, dropped, per QDMA");
++
+ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+ 				     enum dma_data_direction dir,
+ 				     struct airoha_whnat_batch *batch)
+@@ -448,6 +453,12 @@
+ 	if (WARN_ON_ONCE(is_desc_info_nls(&desc.info)))
+ 		goto return_page;
+ 
++	/* Bit 30 is "overflow" on RX: the vendor driver drops the frame. */
++	if (unlikely(is_desc_info_dropped(&desc.info))) {
++		rx_overflow[q->qdma->qdma->id & 1]++;
++		goto return_page;
++	}
++
+ 	skb = napi_build_skb(e->buf, q->buf_size);
+ 	if (!skb)
+ 		goto return_page;
+@@ -520,6 +531,59 @@
+ 	page_pool_put_full_page(q->page_pool, page, false);
+ }
+ 
++/* EN751221: descriptors that needed waiting for DONE, and give-ups. */
++static unsigned int rx_wait_done[2], rx_wait_gave_up[2];
++module_param_array(rx_wait_done, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_wait_done, "EN751221 RX descriptors below RX_HWI found without DONE, per QDMA");
++module_param_array(rx_wait_gave_up, uint, NULL, 0444);
++MODULE_PARM_DESC(rx_wait_gave_up, "EN751221 RX descriptors consumed without DONE after waiting, per QDMA");
++
++#define ECONET_RX_DONE_SPIN	16
++#define ECONET_RX_DONE_POLLS	256
++
++/*
++ * RX_HWI can pass a descriptor before its write-back is visible in memory.
++ * Such a descriptor still holds what econet_fill_rx_queue() wrote: no DONE,
++ * the buffer size as length and an all-zero message, which the rest of the
++ * path would take as a frame from port 0 with CPU reason 0 (WHNAT then
++ * injects a PPE-rewritten downstream frame as RX on the vif). The vendor
++ * driver (qdma_bm_receive_packets()) only consumes descriptors with DONE
++ * set. Spin briefly for it; if it still is not there, leave the descriptor
++ * for the next poll. A descriptor that never gets DONE is consumed as
++ * before after ECONET_RX_DONE_POLLS polls, so a wrong assumption cannot
++ * stall the ring.
++ */
++static bool econet_rx_desc_ready(struct econet_q_rx *q, u32 i)
++{
++	unsigned int id = q->qdma->qdma->id & 1;
++	int spin;
++
++	for (spin = 0; spin < ECONET_RX_DONE_SPIN; spin++) {
++		if (READ_ONCE(q->desc[i].info.word) & DESC_INFO_DONE) {
++			if (spin)
++				rx_wait_done[id]++;
++			q->wait_polls = 0;
++			/* Read the rest of the descriptor after DONE. */
++			dma_rmb();
++			return true;
++		}
++		cpu_relax();
++	}
++
++	if (++q->wait_polls < ECONET_RX_DONE_POLLS) {
++		if (q->wait_polls == 1)
++			rx_wait_done[id]++;
++		return false;
++	}
++
++	rx_wait_gave_up[id]++;
++	q->wait_polls = 0;
++	pr_warn_ratelimited("airoha: qdma%u rx %u: no DONE after %d polls, info %08x\n",
++			    id, i, ECONET_RX_DONE_POLLS,
++			    READ_ONCE(q->desc[i].info.word));
++	return true;
++}
++
+ static int econet_qdma_rx_process(struct econet_q_rx *q, int budget,
+ 				  struct airoha_whnat_batch *batch)
+ {
+@@ -543,6 +607,10 @@
+ 	cpu_i = q->next_i;
+ 
+ 	for (done = 0; done < budget && cpu_i != hardware_i; done++) {
++		if (unlikely(!econet_rx_desc_ready(q, cpu_i))) {
++			q->wait_done = true;
++			break;
++		}
+ 		econet_qdma_rx_process_one(q, cpu_i, dir, batch);
+ 		cpu_i = (cpu_i + 1) % ndesc;
+ 	}
+@@ -739,6 +807,7 @@
+ 		airoha_whnat_batch_init(pending);
+ 	}
+ 
++	q->wait_done = false;
+ 	do {
+ 		cur = econet_qdma_rx_process(q, budget - done, pending);
+ 		done += cur;
+@@ -750,9 +819,12 @@
+ 	/*
+ 	 * A failed refill leaves the hardware short of descriptors. Once it
+ 	 * has none left it raises no interrupt that would retry the refill,
+-	 * so keep polling until the ring is whole again.
++	 * so keep polling until the ring is whole again. The same goes for a
++	 * descriptor RX_HWI already passed but whose DONE is not visible yet:
++	 * its interrupt has been taken, so poll again rather than wait for the
++	 * next frame.
+ 	 */
+-	if (q->next_i != (q->cpu_i + 1) % q->ndesc)
++	if (q->next_i != (q->cpu_i + 1) % q->ndesc || q->wait_done)
+ 		return budget;
+ 
+ 	if (done < budget && napi_complete(napi)) {
+@@ -1621,11 +1693,24 @@
+ 		queue_max = 204;
+ 	} else if (qdma->fwd_buf_size == 2048 && qdma->qdma->id == 1 &&
+ 		   qdma->num_fwd_descs == 4096) {
+-		total_min = 819;
++		/*
++		 * Upstream FoE flows enter this QDMA from a 1 Gbit/s LAN port
++		 * and leave through GPON grants that drain at the line rate
++		 * only in bursts. With the shipping thresholds (total min 819,
++		 * channel min 160, queue 24..819) the dynamic congestion
++		 * control drops ~0.9 % of a saturated upload at the HWF ingress
++		 * (CDMA2_RXHWF_DROP_CNT), which halves TCP throughput for
++		 * higher-RTT clients. Raise the minimum thresholds so line-rate
++		 * bursts fit, while keeping the queue well inside the 4096
++		 * descriptor pool and the drops enabled, so a stalled GPON
++		 * link cannot back-pressure the frame engine.
++		 */
++		total_min = 4096;
+ 		total_max = 15360;
+-		channel_min = 160;
++		channel_min = 2048;
+ 		channel_max = 15360;
+-		queue_max = 819;
++		queue_min = 2048;
++		queue_max = 4095;
+ 	}
+ 
+ 	airoha_wr((void __iomem *)&qdma->regs->tx_congest_thr, 0,
+diff -ruN a/drivers/net/ethernet/airoha/airoha_whnat.c b/drivers/net/ethernet/airoha/airoha_whnat.c
+--- a/drivers/net/ethernet/airoha/airoha_whnat.c
++++ b/drivers/net/ethernet/airoha/airoha_whnat.c
+@@ -482,6 +482,61 @@
+ 	       !(type & (IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK));
+ }
+ 
++/*
++ * cfg80211 hands each A-MSDU subframe over as a short copied head plus the
++ * rest of the payload in the RX page. In that page the head bytes are
++ * preceded by the subframe's own A-MSDU header and LLC/SNAP, which nothing
++ * reads any more. Rebuild the VLAN-tagged Ethernet header over them and let
++ * the QDMA send the page bytes, instead of copying the payload into a new
++ * head. The checks only pass when those bytes really are this subframe's
++ * header: a subframe that crossed into another RX buffer falls back to the
++ * copy. Returns the start of the frame, or NULL.
++ */
++static void *airoha_whnat_rx_page_frame(struct sk_buff *skb, int idx,
++					unsigned int *len)
++{
++	static const u8 llc[] = { 0xaa, 0xaa, 0x03 };
++	const struct ethhdr *eth = eth_hdr(skb);
++	unsigned int hlen = skb_headlen(skb);
++	const skb_frag_t *frag;
++	unsigned int off;
++	struct page *page;
++	u8 *p;
++
++	if (skb_shinfo(skb)->nr_frags != 1 || skb_has_frag_list(skb) ||
++	    skb_cloned(skb) || !hlen)
++		return NULL;
++
++	frag = &skb_shinfo(skb)->frags[0];
++	page = skb_frag_page(frag);
++	off = skb_frag_off(frag);
++	/* subframe header (14) + LLC/SNAP (8) + the copied head */
++	if (PageHighMem(page) || off < ETH_HLEN + 8 + hlen)
++		return NULL;
++
++	p = (u8 *)page_address(page) + off - hlen;
++	if (memcmp(p, skb->data, hlen))
++		return NULL;
++	p -= 8;
++	if (memcmp(p, llc, sizeof(llc)) ||
++	    get_unaligned((__be16 *)(p + 6)) != eth->h_proto)
++		return NULL;
++	p -= ETH_HLEN;
++	if (!ether_addr_equal_unaligned(p, eth->h_dest) ||
++	    !ether_addr_equal_unaligned(p + ETH_ALEN, eth->h_source))
++		return NULL;
++
++	/* DA, SA, 802.1Q tag with the vif; the SNAP ethertype stays in place */
++	p += ETH_HLEN + 8 - (ETH_HLEN + VLAN_HLEN);
++	memcpy(p, eth->h_dest, ETH_ALEN);
++	memcpy(p + ETH_ALEN, eth->h_source, ETH_ALEN);
++	put_unaligned_be16(ETH_P_8021Q, p + 12);
++	put_unaligned_be16(idx, p + 14);
++	*len = ETH_HLEN + VLAN_HLEN + skb->len;
++
++	return p;
++}
++
+ static bool airoha_whnat_upstream(struct sk_buff *skb)
+ {
+ 	struct net_device *vif_dev;
+@@ -511,12 +566,30 @@
+ 	if (!ppe || !qdma || !READ_ONCE(ppe->v1.armed))
+ 		goto out;
+ 
+-	if ((skb_is_nonlinear(skb) && skb_linearize(skb)) ||
+-	    skb_cow_head(skb, ETH_HLEN + VLAN_HLEN))
++	vif_dev = skb->dev;
++	if (skb_is_nonlinear(skb)) {
++		unsigned int len;
++		void *frame;
++
++		frame = airoha_whnat_rx_page_frame(skb, idx, &len);
++		if (frame) {
++			skb->dev = NULL;
++			if (airoha_whnat_qdma_xmit_buf(qdma, skb, frame, len) >= 0) {
++				atomic_inc(&handed);
++				if (ipv6)
++					atomic_inc(&handed6);
++				taken = true;
++				goto out;
++			}
++			skb->dev = vif_dev;
++		}
++		if (skb_linearize(skb))
++			goto out;
++	}
++	if (skb_cow_head(skb, ETH_HLEN + VLAN_HLEN))
+ 		goto out;
+ 
+ 	/* Put the Ethernet header back and tag the frame with its vif. */
+-	vif_dev = skb->dev;
+ 	skb_push(skb, ETH_HLEN + VLAN_HLEN);
+ 	memmove(skb->data, skb->data + VLAN_HLEN, 2 * ETH_ALEN);
+ 	put_unaligned_be16(ETH_P_8021Q, skb->data + 12);
+diff -ruN a/drivers/net/ethernet/airoha/airoha_whnat.h b/drivers/net/ethernet/airoha/airoha_whnat.h
+--- a/drivers/net/ethernet/airoha/airoha_whnat.h
++++ b/drivers/net/ethernet/airoha/airoha_whnat.h
+@@ -42,6 +42,8 @@
+ 
+ /* Provided by the QDMA and PPE code. */
+ int airoha_whnat_qdma_xmit(struct airoha_qdma *qdma, struct sk_buff *skb);
++int airoha_whnat_qdma_xmit_buf(struct airoha_qdma *qdma, struct sk_buff *skb,
++			       void *data, int len);
+ void airoha_whnat_invalidate_vif(struct airoha_ppe *ppe, int idx);
+ 
+ /* Called by mt76 through symbol_get(). */

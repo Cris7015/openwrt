@@ -1,0 +1,211 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: en751221: 512 descriptors on QDMA0 TX ring 0
+
+WHNAT hands every WiFi upstream frame to TX ring 0 and may use it only
+down to AIROHA_WHNAT_TX_RESERVE free entries: with the vendor's 128 that
+is ~95 slots, less than one mt76 NAPI batch of A-MSDU subframes. The
+done list (2048) covers the larger ring. Agents' B-10, 25-oct.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -5530,7 +5530,16 @@
+ 	if (soc->version == econet_en751221 && id == 0) {
+ 		cfg->num_rx_descs[0] = 128;
+ 		cfg->num_rx_descs[1] = 512;
+-		cfg->num_tx_descs[0] = 128;
++		/*
++		 * lab: WHNAT hands every WiFi upstream frame to TX ring 0 and
++		 * may use it only down to AIROHA_WHNAT_TX_RESERVE free entries:
++		 * with the vendor's 128 that is ~95 slots, less than one mt76
++		 * NAPI batch of A-MSDU subframes (up to 128), and completions are
++		 * reaped 16 at a time on the other CPU. The done list (2048)
++		 * covers a larger ring.
++		 */
++		cfg->num_tx_descs[0] = IS_ENABLED(CONFIG_NET_AIROHA_WHNAT) ?
++				       512 : 128;
+ 		cfg->num_tx_descs[1] = 128;
+ 		cfg->done_list_size[0] = 2048;
+ 		cfg->done_list_irq_threshold[0] = 16;
+diff -ruN a/drivers/net/ethernet/airoha/airoha_eth.c.orig b/drivers/net/ethernet/airoha/airoha_eth.c.orig
+--- a/drivers/net/ethernet/airoha/airoha_eth.c.orig
++++ b/drivers/net/ethernet/airoha/airoha_eth.c.orig
+@@ -945,7 +945,9 @@
+ 		struct econet_q_tx *q;
+ 		struct netdev_queue *txq;
+ 		struct sk_buff *skb;
++		dma_addr_t dma_addr;
+ 		struct desc desc;
++		u16 dma_len;
+ 
+ 		if (val == 0xffffffffU)
+ 			break;
+@@ -967,19 +969,25 @@
+ 		if (WARN_ON_ONCE(index >= q->ndesc))
+ 			continue;
+ 
+-		guard(spinlock)(&q->lock_bh);
++		/*
++		 * Only the ring bookkeeping needs q->lock_bh, which the xmit
++		 * path on the other CPU takes for every frame: unmap and free
++		 * the skb after dropping it.
++		 */
++		spin_lock(&q->lock_bh);
+ 
+ 		desc = q->desc[index];
+ 
+ 		if (WARN_ON_ONCE(!is_desc_info_done(&desc.info) &&
+-				 !is_desc_info_dropped(&desc.info)))
++				 !is_desc_info_dropped(&desc.info))) {
++			spin_unlock(&q->lock_bh);
+ 			continue;
++		}
+ 
+ 		e = &q->entry[index];
+ 		skb = e->skb;
+-
+-		dma_unmap_single(qdma->qdma->eth->dev, e->dma_addr, e->dma_len,
+-				 DMA_TO_DEVICE);
++		dma_addr = e->dma_addr;
++		dma_len = e->dma_len;
+ 		memset(e, 0, sizeof(*e));
+ 
+ 		/* Completion ring can report out of order when hw QoS is
+@@ -993,28 +1001,31 @@
+ 		q->free_count++;
+ 
+ 		/* Frames handed to the PPE by WHNAT have no netdev. */
+-		if (!skb->dev) {
+-			airoha_whnat_complete();
+-			dev_kfree_skb_any(skb);
+-			continue;
++		if (skb->dev) {
++			txq = netdev_get_tx_queue(skb->dev,
++						  skb_get_queue_mapping(skb));
++			netdev_tx_completed_queue(txq, 1, skb->len);
++			/* Every net_device TX queue of this conduit (one per
++			 * DSA user port through tag_mtk's queue_mapping, hashed
++			 * for the rest) funnels into the same hardware ring, so
++			 * the gating resource is shared.  A queue stopped on
++			 * ring-full holds no descriptor of its own
++			 * (econet_qdma_xmit_mips() returns -EBUSY before posting
++			 * the skb), so it can never produce a completion that
++			 * would wake it: waking only the queue of the skb just
++			 * freed strands it forever.  Defer a device-wide wake to
++			 * after the drain loop instead.
++			 */
++			wake_dev = skb->dev;
+ 		}
++		spin_unlock(&q->lock_bh);
+ 
+-		txq = netdev_get_tx_queue(skb->dev,
+-					  skb_get_queue_mapping(skb));
+-		netdev_tx_completed_queue(txq, 1, skb->len);
+-		/* Every net_device TX queue of this conduit (one per DSA user
+-		 * port through tag_mtk's queue_mapping, hashed for the rest)
+-		 * funnels into the same hardware ring, so the gating resource
+-		 * is shared.  A queue stopped on ring-full holds no descriptor
+-		 * of its own (econet_qdma_xmit_mips() returns -EBUSY before
+-		 * posting the skb), so it can never produce a completion that
+-		 * would wake it: waking only the queue of the skb just freed
+-		 * strands it forever.  Defer a device-wide wake to after the
+-		 * drain loop instead.
+-		 */
+-		wake_dev = skb->dev;
+-
+-		dev_kfree_skb_any(skb);
++		dma_unmap_single(qdma->qdma->eth->dev, dma_addr, dma_len,
++				 DMA_TO_DEVICE);
++		if (!skb->dev)
++			airoha_whnat_complete();
++		/* A sent frame is consumed, not dropped; NAPI keeps the skb. */
++		napi_consume_skb(skb, budget);
+ 	}
+ 
+ 	/* Freed at least one ring slot: wake every TX queue of the conduit so
+@@ -1067,6 +1078,7 @@
+ 				     struct sk_buff *skb, void *data, int len,
+ 				     union desc_msg *msg, int qid)
+ {
++	struct device *dev = qdma->qdma->eth->dev;
+ 	struct econet_q_tx *q = &qdma->q_tx[qid];
+ 	struct econet_q_tx_ent *e;
+ 	u16 index, next_index;
+@@ -1074,28 +1086,44 @@
+ 	dma_addr_t addr;
+ 	int ret;
+ 
+-	guard(spinlock_bh)(&q->lock_bh);
+-
+ 	/*
+ 	 * Only a completion of a netdev's own frame wakes its stopped queue,
+ 	 * so frames without a netdev (WHNAT) must leave it some descriptors.
++	 * Unlocked first look, so that a full ring costs no cache flush; the
++	 * check under the lock below is the one that counts.
+ 	 */
+-	if (!skb->dev && q->free_count <= AIROHA_WHNAT_TX_RESERVE)
++	if (!skb->dev && READ_ONCE(q->free_count) <= AIROHA_WHNAT_TX_RESERVE)
+ 		return -EAGAIN;
+ 
++	/*
++	 * Write the frame back from the cache before taking q->lock_bh: the
++	 * completion on the other CPU takes it for every descriptor, and on
++	 * this non-coherent MIPS the map is a cache operation per line.
++	 */
++	addr = dma_map_single(dev, data, len, DMA_TO_DEVICE);
++	ret = dma_mapping_error(dev, addr);
++	if (unlikely(ret))
++		return ret;
++
++	spin_lock_bh(&q->lock_bh);
++
++	if (!skb->dev && q->free_count <= AIROHA_WHNAT_TX_RESERVE) {
++		ret = -EAGAIN;
++		goto unmap;
++	}
++
+ 	index = q->freelist_head;
+-	if (index == 0xffff)
+-		return -EBUSY;
++	if (index == 0xffff) {
++		ret = -EBUSY;
++		goto unmap;
++	}
+ 
+ 	e = &q->entry[index];
+ 	next_index = e->freelist_next;
+-	if (next_index == 0xffff)
+-		return -EBUSY;
+-
+-	addr = dma_map_single(qdma->qdma->eth->dev, data, len, DMA_TO_DEVICE);
+-	ret = dma_mapping_error(qdma->qdma->eth->dev, addr);
+-	if (unlikely(ret))
+-		return ret;
++	if (next_index == 0xffff) {
++		ret = -EBUSY;
++		goto unmap;
++	}
+ 
+ 	desc = &q->desc[index];
+ 	WRITE_ONCE(desc->pkt_addr, addr);
+@@ -1133,8 +1161,16 @@
+ 	dma_wmb();
+ 	econet_wreg((u32)next_index, &q->qchain_regs->tx_cpui);
+ 
+-	return q->entry[next_index].freelist_next == 0xffff ?
+-		EBUSY : 0;
++	ret = q->entry[next_index].freelist_next == 0xffff ? EBUSY : 0;
++	spin_unlock_bh(&q->lock_bh);
++
++	return ret;
++
++unmap:
++	spin_unlock_bh(&q->lock_bh);
++	dma_unmap_single(dev, addr, len, DMA_TO_DEVICE);
++
++	return ret;
+ }
+ 
+ static int econet_qdma_xmit_mips(struct airoha_qdma_mips *qdma, struct sk_buff *skb,
