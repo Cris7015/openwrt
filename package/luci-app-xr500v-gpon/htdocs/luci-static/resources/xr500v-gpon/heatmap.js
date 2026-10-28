@@ -66,7 +66,8 @@ return baseclass.extend({
 		table.addEventListener('mouseleave', function() { onCell(null); });
 
 		return E('div', {}, [
-			table,
+			/* ~430 px wide: on a phone it scrolls instead of widening the page */
+			E('div', { 'style': 'overflow-x:auto;max-width:100%' }, [ table ]),
 			E('div', { 'style': 'font-size:12px;margin-top:6px' }, [
 				swatch(color({ crit: 1 }, 0, false), _('critical event')),
 				swatch(color({ bip: 1, warn: 1 }, 1, false), _('BIP errors or warnings')),

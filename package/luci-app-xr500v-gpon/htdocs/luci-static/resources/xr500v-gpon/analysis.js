@@ -9,7 +9,7 @@
  */
 
 var TIP_EVENTS = 3;
-var CSV_HEADER = 'time,rx_dbm_avg,rx_dbm_min,rx_dbm_max,temp_c_avg,temp_c_min,temp_c_max,bip,events';
+var CSV_COLUMNS = 'rx_dbm_avg,rx_dbm_min,rx_dbm_max,temp_c_avg,temp_c_min,temp_c_max,bip,events';
 /* not inline after `return`: LuCI's jsmin would take the slash for a division */
 var CSV_QUOTE = /[",\n]/;
 
@@ -37,6 +37,13 @@ function inBucket(events, t0, step) {
 
 function dayKey(d) {
 	return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+/* "UTC-03:00": the browser's offset at time t */
+function utcOffset(t) {
+	var m = -new Date(t * 1000).getTimezoneOffset(), a = Math.abs(m);
+
+	return 'UTC' + (m < 0 ? '-' : '+') + pad(Math.floor(a / 60)) + ':' + pad(a % 60);
 }
 
 function csvCell(v) {
@@ -165,14 +172,22 @@ return baseclass.extend({
 		return withDate ? dayKey(d) + ' ' + hm : hm;
 	},
 
-	csv: function(points, events, step) {
-		var rows = [ CSV_HEADER ], self = this;
+	/* Local times with their UTC offset in the header, or in each cell when
+	 * the rows span a DST change. With t0/t1, only the points the graphs
+	 * draw: after downtime the rings still hold older ones. */
+	csv: function(points, events, step, t0, t1) {
+		var self = this, rows, offsets, mixed;
 
-		(points || []).forEach(function(p) {
+		points = (t0 != null) ? this.inWindow(points, t0, t1 + 1) : (points || []);
+		offsets = points.map(function(p) { return utcOffset(p.t); });
+		mixed = offsets.some(function(o) { return o != offsets[0]; });
+		rows = [ (mixed ? 'time (local)' : 'time (' + (offsets[0] || utcOffset(Date.now() / 1000)) + ')') + ',' + CSV_COLUMNS ];
+
+		points.forEach(function(p, i) {
 			var rx = triple(p, 'rx', dbm) || {}, temp = triple(p, 'temp', celsius) || {};
 
 			rows.push([
-				self.localTime(p.t, true),
+				self.localTime(p.t, true) + (mixed ? ' ' + offsets[i] : ''),
 				fixed1(rx.avg), fixed1(rx.min), fixed1(rx.max),
 				fixed1(temp.avg), fixed1(temp.min), fixed1(temp.max),
 				(p.bip != null) ? p.bip : '',

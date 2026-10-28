@@ -150,6 +150,7 @@ return view.extend({
 		    tip = (t != null) ? analysis.tooltip(this.points, this.tipEvents, t, this.step, slack) : null,
 		    spread = this.step > 60, rows, w, h;
 
+		this.lastTip = (t != null) ? { t: t, cx: cx, cy: cy } : null;
 		if (!tip) {
 			this.tip.style.display = 'none';
 			return;
@@ -171,6 +172,7 @@ return view.extend({
 		if (tip.more)
 			rows.push(E('div', {}, [ _('+%d more').format(tip.more) ]));
 
+		this.tipOwner = 'graph';
 		this.placeTip(rows, cx, cy);
 	},
 
@@ -209,6 +211,7 @@ return view.extend({
 			if (!c.crit && !c.warn && !c.info)
 				rows.push(E('div', {}, [ _('No events') ]));
 		}
+		this.tipOwner = 'cell';
 		this.placeTip(rows, cx, cy);
 	},
 
@@ -278,7 +281,8 @@ return view.extend({
 		this.step = step;
 		this.tipEvents = events;
 		this.charts = charts;
-		this.tip.style.display = 'none';
+		if (this.tipOwner != 'cell')	/* a Patterns box is not ours to close */
+			this.tip.style.display = 'none';
 		graph.cursor(charts, L.bind(this.showTip, this));
 
 		return E('div', {}, [
@@ -300,11 +304,13 @@ return view.extend({
 
 	/* Downloads what the graphs show (the window, or the zoom) as CSV */
 	exportCsv: function() {
-		var d = new Date(),
+		/* the span the graphs draw: after downtime the rings hold older points */
+		var c = this.charts && this.charts[0] && this.charts[0].chart,
+		    d = new Date(),
 		    name = 'xr500v-gpon-%s-%04d%02d%02d-%02d%02d.csv'.format(this.zoom ? 'event' : this.window,
 			d.getFullYear(), d.getMonth() + 1, d.getDate(), d.getHours(), d.getMinutes()),
-		    url = URL.createObjectURL(new Blob([ analysis.csv(this.points, this.tipEvents, this.step) ],
-			{ type: 'text/csv' })),
+		    url = URL.createObjectURL(new Blob([ analysis.csv(this.points, this.tipEvents, this.step,
+			c ? c.t0 : null, c ? c.t1 : null) ], { type: 'text/csv' })),
 		    link = E('a', { 'href': url, 'download': name, 'style': 'display:none' });
 
 		document.body.appendChild(link);
@@ -409,10 +415,21 @@ return view.extend({
 			L.resolveDefault(callHistory(this.window), {}),
 			L.resolveDefault(callEvents(EVENTS_KEPT), [])
 		]).then(L.bind(function(res) {
+			var keep = (this.tip.style.display != 'none' && this.tipOwner == 'graph') ? this.lastTip : null,
+			    c;
+
 			this.evData = res[2];
 			/* a window chosen meanwhile has its own, newer reply; a zoom stays */
-			if (seq == this.seq && !this.zoom)
+			if (seq == this.seq && !this.zoom) {
 				dom.content(this.graphs, this.renderGraphs(res[1], res[0]));
+				/* the minute's redraw keeps an open box and its cursor, with the
+				 * new values, while that moment is still in the window */
+				c = this.charts && this.charts[0] && this.charts[0].chart;
+				if (keep && c && keep.t >= c.t0 && keep.t <= c.t1) {
+					this.charts.forEach(function(n) { n.chart.setCursor(keep.t); });
+					this.showTip(keep.t, keep.cx, keep.cy);
+				}
+			}
 			dom.content(this.counters, this.renderCounters(res[0]));
 			dom.content(this.events, this.renderEvents(res[2]));
 			dom.content(this.alerts, this.renderAlerts(res[0]));
@@ -504,9 +521,10 @@ return view.extend({
 				this.tip
 			]);
 
-			/* a tap outside the graphs closes the box a tap opened */
+			/* a tap outside the graphs and the map closes the box a tap opened
+			 * (the map cell's own touchstart runs first and opens it) */
 			document.addEventListener('touchstart', L.bind(function(ev) {
-				if (this.graphs.contains(ev.target))
+				if (this.graphs.contains(ev.target) || this.patterns.contains(ev.target))
 					return;
 				this.tip.style.display = 'none';
 				(this.charts || []).forEach(function(c) { c.chart.setCursor(null); });

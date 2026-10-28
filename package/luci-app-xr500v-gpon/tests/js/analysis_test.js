@@ -60,9 +60,25 @@ module.exports = ({ load, eq, ok }) => {
 		ok('analysis_localtime_tz', /^\d{4}-\d\d-\d\d \d\d:\d\d$/.test(a.localTime(T, true)));
 
 	// csv
+	function offset(t) {
+		const m = -new Date(t * 1000).getTimezoneOffset(), h = Math.floor(Math.abs(m) / 60), n = Math.abs(m) % 60;
+		return 'UTC' + (m < 0 ? '-' : '+') + String(h).padStart(2, '0') + ':' + String(n).padStart(2, '0');
+	}
 	const lines = a.csv(pts, [ ev ], 60).trim().split('\n');
 	eq('analysis_csv_header_and_rows', lines[0],
-		'time,rx_dbm_avg,rx_dbm_min,rx_dbm_max,temp_c_avg,temp_c_min,temp_c_max,bip,events');
+		`time (${offset(T)}),rx_dbm_avg,rx_dbm_min,rx_dbm_max,temp_c_avg,temp_c_min,temp_c_max,bip,events`);
+	if (tz === 'America/Argentina/Mendoza')
+		eq('analysis_csv_offset_mendoza', lines[0].split(',')[0], 'time (UTC-03:00)');
+	eq('analysis_csv_window', a.csv(pts, [ ev ], 60, T + 60, T + 120).trim().split('\n').length, 3);
+	/* a window across a DST change: each time carries its own offset */
+	const jan = new Date(2027, 0, 15, 12, 0).getTime() / 1000, jul = new Date(2027, 6, 15, 12, 0).getTime() / 1000;
+	if (offset(jan) != offset(jul)) {
+		const mixed = a.csv([ pt(jan, 8400, 50000, 0), pt(jul, 8400, 50000, 0) ], [], 60).trim().split('\n');
+		eq('analysis_csv_mixed_offsets', [ mixed[0].split(',')[0], mixed[1].split(',')[0], mixed[2].split(',')[0] ],
+			[ 'time (local)', a.localTime(jan, true) + ' ' + offset(jan), a.localTime(jul, true) + ' ' + offset(jul) ]);
+	} else {
+		ok('analysis_csv_mixed_offsets', true);
+	}
 	eq('analysis_csv_row_count', lines.length, 4);
 	const r1 = lines[2].split(',');
 	eq('analysis_csv_values', [ r1[1], r1[4], r1[7], r1[8] ], [ '-20.7', '50.8', '2', 'deactivate' ]);
