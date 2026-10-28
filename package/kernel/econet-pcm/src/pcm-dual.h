@@ -12,4 +12,6 @@ void pcm_en751221_dual_mute(unsigned int index, bool mute);
 u32 pcm_en751221_dual_rx_frames(void);
 ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf,
 			   size_t len, bool capture);
+/* Reads return capture + played-TX frame pairs (echo reference). */
+int pcm_en751221_dual_set_ref(unsigned int index, bool on);
 #endif

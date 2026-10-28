@@ -13,6 +13,13 @@
  * mute also blanks that much of the past. Latched per stream at open.
  */
 #define PCM_DUAL_MAX_HOLD	4
+/* Reference mode pairs capture frame k with TX frame k + PCM_DUAL_REF_LEAD:
+ * the reference leads, so the echo (same 10 ms, +-1 frame of ring phase) is
+ * always causal for the canceller. It needs TX frame k + LEAD to have
+ * completed when frame k leaves the delay line, i.e. dual_cap_hold >= 3;
+ * with less the newest played frame is used and ref_late counts it. */
+#define PCM_DUAL_REF_LEAD	2
+#define PCM_DUAL_REF_RING	8
 static unsigned int dual_cap_hold = PCM_DUAL_MAX_HOLD;
 module_param(dual_cap_hold, uint, 0644);
 MODULE_PARM_DESC(dual_cap_hold, "capture delay line in 10 ms frames (0-4) so the hang-up mute can blank the frames just before it");
@@ -30,6 +37,13 @@ struct pcm_dual_line {
 	unsigned int hold_depth, hold_n, hold_head;
 	bool hold_muted;	/* mute_cap as the capture side last saw it */
 	u32 retro_frames;	/* frames blanked retroactively */
+	/* Echo reference (pcm_en751221_dual_set_ref): each capture frame leaves
+	 * paired with what this line's TX slot carried, both counted in 10 ms
+	 * frames since open (RX and TX complete in lockstep on one PCM clock). */
+	bool ref_mode;
+	u32 rx_seq, tx_seq, ref_late;
+	u32 hold_seq[PCM_DUAL_MAX_HOLD];
+	s16 played[PCM_DUAL_REF_RING][PCM_SAMP_PER_FRAME];
 };
 
 static struct {
@@ -95,22 +109,41 @@ static int pcm_dual_status_show(struct seq_file *s, void *unused)
 			READ_ONCE(pd.rx_min[i]), READ_ONCE(pd.rx_max[i]));
 	for (i = 0; i < 2; i++) {
 		struct pcm_dual_line *l = &pd.line[i];
-		u32 cap, play, rd, wr, shorts, drops, depth, retro;
-		bool opened;
+		u32 cap, play, rd, wr, shorts, drops, depth, retro, late;
+		bool opened, ref;
 
 		spin_lock_irqsave(&l->lock, flags);
 		cap = kfifo_len(&l->cap); play = kfifo_len(&l->play);
 		rd = l->read_bytes; wr = l->write_bytes; opened = l->opened;
 		shorts = l->tx_short_frames; drops = l->cap_drop_frames;
 		depth = l->hold_depth; retro = l->retro_frames;
+		ref = l->ref_mode; late = l->ref_late;
 		spin_unlock_irqrestore(&l->lock, flags);
-		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u hold=%u retro_frames=%u\n",
+		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u hold=%u retro_frames=%u ref=%u ref_late=%u\n",
 			i + 1, opened, dual_rx_ch[i], dual_tx_ch[i], cap, play, rd, wr, shorts, drops, READ_ONCE(l->mute_cap),
-			depth, retro);
+			depth, retro, ref, late);
 	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(pcm_dual_status);
+
+/* The TX frame that pairs with capture frame seq. Called with l->lock held. */
+static const s16 *pcm_dual_ref(struct pcm_dual_line *l, u32 seq)
+{
+	static const s16 silence[PCM_SAMP_PER_FRAME];
+	u32 want = seq + PCM_DUAL_REF_LEAD;
+
+	if (!l->tx_seq)
+		return silence;
+	if ((s32)(l->tx_seq - want) <= 0) {
+		l->ref_late++;		/* not played yet: hold too short */
+		want = l->tx_seq - 1;
+	} else if (l->tx_seq - want > PCM_DUAL_REF_RING) {
+		l->ref_late++;		/* already overwritten */
+		want = l->tx_seq - PCM_DUAL_REF_RING;
+	}
+	return l->played[want % PCM_DUAL_REF_RING];
+}
 
 static int pcm_dual_thread(void *unused)
 {
@@ -142,6 +175,7 @@ static int pcm_dual_thread(void *unused)
 					(rx * VOICE_CHANS + dual_rx_ch[line]) * PCM_SAMP_PER_FRAME;
 
 				s16 *out = frame;
+				u32 seq, out_seq;
 				bool mute;
 
 				if (!READ_ONCE(l->opened))
@@ -153,6 +187,7 @@ static int pcm_dual_thread(void *unused)
 					for (i = 0; i < PCM_SAMP_PER_FRAME; i++)
 						frame[i] = ulaw_decode(src[i] & 0xff);
 				spin_lock_irqsave(&l->lock, flags);
+				seq = out_seq = l->rx_seq++;
 				if (l->opened && l->hold_depth) {
 					/* Loop just opened: what still waits here was
 					 * captured before the mute caught up. */
@@ -163,19 +198,31 @@ static int pcm_dual_thread(void *unused)
 					l->hold_muted = mute;
 					if (l->hold_n < l->hold_depth) {
 						/* Filling up after open: nothing leaves yet. */
-						memcpy(l->hold[(l->hold_head + l->hold_n) % l->hold_depth],
-						       frame, VOICE_FB);
+						unsigned int slot = (l->hold_head + l->hold_n) % l->hold_depth;
+
+						memcpy(l->hold[slot], frame, VOICE_FB);
+						l->hold_seq[slot] = seq;
 						l->hold_n++;
 						out = NULL;
 					} else {
 						/* Oldest frame out, this one into its slot. */
 						memcpy(hold_out, l->hold[l->hold_head], VOICE_FB);
+						out_seq = l->hold_seq[l->hold_head];
 						memcpy(l->hold[l->hold_head], frame, VOICE_FB);
+						l->hold_seq[l->hold_head] = seq;
 						l->hold_head = (l->hold_head + 1) % l->hold_depth;
 						out = hold_out;
 					}
 				}
-				if (out && l->opened && kfifo_avail(&l->cap) >= VOICE_FB)
+				if (out && l->opened && l->ref_mode) {
+					/* The pair goes in whole or not at all. */
+					if (kfifo_avail(&l->cap) >= 2 * VOICE_FB) {
+						kfifo_in(&l->cap, out, VOICE_FB);
+						kfifo_in(&l->cap, pcm_dual_ref(l, out_seq), VOICE_FB);
+					} else {
+						l->cap_drop_frames++;
+					}
+				} else if (out && l->opened && kfifo_avail(&l->cap) >= VOICE_FB)
 					kfifo_in(&l->cap, out, VOICE_FB);
 				else if (out && l->opened)
 					l->cap_drop_frames++;
@@ -191,6 +238,24 @@ static int pcm_dual_thread(void *unused)
 		while (!(READ_ONCE(p->tx_ring[tx].status) & PCM_DESC_OWN)) {
 			s16 *base = (s16 *)pd.tx + tx * VOICE_CHANS * PCM_SAMP_PER_FRAME;
 			pd.tx_frames++;
+
+			/* This descriptor just went out: keep what each open line's
+			 * slot carried before the refill below overwrites it. */
+			for (line = 0; line < 2; line++) {
+				struct pcm_dual_line *l = &pd.line[line];
+				const u16 *slot = (const u16 *)base + dual_tx_ch[line] * PCM_SAMP_PER_FRAME;
+
+				spin_lock_irqsave(&l->lock, flags);
+				if (l->opened) {
+					s16 *dst = l->played[l->tx_seq % PCM_DUAL_REF_RING];
+
+					if (l->ref_mode)
+						for (i = 0; i < PCM_SAMP_PER_FRAME; i++)
+							dst[i] = ulaw_decode((tx_msb ? slot[i] >> 8 : slot[i]) & 0xff);
+					l->tx_seq++;
+				}
+				spin_unlock_irqrestore(&l->lock, flags);
+			}
 
 			for (ch = 0; ch < VOICE_CHANS; ch++)
 				for (i = 0; i < PCM_SAMP_PER_FRAME; i++)
@@ -388,6 +453,9 @@ int pcm_en751221_dual_open(unsigned int index)
 		l->hold_n = l->hold_head = 0;
 		l->hold_muted = false;
 		l->retro_frames = 0;
+		l->ref_mode = false;
+		l->rx_seq = l->tx_seq = l->ref_late = 0;
+		memset(l->played, 0, sizeof(l->played));
 		l->opened = true;
 	l->mute_cap = false;
 	}
@@ -407,6 +475,7 @@ void pcm_en751221_dual_close(unsigned int index)
 	spin_lock_irqsave(&l->lock, flags);
 	l->opened = false;
 	l->mute_cap = false;
+	l->ref_mode = false;
 	kfifo_reset(&l->cap);
 	kfifo_reset(&l->play);
 	spin_unlock_irqrestore(&l->lock, flags);
@@ -414,6 +483,31 @@ void pcm_en751221_dual_close(unsigned int index)
 	wake_up_interruptible(&l->play_wq);
 }
 EXPORT_SYMBOL_GPL(pcm_en751221_dual_close);
+
+/* Reference mode for the open stream: every read then returns whole pairs,
+ * the capture frame followed by the TX frame that played with it (see
+ * PCM_DUAL_REF_LEAD), for an echo canceller that needs no timing of its own.
+ * Switching drops what the capture queue holds, so pairs never mix. */
+int pcm_en751221_dual_set_ref(unsigned int index, bool on)
+{
+	struct pcm_dual_line *l;
+	unsigned long flags;
+	int ret = 0;
+
+	if (index >= 2)
+		return -EINVAL;
+	l = &pd.line[index];
+	spin_lock_irqsave(&l->lock, flags);
+	if (!l->opened) {
+		ret = -ENODEV;
+	} else if (l->ref_mode != on) {
+		kfifo_reset(&l->cap);
+		l->ref_mode = on;
+	}
+	spin_unlock_irqrestore(&l->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pcm_en751221_dual_set_ref);
 
 /* The SLIC side saw the loop open (or close again) on a line with an open
  * stream. With the loop open in active feed the Le9642 buck-boost runs in
@@ -437,9 +531,9 @@ EXPORT_SYMBOL_GPL(pcm_en751221_dual_rx_frames);
 ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf, size_t len, bool capture)
 {
 	struct pcm_dual_line *l;
-	s16 tmp[PCM_SAMP_PER_FRAME];
+	s16 tmp[2 * PCM_SAMP_PER_FRAME];
 	unsigned long flags;
-	unsigned int n;
+	unsigned int n, want = 2;
 	int ret;
 	wait_queue_head_t *wq;
 
@@ -450,14 +544,21 @@ ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf, size_t len, b
 
 	if (!len)
 		return 0;
-	len = min_t(size_t, len, sizeof(tmp)) & ~1UL;
+	if (capture && READ_ONCE(l->ref_mode)) {
+		/* One whole pair per read. */
+		if (len < 2 * VOICE_FB)
+			return -EINVAL;
+		len = want = 2 * VOICE_FB;
+	} else {
+		len = min_t(size_t, len, VOICE_FB) & ~1UL;
+	}
 	if (!len)
 		return -EINVAL;
 	if (!capture && copy_from_user(tmp, buf, len))
 		return -EFAULT;
 	ret = wait_event_interruptible(*wq,
 		!READ_ONCE(pcm_dual_running) || !READ_ONCE(l->opened) ||
-		(capture ? kfifo_len(&l->cap) >= 2 :
+		(capture ? kfifo_len(&l->cap) >= want :
 		 kfifo_len(&l->play) + len <= dual_play_limit));
 	if (ret)
 		return ret;

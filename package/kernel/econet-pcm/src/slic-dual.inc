@@ -560,9 +560,26 @@ static ssize_t slic_dual_write(struct file *f, const char __user *buf, size_t le
 	return pcm_en751221_dual_io(l->index, (char __user *)buf, len, false);
 }
 
+/* Echo reference on (1) or off (0) for this open stream: reads then return
+ * 320-byte pairs, capture frame + the frame its TX slot played. */
+#define XR500V_IOC_REF	_IOW('X', 0x52, int)
+
+static long slic_dual_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	struct slic_dual_line *l = f->private_data;
+	int on;
+
+	if (cmd != XR500V_IOC_REF)
+		return -ENOTTY;
+	if (get_user(on, (int __user *)arg))
+		return -EFAULT;
+	return pcm_en751221_dual_set_ref(l->index, on != 0);
+}
+
 static const struct file_operations slic_dual_fops = {
 	.owner = THIS_MODULE, .open = slic_dual_open, .release = slic_dual_release,
 	.read = slic_dual_read, .write = slic_dual_write,
+	.unlocked_ioctl = slic_dual_ioctl,
 };
 
 
