@@ -26,15 +26,21 @@
 #include <string.h>
 #include <pthread.h>
 #include <math.h>
+#include <stdio.h>
+#include <time.h>
+#include <sys/ioctl.h>
 #include <re.h>
 #include <re_atomic.h>
 #include <rem.h>
 #include <baresip.h>
 #include <speex/speex_echo.h>
 #include "xr500v-denoise.h"
+#include "xr500v-nlp.h"
 #include "dtmf.h"
 
 #define XR_DEV "/dev/xr500v-voice"
+/* econet-slic: reads return capture + played-TX frame pairs (echo reference) */
+#define XR500V_IOC_REF	_IOW('X', 0x52, int)
 #define IO_FRAME 80	/* 10 ms: the driver's PCM frame and the AEC/denoise step */
 
 static struct ausrc *ausrc;
@@ -52,6 +58,9 @@ static struct {
 	struct list srcl, playl;
 	SpeexPreprocessState *denoise;
 	int tap_fd;		/* debug: tee captured mic to /tmp/xr500v_captap.raw */
+	bool ref_mode;		/* the kernel pairs each capture frame with its reference */
+	bool nlp_on;
+	struct xr_nlp nlp;	/* capture thread only */
 } io = { .fd = -1, .tap_fd = -1 };
 static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -141,6 +150,27 @@ static bool aec_requested(void)
 	return env && !strcmp(env, "1");
 }
 
+/* Canceller tail in reference mode: the echo arrives 10-30 ms after its
+ * reference (the kernel's lead, +-1 frame of ring phase) and the hybrid's
+ * impulse lasts ~4 ms. A longer tail only converges slower (measured: 40 ms
+ * as good as 32, 64 ms up to 1 dB worse). */
+static int aec_tail_ms(void)
+{
+	const char *env = getenv("XR500V_AEC_TAIL_MS");
+	int ms = env ? atoi(env) : 40;
+
+	return ms < 32 ? 32 : ms > 200 ? 200 : ms;
+}
+
+/* Residual echo attenuation while only the far end talks; 0 = off. */
+static int nlp_db(void)
+{
+	const char *env = getenv("XR500V_NLP_DB");
+	int db = env ? atoi(env) : 18;
+
+	return db < 0 ? 0 : db > 40 ? 40 : db;
+}
+
 static bool denoise_requested(void)
 {
 	const char *env = getenv("XR500V_DENOISE");
@@ -154,6 +184,20 @@ static void aec_playback(const int16_t *samples, size_t count)
 	if (g_aec && g_aec_active)
 		for (i = 0; i + AEC_FRAME <= count; i += AEC_FRAME)
 			speex_echo_playback(g_aec, samples + i);
+	pthread_mutex_unlock(&g_lock);
+}
+
+/* Reference mode: the frame comes with what its TX slot played, so the
+ * canceller runs in lockstep with no timing of its own. */
+static void aec_cancel(int16_t *samples, const int16_t *ref)
+{
+	int16_t out[AEC_FRAME];
+
+	pthread_mutex_lock(&g_lock);
+	if (g_aec && g_aec_active) {
+		speex_echo_cancellation(g_aec, samples, ref, out);
+		memcpy(samples, out, sizeof(out));
+	}
 	pthread_mutex_unlock(&g_lock);
 }
 
@@ -226,6 +270,70 @@ static int write_full(int fd, const void *buf, size_t n)
 		put += (size_t)r;
 	}
 	return 0;
+}
+
+/* Lab only: raw echo taps, armed by the file /tmp/xr500v-aectap when the line
+ * opens. mic = capture before any processing, ref = the AEC reference, ts = one
+ * record per 10 ms frame (0 capture read, 1 reference handed to the AEC,
+ * 2 playback write returned, 3 kernel reference; CLOCK_MONOTONIC), kref = the
+ * kernel's paired reference in reference mode, so the echo delay and the two
+ * threads' interleaving can be replayed offline. Host (big-endian) order. */
+struct aectap_rec {
+	uint32_t seq;
+	uint8_t dir;
+	uint8_t pad[3];
+	uint64_t ns;
+};
+static int g_tap_mic = -1, g_tap_ref = -1, g_tap_ts = -1, g_tap_kref = -1;
+static uint32_t g_tap_seq[4];
+
+static int aectap_file(const char *what)
+{
+	char path[64];
+
+	snprintf(path, sizeof(path), "/tmp/xr500v_%s.%d", what, (int)getpid());
+	return open(path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+}
+
+static void aectap_open(void)
+{
+	if (access("/tmp/xr500v-aectap", F_OK))
+		return;
+	g_tap_mic = aectap_file("mic");
+	g_tap_ref = aectap_file("ref");
+	g_tap_ts = aectap_file("ts");
+	g_tap_kref = aectap_file("kref");
+	memset(g_tap_seq, 0, sizeof(g_tap_seq));
+	info("xr500v: lab echo taps armed (pid %d)\n", (int)getpid());
+}
+
+static void aectap_close(void)
+{
+	if (g_tap_mic >= 0)
+		close(g_tap_mic);
+	if (g_tap_ref >= 0)
+		close(g_tap_ref);
+	if (g_tap_ts >= 0)
+		close(g_tap_ts);
+	if (g_tap_kref >= 0)
+		close(g_tap_kref);
+	g_tap_mic = g_tap_ref = g_tap_ts = g_tap_kref = -1;
+}
+
+static void aectap(int dir, const int16_t *s)
+{
+	struct aectap_rec r = { .dir = (uint8_t)dir };
+	struct timespec now;
+
+	if (g_tap_ts < 0)
+		return;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	r.seq = g_tap_seq[dir]++;
+	r.ns = (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
+	(void)write(g_tap_ts, &r, sizeof(r));
+	if (s)
+		(void)write(dir == 3 ? g_tap_kref : dir ? g_tap_ref : g_tap_mic, s,
+			    IO_FRAME * sizeof(int16_t));
 }
 
 /* ------------------------------------------------------------ endpoints */
@@ -349,7 +457,9 @@ static bool frame_blank(const int16_t *s, size_t n)
 /* Capture: 10 ms from the line, the capture chain once, every source. */
 static int cap_thread(void *arg)
 {
-	int16_t cap[IO_FRAME];
+	int16_t raw[2 * IO_FRAME], mic[IO_FRAME], aec[IO_FRAME];
+	int16_t *cap = raw, *ref = raw + IO_FRAME;
+	size_t rlen = io.ref_mode ? sizeof(raw) : IO_FRAME * sizeof(int16_t);
 	uint64_t frames = 0;
 	unsigned mic_peak = 0, clean_peak = 0;
 	unsigned long mic_full = 0, clean_full = 0;
@@ -360,24 +470,34 @@ static int cap_thread(void *arg)
 		struct le *le;
 		bool blank;
 
-		if (read_full(io.fd, cap, sizeof(cap))) {
+		if (read_full(io.fd, raw, rlen)) {
 			if (re_atomic_rlx(&io.run))
 				sys_msleep(5);
 			continue;
 		}
+		aectap(0, cap);
+		if (io.ref_mode)
+			aectap(3, ref);
 		blank = frame_blank(cap, IO_FRAME);
 
 		if (g_dtmf_mq)
 			dtmf_scan(cap, IO_FRAME);
 		measure_level(cap, IO_FRAME, &mic_peak, &mic_full);
 		measure_noise(cap, IO_FRAME, &mic_noise);
-		aec_capture(cap, IO_FRAME);
+		memcpy(mic, cap, sizeof(mic));
+		if (!io.ref_mode)
+			aec_capture(cap, IO_FRAME);
+		else if (!blank)
+			aec_cancel(cap, ref);	/* a muted frame would unlearn the echo */
+		memcpy(aec, cap, sizeof(aec));
 		measure_level(cap, IO_FRAME, &clean_peak, &clean_full);
 		measure_noise(cap, IO_FRAME, &clean_noise);
 		if (io.denoise) {
 			speex_preprocess_run(io.denoise, cap);
 			measure_noise(cap, IO_FRAME, &denoise_noise);
 		}
+		if (io.nlp_on && !blank)
+			xr_nlp_run(&io.nlp, mic, ref, aec, cap, IO_FRAME);
 		if (io.tap_fd >= 0)
 			(void)write(io.tap_fd, cap, sizeof(cap));
 		if (blank)
@@ -400,6 +520,9 @@ static int cap_thread(void *arg)
 			report_noise("aec", &clean_noise);
 			if (io.denoise)
 				report_noise("denoise", &denoise_noise);
+			if (io.nlp_on)
+				info("xr500v: nlp suppressed=%u doubletalk=%u of %u frames\n",
+				     io.nlp.suppressed, io.nlp.doubletalk, io.nlp.frames);
 			mic_peak = clean_peak = 0;
 			mic_full = clean_full = 0;
 			frames = 0;
@@ -456,9 +579,12 @@ static int play_thread(void *arg)
 		measure_noise(out, IO_FRAME, &speaker_noise);
 		/* Reference is the outgoing PCM queued below, not received RTP.
 		 * The echo filter must cover kernel FIFO + DMA playback latency. */
-		aec_playback(out, IO_FRAME);
+		aectap(1, out);
+		if (!io.ref_mode)
+			aec_playback(out, IO_FRAME);
 		if (write_full(io.fd, out, sizeof(out)) && re_atomic_rlx(&io.run))
 			sys_msleep(5);
+		aectap(2, NULL);
 
 		frames += IO_FRAME;
 		if (frames >= 8000 * 5) {
@@ -484,12 +610,14 @@ static void io_close(void)
 	g_aec = NULL;
 	g_aec_active = false;
 	pthread_mutex_unlock(&g_lock);
+	io.ref_mode = io.nlp_on = false;
 	if (io.denoise)
 		speex_preprocess_state_destroy(io.denoise);
 	io.denoise = NULL;
 	if (io.tap_fd >= 0)
 		close(io.tap_fd);
 	io.tap_fd = -1;
+	aectap_close();
 }
 
 /* First endpoint: open the line and start the IO threads. */
@@ -515,10 +643,14 @@ static int io_get(void)
 	}
 	info("xr500v: line device %s opened\n", device);
 	if (aec_requested()) {
-		int rate = 8000;
+		int rate = 8000, on = 1, tail = 3200;
 
+		/* Older kernels say ENOTTY: keep the timed reference. */
+		io.ref_mode = !ioctl(io.fd, XR500V_IOC_REF, &on);
+		if (io.ref_mode)
+			tail = aec_tail_ms() * 8;
 		pthread_mutex_lock(&g_lock);
-		g_aec = speex_echo_state_init(AEC_FRAME, 3200);
+		g_aec = speex_echo_state_init(AEC_FRAME, tail);
 		if (g_aec)
 			speex_echo_ctl(g_aec, SPEEX_ECHO_SET_SAMPLING_RATE, &rate);
 		g_aec_active = false;
@@ -528,7 +660,13 @@ static int io_get(void)
 			err = ENOMEM;
 			goto fail;
 		}
-		info("xr500v: experimental fixed-point AEC enabled, 10ms frames/400ms tail\n");
+		info("xr500v: fixed-point AEC enabled, 10ms frames/%d ms tail, %s\n", tail / 8,
+		     io.ref_mode ? "kernel echo reference" : "timed reference");
+		io.nlp_on = io.ref_mode && nlp_db() > 0;
+		if (io.nlp_on) {
+			xr_nlp_init(&io.nlp, nlp_db());
+			info("xr500v: residual echo suppression %d dB\n", nlp_db());
+		}
 	}
 	if (denoise_requested()) {
 		io.denoise = xr500v_denoise_create();
@@ -540,6 +678,7 @@ static int io_get(void)
 	if (getenv("XR500V_CAPTAP"))
 		io.tap_fd = open("/tmp/xr500v_captap.raw",
 				 O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+	aectap_open();
 	memset(&g_dtmf, 0, sizeof(g_dtmf));
 	re_atomic_rlx_set(&io.run, true);
 	err = thread_create_name(&io.cap_thread, "xr500v_cap", cap_thread, NULL);
