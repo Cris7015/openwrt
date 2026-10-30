@@ -430,8 +430,9 @@ function apply_profile(args) {
 	let changed = false;
 	for (let k, v in a) if (v != old[k]) changed = true;
 	if (!changed) return { ok: true, changed: false, restarted: false, config: current };
+	// A shared port uses Phone 1's interface; the page hides its own.
 	let selected = filter(current.networks, (n) => n.name == a.network);
-	if (!length(selected)) return { ok: false, error: 'network_missing' };
+	if (a.account_mode != 'shared' && !length(selected)) return { ok: false, error: 'network_missing' };
 	let safety = idle_check();
 	if (safety) return { ok: false, error: safety };
 	let raw = read('/etc/config/xr500v-voip');

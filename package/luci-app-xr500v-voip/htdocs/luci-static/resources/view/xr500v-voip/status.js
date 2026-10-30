@@ -111,7 +111,7 @@ function content(data) {
 			[_('State'), portState],
 			[_('Registration'), registration],
 			[_('SIP service'), service],
-			[_('Network'), l => l.network_managed ? '%s (%s)'.format(text(l.configured_network), l.network_ready ? _('up') : _('down')) : text(l.configured_network)],
+			[_('Network'), l => l.configured_mode === 'shared' ? _('Through Phone 1') : l.network_managed ?'%s (%s)'.format(text(l.configured_network), l.network_ready ? _('up') : _('down')) : text(l.configured_network)],
 			[_('Dialing'), dialing],
 			[_('Idle feed'), l => l.idle_feed === 'active' ? _('Active') : _('Standby')]
 		]),

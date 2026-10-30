@@ -64,6 +64,8 @@ return view.extend({
 		var seen = {};
 		this.current.networks.forEach(n => { seen[n.name] = true; o.value(n.name, n.name + ' — ' + (n.up ? _('Up') : _('Down')) + (n.ipv4 ? ' (' + n.ipv4 + ')' : '')); });
 		if (!seen[v.network]) o.value(v.network, v.network + ' — ' + _('Unavailable'));
+		// A shared port runs nothing of its own; Phone 1's interface carries it.
+		['local', 'provider', 'custom'].forEach(mode => o.depends('account_mode', mode));
 		['username', 'domain', 'auth_user', 'proxy'].forEach(k => {
 			var help = k === 'domain' ? _('Registrar hostname or IPv4 address, optionally with :port.') :
 				k === 'auth_user' ? _('Optional. Defaults to the user.') : k === 'proxy' ? _('Optional. Hostname or IPv4 address, optionally with :port.') : undefined;
