@@ -9,6 +9,9 @@ var readConfig = rpc.declare({ object: 'xr500v.voip', method: 'config_get', expe
 
 var feedValues = { standby: _('Standby'), active: _('Active') };
 var callerIdValues = { off: _('Off'), v23: _('V.23 FSK (ETSI)'), bell202: _('Bell 202 FSK') };
+/* not inline after `return`: LuCI's jsmin takes the slash for a division
+ * and drops the blank from the class, rejecting space-separated lists */
+var EMERGENCY_NUMBERS = /^[0-9*# ,;]*$/;
 
 // Order matters: it is the parameter order of config_apply.
 var fields = [
@@ -126,7 +129,7 @@ return view.extend({
 				};
 			if (f.key === 'emergency_numbers')
 				o.validate = function(section_id, value) {
-					return /^[0-9*# ,;]*$/.test(value) && value.length < 256 ? true :
+					return EMERGENCY_NUMBERS.test(value) && value.length < 256 ? true :
 						_('Use digits, * and #, separated by spaces.');
 				};
 		});
