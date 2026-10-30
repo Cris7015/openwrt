@@ -102,6 +102,23 @@ function rate(bps) {
 	return (bps != null) ? '%.2mbit/s'.format(bps) : '—';
 }
 
+/* String.format() has no '+' flag */
+function signed(n) {
+	return (n > 0 ? '+' : '') + n;
+}
+
+/* eye cell colour: green when clean, then yellow to red on a log scale */
+function eyeColor(c, max) {
+	if (c == null)
+		return 'transparent';
+	if (c == 0)
+		return 'hsl(122,39%,42%)';
+
+	var f = Math.min(1, Math.log(1 + c) / Math.log(1 + max));
+
+	return 'hsl(%d,85%%,%d%%)'.format(Math.round(55 * (1 - f)), Math.round(55 - 15 * f));
+}
+
 function datetime(t) {
 	var d = new Date(t * 1000);
 
@@ -447,30 +464,28 @@ return view.extend({
 		    CELL = 'width:8px;height:8px;padding:0;border:0';
 
 		var rows = vs.map(function(v) {
-			return E('tr', {}, [ E('td', { 'style': LABEL }, [ ((v - 64) % 16 == 0) ? '%+d'.format(v - 64) : '' ]) ]
+			return E('tr', {}, [ E('td', { 'style': LABEL }, [ ((v - 64) % 16 == 0) ? signed(v - 64) : '' ]) ]
 				.concat(hs.map(function(h) {
 					var c = cnt[h * 128 + v];
-					var bg = (c == null) ? 'transparent' : (c == 0) ? 'rgba(76,175,80,.55)'
-						: 'rgba(244,67,54,%.2f)'.format(0.15 + 0.85 * Math.min(1, c / max));
 
-					return E('td', { 'style': CELL + ';background:' + bg,
-						'title': (c != null) ? _('phase %+d, threshold %+d: %d').format(h - 64, v - 64, c) : '' });
+					return E('td', { 'style': CELL + ';background:' + eyeColor(c, max),
+						'title': (c != null) ? _('phase %s, threshold %s: %d').format(signed(h - 64), signed(v - 64), c) : '' });
 				})));
 		});
 		var axis = E('tr', {}, [ E('td') ].concat(hs.map(function(h) {
 			return E('td', { 'style': 'padding:0;font-size:10px;white-space:nowrap;overflow:visible' },
-				[ ((h - 64) % 32 == 0) ? '%+d'.format(h - 64) : '' ]);
+				[ ((h - 64) % 32 == 0) ? signed(h - 64) : '' ]);
 		})));
 
 		return E([], [
 			E('p', {}, [
-				hOpen ? _('At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes).').format(hOpen[0], hOpen[1], hOpen[1] - hOpen[0] + step) : _('No clean point at threshold 0.'),
+				hOpen ? _('At threshold 0 the eye is clean from phase %s to %s (%d of 128 codes).').format(signed(hOpen[0]), signed(hOpen[1]), hOpen[1] - hOpen[0] + step) : _('No clean point at threshold 0.'),
 				' ',
-				vOpen ? _('At phase 0, from threshold %+d to %+d.').format(vOpen[0], vOpen[1]) : ''
+				vOpen ? _('At phase 0, from threshold %s to %s.').format(signed(vOpen[0]), signed(vOpen[1])) : ''
 			]),
 			E('table', { 'style': 'border-collapse:collapse;margin:8px 0' }, rows.concat([ axis ])),
 			E('div', { 'class': 'cbi-section-descr' }, [
-				_('Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s.').format(datetime(res.t))
+				_('Rows: decision threshold. Columns: sampling phase. Green: no disagreement; yellow to red: more disagreements. Measured %s.').format(datetime(res.t))
 			])
 		]);
 	},

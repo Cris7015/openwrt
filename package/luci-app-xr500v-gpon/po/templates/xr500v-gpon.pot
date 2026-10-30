@@ -656,11 +656,11 @@ msgid "No answer from the monitor."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "phase %+d, threshold %+d: %d"
+msgid "phase %s, threshold %s: %d"
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes)."
+msgid "At threshold 0 the eye is clean from phase %s to %s (%d of 128 codes)."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
@@ -668,11 +668,11 @@ msgid "No clean point at threshold 0."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "At phase 0, from threshold %+d to %+d."
+msgid "At phase 0, from threshold %s to %s."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s."
+msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; yellow to red: more disagreements. Measured %s."
 msgstr ""
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js

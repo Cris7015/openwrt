@@ -655,24 +655,24 @@ msgid "No answer from the monitor."
 msgstr "El monitor no respondió."
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "phase %+d, threshold %+d: %d"
-msgstr "fase %+d, umbral %+d: %d"
+msgid "phase %s, threshold %s: %d"
+msgstr "fase %s, umbral %s: %d"
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes)."
-msgstr "Con umbral 0, el ojo está limpio desde la fase %+d hasta %+d (%d de 128 códigos)."
+msgid "At threshold 0 the eye is clean from phase %s to %s (%d of 128 codes)."
+msgstr "Con umbral 0, el ojo está limpio desde la fase %s hasta %s (%d de 128 códigos)."
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "No clean point at threshold 0."
 msgstr "No hay ningún punto limpio con umbral 0."
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "At phase 0, from threshold %+d to %+d."
-msgstr "Con fase 0, desde el umbral %+d hasta %+d."
+msgid "At phase 0, from threshold %s to %s."
+msgstr "Con fase 0, desde el umbral %s hasta %s."
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
-msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s."
-msgstr "Filas: umbral de decisión. Columnas: fase de muestreo. Verde: sin diferencias; rojo: con diferencias, más oscuro cuantas más hay. Medido el %s."
+msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; yellow to red: more disagreements. Measured %s."
+msgstr "Filas: umbral de decisión. Columnas: fase de muestreo. Verde: sin diferencias; de amarillo a rojo: cada vez más diferencias. Medido el %s."
 
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "Measuring…"
