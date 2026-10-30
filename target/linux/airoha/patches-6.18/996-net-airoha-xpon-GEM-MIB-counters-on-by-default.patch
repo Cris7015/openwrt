@@ -1,0 +1,44 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: net: airoha: xpon: GEM MIB counters on by default
+
+On the live link the RX payload bytes of the internet GEM port passed
+4 GiB with the high word of the MIB window at 1: the counters are 64
+bits wide. Read them from boot (airoha_xpon.gem_mib=0 turns that off)
+and poll once a minute instead of every 5 s: there is no wrap to catch,
+the poll only folds the counts in and rebuilds the table after a MAC
+reset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 11:23:03.827232127 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 11:23:03.851232124 -0300
+@@ -1058,7 +1058,16 @@
+  * (which zeroes it) and the table rebuilt right away; the counts are folded
+  * into software totals first.
+  */
+-#define GPON_MIB_POLL_MS	5000
++/*
++ * The counters are 64 bits wide (checked on the live link past 4 GiB), so
++ * the poll is not there to catch wraps: it folds the counts in and
++ * rebuilds the table after a MAC reset.
++ */
++#define GPON_MIB_POLL_MS	60000
++
++static bool gem_mib = true;
++module_param(gem_mib, bool, 0444);
++MODULE_PARM_DESC(gem_mib, "Read the per-GEM MIB counters from boot (default: on)");
+ 
+ static int gpon_mib_read_locked(struct xpon_priv *priv, u16 gem,
+ 				unsigned int type, u64 *val)
+@@ -1219,6 +1228,11 @@
+ 	bitmap_zero(priv->hw_gems, GPON_MAX_GEM_ID);
+ 	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++)
+ 		priv->gem_mib[i].gem = GPON_MAX_GEM_ID;
++	/* The table is built when the first GEM ports come up. */
++	priv->gem_mib_enabled = gem_mib;
++	if (gem_mib)
++		schedule_delayed_work(&priv->gem_mib_work,
++				      msecs_to_jiffies(GPON_MIB_POLL_MS));
+ }
+ 
+ static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
