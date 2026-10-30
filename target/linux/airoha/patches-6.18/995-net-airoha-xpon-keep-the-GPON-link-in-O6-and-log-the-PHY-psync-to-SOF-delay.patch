@@ -1,0 +1,161 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: net: airoha: xpon: keep the GPON link in O6 and log the PHY psync-to-SOF delay
+
+Entering O6 (LOS/LOF) dropped the netdev carrier at once, so even a
+Popup within TO2 (100 ms) that brings O5 back tore down PPPoE. Keep the
+link through O6 like the vendor driver does; TO2 expiring still takes it
+down through gpon_disable().
+
+The vendor driver also stores the PHY psync-to-SOF delay (PHY 0x2d4) on
+reaching O5 and, when the PHY relocks without a new ranging, moves the
+MAC fine delay by half the change. That path has not been seen on the
+XR500v, so only log the delay at O5, at O6 and on the way back to O5,
+with the difference from the session's O5 entry, before correcting
+anything.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/phy/airoha/phy-airoha-xpon.c	2026-10-30 04:48:15.240386271 -0300
++++ b/drivers/phy/airoha/phy-airoha-xpon.c	2026-10-30 04:48:58.460375366 -0300
+@@ -57,6 +57,8 @@
+ #define XPON_RX_BIP_LATCH		BIT(2)
+ #define XPON_RX_BIP_CLEAR		BIT(3)
+ #define XPON_RX_COUNTER_CTRL2		0x0298
++#define XPON_PSYNC_SOF_DELAY		0x02d4	/* vendor ROUND_TRIP_DELAY */
++#define XPON_PSYNC_SOF_DELAY_MASK	GENMASK(15, 0)
+ #define XPON_GPON_PREAMBLE		0x0400
+ #define XPON_GPON_DELIMITER_GUARD	0x0404
+ #define XPON_GPON_EXT_PREAMBLE		0x0408
+@@ -299,6 +301,32 @@
+ }
+ EXPORT_SYMBOL_GPL(airoha_xpon_phy_get_link_state);
+ 
++/*
++ * Delay from the downstream Psync to the PHY start of frame, in 3.2 ns
++ * units (4 upstream bits). It moves when the PHY relocks; the vendor
++ * driver corrects the MAC fine delay by half the change after a relock
++ * in O5.
++ */
++int airoha_xpon_phy_get_psync_sof_delay(struct phy *phy, u32 *delay)
++{
++	struct airoha_xpon_phy *priv;
++
++	if (!phy || !delay)
++		return -EINVAL;
++
++	priv = phy_get_drvdata(phy);
++	if (!priv)
++		return -ENODEV;
++	if (!READ_ONCE(priv->powered))
++		return -ENODATA;
++
++	*delay = FIELD_GET(XPON_PSYNC_SOF_DELAY_MASK,
++			   airoha_xpon_phy_read(priv, XPON_PSYNC_SOF_DELAY));
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(airoha_xpon_phy_get_psync_sof_delay);
++
+ static int airoha_xpon_phy_get_active_gpon(
+ 	struct phy *phy, struct airoha_xpon_phy **privp)
+ {
+--- a/include/linux/phy/phy-airoha-xpon.h	2026-10-30 04:48:15.248386269 -0300
++++ b/include/linux/phy/phy-airoha-xpon.h	2026-10-30 04:48:58.460375366 -0300
+@@ -28,6 +28,7 @@
+ int airoha_xpon_phy_get_cached_rx_sync(struct phy *phy, u32 *sync,
+ 				       bool *fec, u32 *age_ms);
+ int airoha_xpon_phy_get_link_state(struct phy *phy, bool *ready, bool *los);
++int airoha_xpon_phy_get_psync_sof_delay(struct phy *phy, u32 *delay);
+ /* EN751221: latch, read and clear the BIP error counter; atomic-safe. */
+ int airoha_xpon_phy_take_gpon_bip(struct phy *phy, u32 *count);
+ int airoha_xpon_phy_get_gpon_tx_counters(struct phy *phy,
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h	2026-10-30 04:48:15.232386273 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h	2026-10-30 04:48:58.464375365 -0300
+@@ -547,6 +547,8 @@
+ 	/* EqD state for O5 incremental adjustment */
+ 	u32			byte_delay;
+ 	u32			bit_delay;
++	/* PHY psync-to-SOF delay when this session reached O5, or U32_MAX */
++	u32			psync_sof_o5;
+ 
+ 	/* Consecutive TO1 expiries; cleared on O5. */
+ 	unsigned int		to1_failures;
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 04:48:15.224386275 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 04:48:58.464375365 -0300
+@@ -2549,6 +2549,30 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(gpon_lab_err_ctrl_fops, gpon_lab_err_ctrl_get,
+ 			 gpon_lab_err_ctrl_set, "0x%08llx\n");
+ 
++/*
++ * The vendor driver stores the PHY psync-to-SOF delay on reaching O5
++ * and, when the PHY relocks without a new ranging, moves the MAC fine
++ * delay by half the change. That path (O6 left through a Popup within
++ * TO2) has not been seen on the XR500v yet: log the delay so that it can
++ * be measured before anything is corrected.
++ */
++static void gpon_log_psync_sof(struct xpon_priv *priv, const char *when)
++{
++	u32 delay;
++
++	if (airoha_xpon_phy_get_psync_sof_delay(priv->phy, &delay))
++		return;
++	if (priv->psync_sof_o5 == U32_MAX) {
++		priv->psync_sof_o5 = delay;
++		dev_info(priv->dev, "GPON %s: PHY psync-to-SOF delay %u\n",
++			 when, delay);
++		return;
++	}
++	dev_info(priv->dev,
++		 "GPON %s: PHY psync-to-SOF delay %u, %d from the O5 entry of this session\n",
++		 when, delay, (int)(delay - priv->psync_sof_o5));
++}
++
+ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+@@ -2620,8 +2644,14 @@
+ 		xpon_device_report_registration(priv->xpon, registration);
+ 	}
+ 
++	/*
++	 * Like the vendor driver, O6 keeps the link: a Popup within TO2
++	 * (100 ms) returns to O5 without a carrier flap that would tear
++	 * down PPPoE, and TO2 expiring takes it down in gpon_disable().
++	 */
+ 	mutex_lock(&priv->link_state_lock);
+-	priv->gpon_o5 = state == GPON_O5_OPERATION;
++	if (state != GPON_O6_POPUP)
++		priv->gpon_o5 = state == GPON_O5_OPERATION;
+ 	mutex_unlock(&priv->link_state_lock);
+ 	gpon_refresh_netdev_link(priv, false);
+ 
+@@ -2669,6 +2699,7 @@
+ 		priv->byte_delay = 0;
+ 		priv->bit_delay = 0;
+ 		gpon_set_bit_delay(priv, 0);
++		priv->psync_sof_o5 = U32_MAX;
+ 		fallthrough;
+ 	case GPON_O3_SERIAL_NUMBER:
+ 	case GPON_O4_RANGING:
+@@ -2686,11 +2717,13 @@
+ 		priv->to1_failures = 0;
+ 		dev_info(priv->dev, "GPON O5: operational, ONU-ID=%u\n",
+ 			 ploam_get_onu_id(priv->ploam));
++		gpon_log_psync_sof(priv, "O5");
+ 		gpon_lab_o5_config(priv);
+ 		break;
+ 	case GPON_O6_POPUP:
+ 		/* Cancel TO1, start TO2 */
+ 		cancel_delayed_work(&priv->to1_work);
++		gpon_log_psync_sof(priv, "O6");
+ 		mod_delayed_work(priv->fsm_wq, &priv->to2_work,
+ 				 msecs_to_jiffies(GPON_TO2_MS));
+ 		break;
+@@ -4766,6 +4799,7 @@
+ 	INIT_DELAYED_WORK(&priv->phy_link_work,
+ 			  airoha_xpon_phy_link_work_fn);
+ 	gpon_mib_init(priv);
++	priv->psync_sof_o5 = U32_MAX;
+ 
+ 	dev_info(dev, "xPON initial mode: %s\n",
+ 		 airoha_xpon_mode_name(priv->mode));
