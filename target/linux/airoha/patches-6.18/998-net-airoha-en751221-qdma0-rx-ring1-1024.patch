@@ -1,0 +1,31 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: en751221: 1024 descriptors on QDMA0 RX ring 1
+
+WHNAT downstream frames, which the PPE rewrites and returns to the CPU
+with CRSN_22, arrive on QDMA_LAN RX ring 1. During a WiFi speed test at
+750-840 Mbit/s the CPU saturates and the ring, sampled every ~1 ms, was
+full (RX_HWI == RX_CPUI) in every second of the download, while the
+QDMA_WAN rings stayed empty. GDM2 drops what does not fit, counted in
+GDMA2_RX_ETHDROPCNT = pon0 rx_dropped: 350-2500 frames per second.
+Doubling the ring absorbs those bursts for ~7 ms more of queue.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -5529,7 +5529,14 @@
+ 	 */
+ 	if (soc->version == econet_en751221 && id == 0) {
+ 		cfg->num_rx_descs[0] = 128;
+-		cfg->num_rx_descs[1] = 512;
++		/*
++		 * lab: WHNAT downstream frames (PPE-rewritten, CRSN_22) arrive
++		 * on RX ring 1. A WiFi speed test at ~800 Mbit/s saturates the
++		 * CPU and keeps the vendor's 512 entries full, and GDM2 drops
++		 * the frames that do not fit (pon0 rx_dropped).
++		 */
++		cfg->num_rx_descs[1] = IS_ENABLED(CONFIG_NET_AIROHA_WHNAT) ?
++				       1024 : 512;
+ 		/*
+ 		 * lab: WHNAT hands every WiFi upstream frame to TX ring 0 and
+ 		 * may use it only down to AIROHA_WHNAT_TX_RESERVE free entries:
