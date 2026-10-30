@@ -52,7 +52,9 @@ let st = {
 	// (WAN over Ethernet, say) raises no alert and no event
 	ever_o5: false, snap_boot: null,
 	windows: [], win_pending: null, win_dirty: false,
-	skipped: 0
+	skipped: 0,
+	// latest gpon_gem_mib reading; rates against the previous one
+	gem: null
 };
 
 let klog_path = KLOG_FILE;
@@ -68,6 +70,41 @@ function num(text) {
 		return null;
 	let n = +s;
 	return (n != n) ? null : n;
+}
+
+function fields(line) {
+	let f = {};
+	for (let kv in split(line, ' ')) {
+		let p = split(kv, '=', 2);
+		if (length(p) == 2)
+			f[p[0]] = p[1];
+	}
+	return f;
+}
+
+// gpon_gem_mib: "enabled=1 ready=1 epoch=3 type=gem", then one line per GEM
+// port with running totals. A total that went backwards belongs to a new
+// session (MAC reset): no rate for that reading.
+function parse_gem_mib(text, t, prev) {
+	if (text == null)
+		return null;
+	let lines = split(trim(text), '\n'), head = fields(lines[0]);
+	let gem = { t, enabled: head.enabled == '1', ready: head.ready == '1',
+		type: head.type, ports: [] };
+	for (let i = 1; i < length(lines); i++) {
+		let f = fields(lines[i]), id = num(f.gem);
+		if (id == null)
+			continue;
+		let port = { id, rx_frames: num(f.rx_frames), rx_bytes: num(f.rx_bytes),
+			tx_frames: num(f.tx_frames), tx_bytes: num(f.tx_bytes) };
+		let old = (prev && t > prev.t) ? filter(prev.ports, (o) => o.id == id)[0] : null;
+		if (old && port.rx_bytes >= old.rx_bytes && port.tx_bytes >= old.tx_bytes) {
+			port.rx_bps = (port.rx_bytes - old.rx_bytes) * 8 / (t - prev.t);
+			port.tx_bps = (port.tx_bytes - old.tx_bytes) * 8 / (t - prev.t);
+		}
+		push(gem.ports, port);
+	}
+	return gem;
 }
 
 function uptime() {
@@ -201,6 +238,7 @@ function ingest(raw) {
 		sfifo_resync: num(raw.sfifo_resync), sfifo_glitch: num(raw.sfifo_glitch),
 		bip: 0
 	};
+	st.gem = parse_gem_mib(raw.gem_mib, raw.t, st.gem);
 	// A counter that went backwards was reset (driver reload): count from 0.
 	if (sample.bip_total != null && prev?.bip_total != null)
 		sample.bip = sample.bip_total >= prev.bip_total
@@ -279,6 +317,8 @@ function summary(now) {
 		counters: { bip_total: l?.bip_total, bip_session: l?.bip_session,
 			gem_delin: l?.gem_delin, sfifo_resync: l?.sfifo_resync,
 			sfifo_glitch: l?.sfifo_glitch, deactivate: st.deact },
+		gem: st.gem ? { enabled: st.gem.enabled, ready: st.gem.ready,
+			type: st.gem.type, ports: st.gem.ports } : null,
 		serial_hint: st.serial ? substr(st.serial, 0, 4) + '…' : null
 	};
 }
@@ -520,6 +560,7 @@ function collect(bus) {
 		t: time(), up: uptime(), status,
 		bip: fs.readfile(XMAC + '/gpon_bip'),
 		gem_delin: fs.readfile(XMAC + '/gpon_gem_delin'),
+		gem_mib: fs.readfile(XMAC + '/gpon_gem_mib'),
 		sfifo_resync: fs.readfile(DBG + '/gpon_sfifo_resync_count'),
 		sfifo_glitch: fs.readfile(DBG + '/gpon_sfifo_glitch_count')
 	};
@@ -573,7 +614,8 @@ function replay(path) {
 	print(sprintf('%J\n', {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
-		counters: summary(now).counters, skipped: st.skipped, last: st.last,
+		counters: summary(now).counters, gem: summary(now).gem,
+		skipped: st.skipped, last: st.last,
 		o5_since: wall(st.o5_up, st.o5_t), ever_o5: st.ever_o5,
 		windows: map(st.windows, (w) => ({ t0: w.t0, t1: w.t1, n: length(w.points) })),
 		pending: st.win_pending, listed: events_list(0),

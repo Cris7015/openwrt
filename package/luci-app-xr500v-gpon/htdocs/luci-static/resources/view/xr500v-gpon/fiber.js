@@ -77,6 +77,19 @@ function scaled(v, div, format) {
 	return (v != null) ? format.format(v / div) : null;
 }
 
+var GEM_MIB_ENABLE = '/sys/bus/platform/drivers/airoha-xpon/1fb60000.xmac/gpon_gem_mib_enable';
+
+function volume(bytes, frames) {
+	if (bytes == null)
+		return '—';
+
+	return '%1024.2mB'.format(bytes) + ((frames != null) ? ' · ' + _('%d frames').format(frames) : '');
+}
+
+function rate(bps) {
+	return (bps != null) ? '%.2mbit/s'.format(bps) : '—';
+}
+
 function datetime(t) {
 	var d = new Date(t * 1000);
 
@@ -369,9 +382,32 @@ return view.extend({
 			return r[1] != null || r[2].indexOf('debugfs') != 0;
 		});
 
-		return table([ _('Value'), _('Current'), _('Source') ], rows.map(function(r) {
+		return [ table([ _('Value'), _('Current'), _('Source') ], rows.map(function(r) {
 			return [ r[0], (r[1] != null) ? String(r[1]) : '—', E('code', {}, [ r[2] ]) ];
-		}), '');
+		}), ''), this.renderGem(s) ];
+	},
+
+	renderGem: function(s) {
+		var g = L.isObject(s.gem) ? s.gem : null,
+		    title = E('h3', {}, [ _('GEM ports') ]);
+
+		if (!g || !g.enabled)
+			return E([], [ title, E('div', { 'class': 'cbi-section-descr' }, [
+				_('Per-port traffic counters are off. To turn them on until the next reboot:'), ' ',
+				E('code', {}, [ 'echo 1 > ' + GEM_MIB_ENABLE ])
+			]) ]);
+
+		return E([], [ title,
+			E('div', { 'class': 'cbi-section-descr' }, [
+				_('GEM payload since the session started. Rates are averages over the last minute.')
+			]),
+			table([ _('GEM port'), _('Received'), _('Sent'), _('Receive rate'), _('Send rate') ],
+				(g.ports || []).map(function(p) {
+					return [ (p.id == 4095) ? _('%d (multicast)').format(p.id) : String(p.id),
+						volume(p.rx_bytes, p.rx_frames), volume(p.tx_bytes, p.tx_frames),
+						rate(p.rx_bps), rate(p.tx_bps) ];
+				}), g.ready ? _('No GEM ports configured') : _('Counters not ready yet'))
+		]);
 	},
 
 	renderEvents: function(events) {

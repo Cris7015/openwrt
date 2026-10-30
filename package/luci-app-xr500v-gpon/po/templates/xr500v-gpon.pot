@@ -570,3 +570,51 @@ msgstr ""
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js:287
 msgid "← Back to %s"
 msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "GEM ports"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Per-port traffic counters are off. To turn them on until the next reboot:"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "GEM payload since the session started. Rates are averages over the last minute."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "GEM port"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Received"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Sent"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Receive rate"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Send rate"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "%d (multicast)"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "%d frames"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "No GEM ports configured"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Counters not ready yet"
+msgstr ""

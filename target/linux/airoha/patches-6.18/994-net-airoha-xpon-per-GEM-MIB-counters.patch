@@ -1,0 +1,456 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: net: airoha: xpon: per-GEM MIB counters
+
+The GPON MAC keeps RX/TX frame and payload byte counters for every valid
+GEM port, read through an indirect command window (0x120-0x128) and
+mapped by a GEM-ID group index table (0x140-0x148). Track the GEM ports
+valid in hardware, rebuild the index table synchronously whenever that
+set changes (the vendor driver waits 2 s, counting into shifted rows
+meanwhile), fold the counts into 64-bit software totals every 5 s and
+expose them in sysfs as gpon_gem_mib.
+
+The register side is off by default: it starts when 1 is written to
+gpon_gem_mib_enable, so the default datapath never touches the MIB
+tables. The sequence follows the stock xpon.ko (gponDevGetGemPortCounter,
+gponDevUpdateGemMibIdxTable), without its read-and-clear path and its
+poll of the wrong done register.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h	2026-10-30 02:21:48.662580165 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h	2026-10-30 02:22:51.870564323 -0300
+@@ -111,6 +111,9 @@
+ #define GPON_MIB_RDATA_L32	0x124
+ #define GPON_MIB_RDATA_H32	0x128
+ #define GPON_MIB_TBL_INIT	0x134
++#define GPON_MIB_IDX_CFG	0x140
++#define GPON_MIB_IDX_STS	0x144
++#define GPON_MIB_IDX_TBL_INIT	0x148
+ /* GPON/PSE memory-bus interface control */
+ #define GPON_MBI_MPI_STOP	0x160
+ /* EN7523 GPON debug and timing registers */
+@@ -258,10 +261,26 @@
+ /* G_TCONT_ID_16_31_STS */
+ #define TCONT16_CMD_DONE	BIT(31)
+ 
+-/* G_MIB_TBL_INIT */
++/* G_MIB_TBL_INIT, G_MIB_IDX_TBL_INIT */
+ #define MIB_TBL_INIT_DONE	BIT(8)
+ #define MIB_TBL_INIT_START	BIT(0)
+ 
++/* G_MIB_CTRL_STS: per-GEM counter command, triggered by the write */
++#define MIB_CMD_DONE		BIT(30)
++#define MIB_CMD_CLEAR		BIT(24)	/* read-and-clear: never set */
++#define MIB_CMD_TYPE_MASK	GENMASK(18, 16)
++#define MIB_CMD_GEM_ID_MASK	GENMASK(11, 0)
++
++/* G_MIB_IDX_CFG, G_MIB_IDX_STS: GEM-ID group -> first MIB row */
++#define MIB_IDX_CMD_WRITE	BIT(31)
++#define MIB_IDX_ROW_MASK	GENMASK(23, 16)
++#define MIB_IDX_BASE_MASK	GENMASK(8, 0)
++#define MIB_IDX_CMD_DONE	BIT(31)
++#define GPON_MIB_IDX_ROWS	256
++
++/* G_FLEX_ONU_CAP */
++#define FLEX_ONU_CAP_CNT_ETH	BIT(26)	/* 0: count GEM frames and payload */
++
+ /* G_OMCI_ID */
+ #define OMCI_PORT_VLD		BIT(16)
+ #define OMCI_GPID_MASK		0xFFF
+@@ -379,6 +398,22 @@
+ 
+ struct gpon_blackbox;
+ 
++#define GPON_GEM_MIB_SLOTS	32
++
++enum gpon_gem_mib_type {
++	GPON_MIB_RX_FRAMES,
++	GPON_MIB_RX_BYTES,
++	GPON_MIB_TX_FRAMES,
++	GPON_MIB_TX_BYTES,
++	GPON_MIB_NR
++};
++
++struct gpon_gem_mib {
++	u16			gem;	/* GPON_MAX_GEM_ID: slot free */
++	u64			total[GPON_MIB_NR];	/* since the slot was taken */
++	u64			last[GPON_MIB_NR];	/* raw, since the MIB init */
++};
++
+ struct xpon_priv {
+ 	struct gpon_blackbox *blackbox;
+ 	void __iomem		*base;
+@@ -489,6 +524,20 @@
+ 	DECLARE_BITMAP(service_gems, GPON_MAX_GEM_ID);
+ 	/* GEM ports the OLT made encrypted with Encrypted_Port-ID (PLOAM) */
+ 	DECLARE_BITMAP(encrypted_gems, GPON_MAX_GEM_ID);
++
++	/*
++	 * Per-GEM MIB counters. gem_mib_lock serialises the MIB command
++	 * window and index table (0x120-0x148) with the map of GEM ports
++	 * valid in hardware; it is a leaf lock, process context only. The
++	 * registers are left alone until enabled through sysfs.
++	 */
++	struct mutex		gem_mib_lock;
++	DECLARE_BITMAP(hw_gems, GPON_MAX_GEM_ID);
++	struct gpon_gem_mib	gem_mib[GPON_GEM_MIB_SLOTS];
++	bool			gem_mib_enabled;
++	bool			gem_mib_ready;
++	u32			gem_mib_epoch;
++	struct delayed_work	gem_mib_work;
+ 	bool			gpon_o5;
+ 	bool			omci_operational;
+ 	bool			netdev_link;
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 02:21:48.662580165 -0300
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c	2026-10-30 02:22:51.870564323 -0300
+@@ -401,6 +401,7 @@
+ 
+ static inline void gpon_set_bits(struct xpon_priv *priv, u32 reg, u32 bits);
+ static int gpon_set_mpi_stop(struct xpon_priv *priv, bool stop);
++static void gpon_mib_invalidate(struct xpon_priv *priv);
+ 
+ static int airoha_xpon_reset_mac(struct xpon_priv *priv)
+ {
+@@ -427,6 +428,8 @@
+ 
+ 	dev_info(priv->dev, "resetting %s MAC before session start\n",
+ 		 airoha_xpon_mode_name(priv->mode));
++	/* The reset clears the GEM table and the MIB behind it. */
++	gpon_mib_invalidate(priv);
+ 	ret = reset_control_reset(priv->mac_reset);
+ 	if (ret) {
+ 		dev_err(priv->dev, "failed to reset xPON MAC: %d\n", ret);
+@@ -1001,8 +1004,8 @@
+ 	return 0;
+ }
+ 
+-static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+-				bool valid, bool encrypted)
++static int gpon_write_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
++				  bool valid, bool encrypted)
+ {
+ 	bool read_encrypted, read_valid;
+ 	u32 cfg;
+@@ -1047,6 +1050,203 @@
+ 	return ret ?: -EIO;
+ }
+ 
++/*
++ * Per-GEM MIB counters. The MAC keeps RX/TX frame and payload byte counters
++ * for every valid GEM port in a dense MIB indexed through a table: row r
++ * holds the number of valid GEM ports below 16 * r. Adding or removing a
++ * GEM port shifts the rows of the higher ones, so the MIB is re-initialised
++ * (which zeroes it) and the table rebuilt right away; the counts are folded
++ * into software totals first.
++ */
++#define GPON_MIB_POLL_MS	5000
++
++static int gpon_mib_read_locked(struct xpon_priv *priv, u16 gem,
++				unsigned int type, u64 *val)
++{
++	u32 hi, lo;
++
++	lockdep_assert_held(&priv->gem_mib_lock);
++	gpon_write(priv, GPON_MIB_CTRL_STS,
++		   FIELD_PREP(MIB_CMD_TYPE_MASK, type) |
++		   FIELD_PREP(MIB_CMD_GEM_ID_MASK, gem));
++	/* Same stale completion bit as G_GEM_PORT_STS. */
++	udelay(1);
++	if (gpon_wait_bits(priv, GPON_MIB_CTRL_STS, MIB_CMD_DONE,
++			   GPON_CMD_TIMEOUT_US))
++		return -ETIMEDOUT;
++
++	hi = gpon_read(priv, GPON_MIB_RDATA_H32);
++	lo = gpon_read(priv, GPON_MIB_RDATA_L32);
++	*val = (u64)hi << 32 | lo;
++
++	return 0;
++}
++
++static void gpon_mib_accumulate_locked(struct xpon_priv *priv)
++{
++	unsigned int i, t;
++	u64 val;
++
++	lockdep_assert_held(&priv->gem_mib_lock);
++	if (!priv->gem_mib_ready || !READ_ONCE(priv->mac_enabled))
++		return;
++
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++) {
++		struct gpon_gem_mib *m = &priv->gem_mib[i];
++
++		if (m->gem >= GPON_MAX_GEM_ID)
++			continue;
++		for (t = 0; t < GPON_MIB_NR; t++) {
++			if (gpon_mib_read_locked(priv, m->gem, t, &val))
++				continue;
++			/* The window is 64-bit; the counter width is unknown. */
++			if (val >= m->last[t])
++				m->total[t] += val - m->last[t];
++			else if (!(m->last[t] >> 32))
++				m->total[t] += (u32)(val - m->last[t]);
++			else
++				m->total[t] += val;
++			m->last[t] = val;
++		}
++	}
++}
++
++static int gpon_mib_rebuild_locked(struct xpon_priv *priv)
++{
++	unsigned int row, base = 0, i;
++	int ret;
++
++	lockdep_assert_held(&priv->gem_mib_lock);
++	priv->gem_mib_ready = false;
++	if (!READ_ONCE(priv->mac_enabled))
++		return -ENETDOWN;
++
++	gpon_write(priv, GPON_MIB_TBL_INIT, MIB_TBL_INIT_START);
++	gpon_write(priv, GPON_MIB_IDX_TBL_INIT, MIB_TBL_INIT_START);
++	ret = gpon_wait_bits(priv, GPON_MIB_TBL_INIT, MIB_TBL_INIT_DONE,
++			     GPON_CMD_TIMEOUT_US);
++	if (!ret)
++		ret = gpon_wait_bits(priv, GPON_MIB_IDX_TBL_INIT,
++				     MIB_TBL_INIT_DONE, GPON_CMD_TIMEOUT_US);
++
++	for (row = 0; !ret && row < GPON_MIB_IDX_ROWS; row++) {
++		if (row)
++			base += hweight16(bitmap_read(priv->hw_gems,
++						      (row - 1) * 16, 16));
++		gpon_write(priv, GPON_MIB_IDX_CFG, MIB_IDX_CMD_WRITE |
++			   FIELD_PREP(MIB_IDX_ROW_MASK, row) |
++			   FIELD_PREP(MIB_IDX_BASE_MASK, base));
++		udelay(1);
++		ret = gpon_wait_bits(priv, GPON_MIB_IDX_STS, MIB_IDX_CMD_DONE,
++				     GPON_CMD_TIMEOUT_US);
++	}
++
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++)
++		memset(priv->gem_mib[i].last, 0, sizeof(priv->gem_mib[i].last));
++	priv->gem_mib_epoch++;
++	if (ret) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON MIB table init failed at row %u: %d\n",
++				     row, ret);
++		return ret;
++	}
++	priv->gem_mib_ready = true;
++
++	return 0;
++}
++
++static void gpon_mib_slot_update_locked(struct xpon_priv *priv, u16 gem,
++					bool valid)
++{
++	struct gpon_gem_mib *free = NULL;
++	unsigned int i;
++
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++) {
++		struct gpon_gem_mib *m = &priv->gem_mib[i];
++
++		if (m->gem == gem) {
++			if (!valid)
++				m->gem = GPON_MAX_GEM_ID;
++			return;
++		}
++		if (!free && m->gem >= GPON_MAX_GEM_ID)
++			free = m;
++	}
++	if (valid && free) {
++		memset(free, 0, sizeof(*free));
++		free->gem = gem;
++	}
++}
++
++static void gpon_mib_invalidate(struct xpon_priv *priv)
++{
++	unsigned int i;
++
++	mutex_lock(&priv->gem_mib_lock);
++	priv->gem_mib_ready = false;
++	bitmap_zero(priv->hw_gems, GPON_MAX_GEM_ID);
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++)
++		priv->gem_mib[i].gem = GPON_MAX_GEM_ID;
++	priv->gem_mib_epoch++;
++	mutex_unlock(&priv->gem_mib_lock);
++}
++
++static void gpon_mib_work_fn(struct work_struct *work)
++{
++	struct xpon_priv *priv = container_of(to_delayed_work(work),
++					      struct xpon_priv, gem_mib_work);
++	bool again;
++
++	mutex_lock(&priv->gem_mib_lock);
++	if (priv->gem_mib_enabled && !priv->gem_mib_ready &&
++	    !bitmap_empty(priv->hw_gems, GPON_MAX_GEM_ID))
++		gpon_mib_rebuild_locked(priv);
++	gpon_mib_accumulate_locked(priv);
++	again = priv->gem_mib_enabled;
++	mutex_unlock(&priv->gem_mib_lock);
++
++	if (again)
++		schedule_delayed_work(&priv->gem_mib_work,
++				      msecs_to_jiffies(GPON_MIB_POLL_MS));
++}
++
++static void gpon_mib_init(struct xpon_priv *priv)
++{
++	unsigned int i;
++
++	mutex_init(&priv->gem_mib_lock);
++	INIT_DELAYED_WORK(&priv->gem_mib_work, gpon_mib_work_fn);
++	bitmap_zero(priv->hw_gems, GPON_MAX_GEM_ID);
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++)
++		priv->gem_mib[i].gem = GPON_MAX_GEM_ID;
++}
++
++static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
++				bool valid, bool encrypted)
++{
++	bool was;
++	int ret;
++
++	if (gem_port_id >= GPON_MAX_GEM_ID)
++		return -EINVAL;
++
++	mutex_lock(&priv->gem_mib_lock);
++	was = test_bit(gem_port_id, priv->hw_gems);
++	/* Fold the counts in while the rows still match the old GEM set. */
++	if (was != valid && priv->gem_mib_enabled)
++		gpon_mib_accumulate_locked(priv);
++	ret = gpon_write_gem_port_hw(priv, gem_port_id, valid, encrypted);
++	if (!ret && was != valid) {
++		__assign_bit(gem_port_id, priv->hw_gems, valid);
++		gpon_mib_slot_update_locked(priv, gem_port_id, valid);
++		if (priv->gem_mib_enabled)
++			gpon_mib_rebuild_locked(priv);
++	}
++	mutex_unlock(&priv->gem_mib_lock);
++
++	return ret;
++}
++
+ static int gpon_set_alloc_id_hw(struct xpon_priv *priv, u16 alloc_id,
+ 				bool allocate)
+ {
+@@ -1698,9 +1898,98 @@
+ }
+ static DEVICE_ATTR_RO(gpon_gem_delin);
+ 
++static ssize_t gpon_gem_mib_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++	unsigned int i;
++	bool eth;
++	int len;
++
++	if (!priv)
++		return -ENODEV;
++
++	mutex_lock(&priv->gem_mib_lock);
++	if (!priv->gem_mib_enabled) {
++		mutex_unlock(&priv->gem_mib_lock);
++		return sysfs_emit(buf, "enabled=0\n");
++	}
++	gpon_mib_accumulate_locked(priv);
++	eth = priv->gem_mib_ready &&
++	      (gpon_read(priv, GPON_FLEX_ONU_CAP) & FLEX_ONU_CAP_CNT_ETH);
++	len = sysfs_emit(buf, "enabled=1 ready=%u epoch=%u type=%s\n",
++			 priv->gem_mib_ready, priv->gem_mib_epoch,
++			 eth ? "ethernet" : "gem");
++	for (i = 0; i < GPON_GEM_MIB_SLOTS; i++) {
++		const struct gpon_gem_mib *m = &priv->gem_mib[i];
++
++		if (m->gem >= GPON_MAX_GEM_ID)
++			continue;
++		len += sysfs_emit_at(buf, len,
++				     "gem=%u rx_frames=%llu rx_bytes=%llu tx_frames=%llu tx_bytes=%llu\n",
++				     m->gem, m->total[GPON_MIB_RX_FRAMES],
++				     m->total[GPON_MIB_RX_BYTES],
++				     m->total[GPON_MIB_TX_FRAMES],
++				     m->total[GPON_MIB_TX_BYTES]);
++	}
++	mutex_unlock(&priv->gem_mib_lock);
++
++	return len;
++}
++static DEVICE_ATTR_RO(gpon_gem_mib);
++
++static ssize_t gpon_gem_mib_enable_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++
++	if (!priv)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(priv->gem_mib_enabled));
++}
++
++static ssize_t gpon_gem_mib_enable_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t count)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++	bool enable;
++	int ret;
++
++	if (!priv)
++		return -ENODEV;
++
++	ret = kstrtobool(buf, &enable);
++	if (ret)
++		return ret;
++
++	mutex_lock(&priv->gem_mib_lock);
++	if (enable && !priv->gem_mib_enabled) {
++		priv->gem_mib_enabled = true;
++		if (!bitmap_empty(priv->hw_gems, GPON_MAX_GEM_ID))
++			gpon_mib_rebuild_locked(priv);
++		schedule_delayed_work(&priv->gem_mib_work,
++				      msecs_to_jiffies(GPON_MIB_POLL_MS));
++	} else if (!enable) {
++		priv->gem_mib_enabled = false;
++		priv->gem_mib_ready = false;
++	}
++	mutex_unlock(&priv->gem_mib_lock);
++
++	if (!enable)
++		cancel_delayed_work_sync(&priv->gem_mib_work);
++
++	return count;
++}
++static DEVICE_ATTR_RW(gpon_gem_mib_enable);
++
+ static struct attribute *gpon_bip_attrs[] = {
+ 	&dev_attr_gpon_bip.attr,
+ 	&dev_attr_gpon_gem_delin.attr,
++	&dev_attr_gpon_gem_mib.attr,
++	&dev_attr_gpon_gem_mib_enable.attr,
+ 	NULL
+ };
+ 
+@@ -4476,6 +4765,7 @@
+ 	priv->mode = AIROHA_XPON_MODE_GPON;
+ 	INIT_DELAYED_WORK(&priv->phy_link_work,
+ 			  airoha_xpon_phy_link_work_fn);
++	gpon_mib_init(priv);
+ 
+ 	dev_info(dev, "xPON initial mode: %s\n",
+ 		 airoha_xpon_mode_name(priv->mode));
+@@ -4711,6 +5001,11 @@
+ 	dev_info(priv->dev, "removing xPON mode %s\n",
+ 		 airoha_xpon_mode_name(priv->mode));
+ 
++	mutex_lock(&priv->gem_mib_lock);
++	priv->gem_mib_enabled = false;
++	mutex_unlock(&priv->gem_mib_lock);
++	cancel_delayed_work_sync(&priv->gem_mib_work);
++
+ 	if (airoha_xpon_is_gpon(priv))
+ 		cancel_delayed_work_sync(&priv->restart_work);
+ 

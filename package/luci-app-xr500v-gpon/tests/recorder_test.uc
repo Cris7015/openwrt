@@ -63,6 +63,32 @@ eq('recorder_replay_basic_m1', r.out?.m1_len, 360);
 eq('recorder_replay_basic_m5', r.out?.m5_len, 72);
 eq('recorder_replay_basic_health', r.out?.health, 'ok');
 eq('recorder_replay_basic_bip_total', r.out?.counters?.bip_total, 29);
+eq('recorder_replay_basic_no_gem', r.out?.gem, null);
+
+// recorder_replay_gem_mib: per-GEM totals become rates; a total that goes
+// backwards (new session) gives no rate, and "enabled=0" lists no port.
+function gemmib(rx, tx) {
+	return `enabled=1 ready=1 epoch=2 type=gem\n` +
+		`gem=257 rx_frames=10 rx_bytes=${rx} tx_frames=5 tx_bytes=${tx}\n` +
+		`gem=4095 rx_frames=0 rx_bytes=0 tx_frames=0 tx_bytes=0\n`;
+}
+r = replay('gem', { samples: [
+	sample(T0, { gem_mib: gemmib(1000, 500) }),
+	sample(T0 + 60, { gem_mib: gemmib(751000, 15500) })
+] });
+eq('recorder_replay_gem_ports', length(r.out?.gem?.ports), 2);
+eq('recorder_replay_gem_id', r.out?.gem?.ports?.[0]?.id, 257);
+eq('recorder_replay_gem_rx_bytes', r.out?.gem?.ports?.[0]?.rx_bytes, 751000);
+eq('recorder_replay_gem_rx_bps', r.out?.gem?.ports?.[0]?.rx_bps, 100000);
+eq('recorder_replay_gem_tx_bps', r.out?.gem?.ports?.[0]?.tx_bps, 2000);
+r = replay('gem_reset', { samples: [
+	sample(T0, { gem_mib: gemmib(751000, 15500) }),
+	sample(T0 + 60, { gem_mib: gemmib(1000, 500) })
+] });
+eq('recorder_replay_gem_reset_no_rate', r.out?.gem?.ports?.[0]?.rx_bps, null);
+r = replay('gem_off', { samples: [ sample(T0, { gem_mib: 'enabled=0\n' }) ] });
+eq('recorder_replay_gem_off_enabled', r.out?.gem?.enabled, false);
+eq('recorder_replay_gem_off_ports', length(r.out?.gem?.ports), 0);
 
 // recorder_replay_deactivate: a Deactivate in the kernel log at the end.
 samples = [];
