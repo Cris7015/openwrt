@@ -155,6 +155,16 @@ return baseclass.extend({
 		case 'rx_high':    return _('Received power above the overload warning');
 		case 'temp_warn':  return _('Laser temperature above the warning threshold');
 		case 'resync':     return _('Grant FIFO resync');
+		case 'o6':         return _('Signal lost for an instant (O6); waiting up to 100 ms for the OLT');
+		case 'phy_shift':
+			return (ev.diff != null)
+				? _('Back in O5 without new ranging; the PHY delay moved %d units of 3.2 ns').replace('%d', ev.diff)
+				: _('Back in O5 without new ranging');
+		case 'eqd_adjust':
+			return (ev.delta != null)
+				? _('The OLT adjusted the equalization delay by %d bits').replace('%d', ev.delta)
+				: _('The OLT adjusted the equalization delay');
+		case 'to2':        return _('No Popup within 100 ms (TO2); the GPON link restarted');
 		case 'bip_burst':
 			return (ev.n != null) ? _('%d BIP errors in one minute').replace('%d', ev.n) : _('BIP error burst');
 		case 'bosa_alarm':

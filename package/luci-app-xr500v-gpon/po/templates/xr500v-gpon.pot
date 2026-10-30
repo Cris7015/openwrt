@@ -678,3 +678,27 @@ msgstr ""
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "Measuring…"
 msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Signal lost for an instant (O6); waiting up to 100 ms for the OLT"
+msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Back in O5 without new ranging; the PHY delay moved %d units of 3.2 ns"
+msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Back in O5 without new ranging"
+msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "The OLT adjusted the equalization delay by %d bits"
+msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "The OLT adjusted the equalization delay"
+msgstr ""
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "No Popup within 100 ms (TO2); the GPON link restarted"
+msgstr ""

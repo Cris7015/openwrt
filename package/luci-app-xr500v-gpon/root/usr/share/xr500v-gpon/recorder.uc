@@ -206,7 +206,7 @@ function open_window(t) {
 
 function add_event(t, ev) {
 	let e = { t, type: ev.type, severity: ev.severity, msg: ev.msg };
-	for (let k in [ 'n', 'flags' ])	/* the browser words the event with these */
+	for (let k in [ 'n', 'flags', 'delay', 'diff', 'delta' ])	/* the browser words the event with these */
 		if (ev[k] != null)
 			e[k] = ev[k];
 	ring_push(st.events, e, cfg.events_max);
@@ -290,6 +290,26 @@ function on_klog(line, t) {
 		st.o5_up = up;
 		st.o5_t = t;
 		st.ever_o5 = true;
+	} else if (index(line, 'PHY psync-to-SOF delay') >= 0) {
+		// O6, or O5 again within a session (no new ranging): the PHY
+		// relocked and the upstream timing may have moved by `diff` units
+		// of 3.2 ns. The first O5 of a session has no diff and is normal.
+		let m = match(line, /GPON (O[56]): PHY psync-to-SOF delay ([0-9]+)(, (-?[0-9]+) from)?/);
+		if (m && m[1] == 'O6')
+			add_event(wall(up, t), { type: 'o6', severity: 'warn', delay: +m[2],
+				diff: (m[4] != null) ? +m[4] : null,
+				msg: 'Signal lost for an instant (O6)' });
+		else if (m && m[4] != null)
+			add_event(wall(up, t), { type: 'phy_shift', severity: (+m[4] == 0) ? 'info' : 'warn',
+				delay: +m[2], diff: +m[4],
+				msg: `Back in O5 without new ranging; PHY delay moved ${m[4]} units` });
+	} else if (index(line, 'O5 EqD adjustment') >= 0) {
+		let m = match(line, /delta=(-?[0-9]+)/);
+		add_event(wall(up, t), { type: 'eqd_adjust', severity: 'info', delta: m ? +m[1] : null,
+			msg: 'The OLT adjusted the equalization delay' });
+	} else if (index(line, 'GPON TO2 expired in O6') >= 0) {
+		add_event(wall(up, t), { type: 'to2', severity: 'warn',
+			msg: 'No Popup within 100 ms (TO2); GPON restarting' });
 	}
 }
 

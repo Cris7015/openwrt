@@ -677,3 +677,27 @@ msgstr "Filas: umbral de decisión. Columnas: fase de muestreo. Verde: sin difer
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "Measuring…"
 msgstr "Midiendo…"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Signal lost for an instant (O6); waiting up to 100 ms for the OLT"
+msgstr "La señal se cortó un instante (O6); se espera hasta 100 ms a la OLT"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Back in O5 without new ranging; the PHY delay moved %d units of 3.2 ns"
+msgstr "De vuelta en O5 sin nuevo ranging; el retardo del PHY se movió %d unidades de 3,2 ns"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Back in O5 without new ranging"
+msgstr "De vuelta en O5 sin nuevo ranging"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "The OLT adjusted the equalization delay by %d bits"
+msgstr "La OLT ajustó el retardo de ecualización en %d bits"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "The OLT adjusted the equalization delay"
+msgstr "La OLT ajustó el retardo de ecualización"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "No Popup within 100 ms (TO2); the GPON link restarted"
+msgstr "No llegó un Popup en 100 ms (TO2); el enlace GPON se reinició"

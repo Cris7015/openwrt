@@ -100,6 +100,27 @@ eq('recorder_replay_deactivate_events', length(filter(types(r.out?.events), (t) 
 eq('recorder_replay_deactivate_counter', r.out?.counters?.deactivate, 1);
 eq('recorder_replay_deactivate_health', r.out?.health, 'crit');
 
+// recorder_replay_relock_events: an O6, the return to O5 with the PHY delay
+// moved, an EqD adjustment and a TO2 expiry become events with their numbers;
+// the first O5 delay of a session (no diff) does not.
+const XM = 'airoha-xpon 1fb60000.xmac: ';
+samples = [];
+for (let i = 0; i < 6; i++)
+	push(samples, sample(T0 + 60 * i));
+r = replay('relock', { boot: T0 + 240, samples, klog: [
+	{ t: T0 + 250, line: `[   10.000000] ${XM}GPON O5: PHY psync-to-SOF delay 39193` },
+	{ t: T0 + 260, line: `[   20.000000] ${XM}GPON O6: PHY psync-to-SOF delay 39190, -3 from the O5 entry of this session` },
+	{ t: T0 + 260, line: `[   20.050000] ${XM}GPON O5: PHY psync-to-SOF delay 39199, 6 from the O5 entry of this session` },
+	{ t: T0 + 270, line: `[   30.000000] ${XM}GPON O5 EqD adjustment: current=266532 new=266550 delta=18` },
+	{ t: T0 + 280, line: `[   40.000000] ${XM}GPON TO2 expired in O6, resetting` }
+] });
+let relock = filter(r.out?.events || [], (e) => index([ 'o6', 'phy_shift', 'eqd_adjust', 'to2' ], e.type) >= 0);
+eq('recorder_replay_relock_types', join(',', types(relock)), 'o6,phy_shift,eqd_adjust,to2');
+eq('recorder_replay_relock_o6_diff', relock[0]?.diff, -3);
+eq('recorder_replay_relock_shift', relock[1]?.diff, 6);
+eq('recorder_replay_relock_shift_severity', relock[1]?.severity, 'warn');
+eq('recorder_replay_relock_eqd', relock[2]?.delta, 18);
+
 // recorder_replay_skips_invalid_clock: first sample before NTP sync.
 samples = [ sample(1000, { status: status({ state: 1 }) }) ];
 for (let i = 1; i < 5; i++)
