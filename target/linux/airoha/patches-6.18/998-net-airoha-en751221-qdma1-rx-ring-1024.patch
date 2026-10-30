@@ -1,0 +1,33 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: en751221: 1024 descriptors on QDMA1 RX ring 0
+
+Every downstream frame the CPU forwards (WiFi through WHNAT, routed LAN)
+arrives on QDMA_WAN RX ring 0. When forwarding saturates the CPU the
+vendor 512 entries fill: under a CPU-bound load RX_HWI == RX_CPUI was
+sampled in nearly every loaded second, and GDM2 dropped frames
+(GDMA2_RX_ETHDROPCNT = pon0 rx_dropped) only in those seconds. A WiFi
+speed test drops 1000-1600 frames per second at its ~650 Mbit/s peaks and
+TCP saws down to ~200 Mbit/s. HW-forwarded traffic at 800 Mbit/s never
+touches the ring and drops nothing. ~650 Mbit/s with a 20 ms RTT needs
+~1080 packets of buffer.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -5548,7 +5548,14 @@
+ 		cfg->num_channels = 8;
+ 	} else if (soc->version == econet_en751221 && id == 1) {
+ 		/* Vendor QDMA_WAN profile. */
+-		cfg->num_rx_descs[0] = 512;
++		/*
++		 * lab: every downstream frame the CPU forwards (WiFi, routed
++		 * LAN) arrives on RX ring 0. When forwarding saturates the CPU,
++		 * the vendor's 512 entries fill and GDM2 drops the frames
++		 * (GDMA2_RX_ETHDROPCNT, pon0 rx_dropped): ~650 Mbit/s with a
++		 * 20 ms RTT needs ~1080 packets of buffer, so TCP saws down.
++		 */
++		cfg->num_rx_descs[0] = 1024;
+ 		cfg->num_rx_descs[1] = 256;
+ 		cfg->num_tx_descs[0] = 1024;
+ 		cfg->num_tx_descs[1] = 128;
