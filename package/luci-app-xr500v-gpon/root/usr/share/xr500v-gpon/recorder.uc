@@ -20,7 +20,7 @@ import { cursor } from 'uci';
 import {
 	normalize_status, parse_bip, thresholds, evaluate, detect, aggregate, ring_push
 } from 'lib';
-import { eye_scan } from 'eye';
+import { eye_scan, eye_metrics } from 'eye';
 
 const CLOCK_MIN = 1704067200;	// 2024-01-01: older means the clock is not synced yet
 const XMAC = '/sys/bus/platform/drivers/airoha-xpon/1fb60000.xmac';
@@ -40,7 +40,9 @@ const WIN_MAX_SPAN = 7200;	// close events share one window, up to 2 h
 const WIN_KEEP = 20;
 const WINDOWS_FILE = STATE_DIR + '/windows.json.gz';
 
-let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_day: 100, windows_per_day: 10 };
+let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_day: 100, windows_per_day: 10,
+	eye_minutes: 60 };
+const EYE_CAP = 1080;	// eye margin history: 45 days at one scan an hour
 let th = thresholds(null);
 let sink = null;	// daemon only: event -> overlay
 
@@ -55,7 +57,9 @@ let st = {
 	windows: [], win_pending: null, win_dirty: false,
 	skipped: 0,
 	// latest gpon_gem_mib reading; rates against the previous one
-	gem: null
+	gem: null,
+	// eye margin per scan (eye_metrics), oldest first
+	eye: []
 };
 
 let klog_path = KLOG_FILE;
@@ -384,7 +388,7 @@ function events_list(limit) {
 function save_snapshot(path) {
 	return write_gz(path, {
 		version: 1, saved: time(), boot_id: boot_id_of(),
-		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30
+		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30, eye: st.eye
 	});
 }
 
@@ -397,7 +401,7 @@ function load_snapshot(path) {
 		warn(`xr500v-gpon: ignoring unreadable snapshot ${path}\n`);
 		return false;
 	}
-	for (let k in [ 'm1', 'm5', 'm30', 'p5', 'p30' ])
+	for (let k in [ 'm1', 'm5', 'm30', 'p5', 'p30', 'eye' ])
 		if (type(data[k]) == 'array')
 			st[k] = data[k];
 	st.snap_boot = data.boot_id;
@@ -495,7 +499,19 @@ function load_config() {
 		if (n > 0)
 			cfg[k] = n;
 	}
+	// 0 turns the periodic eye scan off
+	let e = num(m.eye_minutes);
+	if (e != null && e >= 0)
+		cfg.eye_minutes = int(e);
 	th = thresholds(uci.get_all('xr500v-gpon', 'thresholds'));
+}
+
+// One eye scan (lab module), kept in the margin history whether it worked
+// or not, so failures show up too.
+function eye_measure() {
+	let r = eye_scan();
+	ring_push(st.eye, eye_metrics(r, time()), EYE_CAP);
+	return r;
 }
 
 // Deactivates and the last O5 since boot, from one dmesg read at start.
@@ -648,14 +664,15 @@ function daemon() {
 		events: { args: { ...sid, limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
 		around: { args: { ...sid, t: 0 }, call: (req) => around(req.args.t) },
 		persist: { args: sid, call: () => ({ ok: persist(true) }) },	/* stop_service */
-		eye_scan: { args: sid, call: () => eye_scan() },	/* lab: needs xr500v_eye.ko */
+		eye_scan: { args: sid, call: () => eye_measure() },	/* lab: needs xr500v_eye.ko */
+		eye_history: { args: sid, call: () => ({ interval: cfg.eye_minutes, points: st.eye }) },
 		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});
 	let tick = () => {
 		read_klog(time());
 		ingest(collect(bus));
 	};
-	let sampler, saver;
+	let sampler, saver, eye;
 	sampler = uloop.timer(cfg.interval * 1000, () => {
 		tick();
 		sampler.set(cfg.interval * 1000);
@@ -663,6 +680,14 @@ function daemon() {
 	saver = uloop.timer(cfg.persist_hours * 3600000, () => {
 		persist();
 		saver.set(cfg.persist_hours * 3600000);
+	});
+	// Eye margin, first 5 min after start; only in O5 (no light, no eye).
+	// With eye_minutes 0 it checks back every 5 min in case a reload turns
+	// it on.
+	eye = uloop.timer(300000, () => {
+		if (cfg.eye_minutes > 0 && st.last?.state == 5)
+			eye_measure();
+		eye.set((cfg.eye_minutes > 0 ? cfg.eye_minutes : 5) * 60000);
 	});
 	tick();
 	uloop.run();

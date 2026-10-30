@@ -170,7 +170,7 @@ define Device/tplink_archer-xr500v-v1
     kmod-wireguard wireguard-tools luci-proto-wireguard \
     kmod-usb-storage kmod-fs-vfat kmod-fs-exfat kmod-fs-ext4 \
     kmod-nls-cp437 kmod-nls-iso8859-1 kmod-nls-utf8 block-mount \
-    kmod-usb-net-rndis kmod-usb-net-cdc-ncm
+    kmod-usb-net-rndis kmod-usb-net-cdc-ncm kmod-xr500v-eye
 endef
 TARGET_DEVICES += tplink_archer-xr500v-v1
 

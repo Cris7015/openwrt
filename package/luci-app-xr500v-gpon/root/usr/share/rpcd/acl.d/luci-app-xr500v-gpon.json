@@ -3,7 +3,7 @@
 		"description": "Grant access to the GPON fiber health panel",
 		"read": {
 			"ubus": {
-				"xr500v.gpon": [ "summary", "history", "events", "around" ]
+				"xr500v.gpon": [ "summary", "history", "events", "around", "eye_history" ]
 			},
 			"uci": [ "xr500v-gpon" ]
 		},

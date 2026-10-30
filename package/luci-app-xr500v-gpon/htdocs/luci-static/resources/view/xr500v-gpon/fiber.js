@@ -39,6 +39,11 @@ var callEyeScan = rpc.declare({
 	method: 'eye_scan'
 });
 
+var callEyeHistory = rpc.declare({
+	object: 'xr500v.gpon',
+	method: 'eye_history'
+});
+
 var EYE_ERRORS = {
 	no_module: _('The lab module xr500v_eye.ko is not installed.'),
 	not_aligned: _('The eye sampler did not realign. Try again.'),
@@ -495,9 +500,73 @@ return view.extend({
 
 		return callEyeScan().then(L.bind(function(res) {
 			dom.content(this.eye, this.renderEye(res));
+			return this.loadEyeHistory();
 		}, this)).catch(L.bind(function(err) {
 			dom.content(this.eye, E('div', { 'class': 'alert-message warning' }, [ String(err) ]));
 		}, this));
+	},
+
+	loadEyeHistory: function() {
+		return callEyeHistory().then(L.bind(function(hist) {
+			dom.content(this.eyeHist, this.renderEyeHistory(hist));
+		}, this)).catch(L.bind(function(err) {
+			dom.content(this.eyeHist, E('em', {}, [ String(err) ]));
+		}, this));
+	},
+
+	/* clean width and height (codes) of every scan, as two lines over time */
+	renderEyeHistory: function(hist) {
+		var all = (L.isObject(hist) && Array.isArray(hist.points)) ? hist.points : [],
+		    pts = all.filter(function(p) { return p.w != null; }),
+		    failed = all.length - pts.length,
+		    title = E('h3', {}, [ _('Margin over time') ]),
+		    every = (L.isObject(hist) && hist.interval > 0)
+			? _('Measured every %d minutes while the link is in O5, and on each manual scan.').format(hist.interval)
+			: _('Periodic scans are off (eye_minutes is 0); only manual scans are kept.'),
+		    descr = E('div', { 'class': 'cbi-section-descr' }, [ every,
+			failed ? ' ' + _('%d scans failed.').format(failed) : '' ]);
+
+		if (pts.length < 2)
+			return E([], [ title, descr, E('em', {}, [ _('Not enough scans yet.') ]) ]);
+
+		var W = 640, H = 150, t0 = pts[0].t, t1 = pts[pts.length - 1].t,
+		    NS = 'http://www.w3.org/2000/svg';
+		var x = function(t) { return (t1 > t0) ? (t - t0) / (t1 - t0) * W : W; },
+		    y = function(v) { return H - Math.min(128, v) / 128 * H; };
+
+		function svg(tag, attrs, text) {
+			var e = document.createElementNS(NS, tag);
+
+			for (var k in attrs)
+				e.setAttribute(k, attrs[k]);
+			if (text != null)
+				e.appendChild(document.createTextNode(text));
+			return e;
+		}
+
+		var box = svg('svg', { 'width': '100%', 'viewBox': '0 0 %d %d'.format(W, H), 'preserveAspectRatio': 'none',
+			'style': 'max-width:%dpx;height:%dpx;background:#fff;border:1px solid #ccc'.format(W, H) });
+
+		[ 32, 64, 96 ].forEach(function(v) {
+			box.appendChild(svg('line', { 'x1': 0, 'x2': W, 'y1': y(v), 'y2': y(v), 'stroke': '#ddd' }));
+			box.appendChild(svg('text', { 'x': 2, 'y': y(v) - 2, 'font-size': 10, 'fill': '#888' }, String(v)));
+		});
+		[ [ 'w', '#1f77b4' ], [ 'h', '#ff7f0e' ] ].forEach(function(s) {
+			box.appendChild(svg('polyline', { 'fill': 'none', 'stroke': s[1], 'stroke-width': 2,
+				'vector-effect': 'non-scaling-stroke',
+				'points': pts.map(function(p) { return '%.1f,%.1f'.format(x(p.t), y(p[s[0]])); }).join(' ') }));
+		});
+
+		var last = pts[pts.length - 1];
+
+		return E([], [ title, descr, box,
+			E('div', { 'style': 'margin-top:4px' }, [
+				E('span', { 'style': 'color:#1f77b4;font-weight:bold' }, [ '— ' + _('width at threshold 0') ]), '  ',
+				E('span', { 'style': 'color:#ff7f0e;font-weight:bold' }, [ '— ' + _('height at phase 0') ]), '  ',
+				_('(codes of 128; %s to %s)').format(datetime(t0), datetime(t1))
+			]),
+			E('p', {}, [ _('Last scan: width %d, height %d, %d of %d cells clean.').format(last.w, last.h, last.a, last.n) ])
+		]);
 	},
 
 	renderEvents: function(events) {
@@ -608,6 +677,8 @@ return view.extend({
 		this.events = E('div', {}, this.renderEvents(events));
 		this.alerts = E('div', {}, this.renderAlerts(summary));
 		this.eye = E('div', {}, [ E('em', {}, [ _('Not measured yet.') ]) ]);
+		this.eyeHist = E('div', {}, [ E('em', {}, [ _('Loading…') ]) ]);
+		this.loadEyeHistory();
 
 		return m.render().then(L.bind(function(mapEl) {
 			var tabs = E('div', {}, [
@@ -640,7 +711,8 @@ return view.extend({
 						]),
 						E('button', { 'class': 'cbi-button cbi-button-action',
 							'click': ui.createHandlerFn(this, 'measureEye') }, [ _('Measure the eye') ]),
-						this.eye
+						this.eye,
+						this.eyeHist
 					])
 				]),
 				E('div', { 'data-tab': 'alerts', 'data-tab-title': _('Alerts') }, [
