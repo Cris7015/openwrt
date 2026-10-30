@@ -617,3 +617,63 @@ msgstr "No hay puertos GEM configurados"
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "Counters not ready yet"
 msgstr "Los contadores todavía no están listos"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The lab module xr500v_eye.ko is not installed."
+msgstr "El módulo de laboratorio xr500v_eye.ko no está instalado."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The eye sampler did not realign. Try again."
+msgstr "El muestreador de ojo no se realineó. Probá de nuevo."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The eye sampler did not accept the command."
+msgstr "El muestreador de ojo no aceptó el comando."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The scan did not complete."
+msgstr "El barrido no terminó."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Not measured yet."
+msgstr "Todavía no se midió."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Eye"
+msgstr "Ojo"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Lab measurement of the received signal with the PHY eye sampler: each cell counts the bits where a sample at that phase and threshold disagrees with the data. The data path is not touched; the sweep takes a few seconds."
+msgstr "Medición de laboratorio de la señal recibida con el muestreador de ojo del PHY: cada celda cuenta los bits en los que una muestra con esa fase y ese umbral no coincide con el dato. No toca el camino de datos; el barrido tarda unos segundos."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Measure the eye"
+msgstr "Medir el ojo"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "No answer from the monitor."
+msgstr "El monitor no respondió."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "phase %+d, threshold %+d: %d"
+msgstr "fase %+d, umbral %+d: %d"
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes)."
+msgstr "Con umbral 0, el ojo está limpio desde la fase %+d hasta %+d (%d de 128 códigos)."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "No clean point at threshold 0."
+msgstr "No hay ningún punto limpio con umbral 0."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "At phase 0, from threshold %+d to %+d."
+msgstr "Con fase 0, desde el umbral %+d hasta %+d."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s."
+msgstr "Filas: umbral de decisión. Columnas: fase de muestreo. Verde: sin diferencias; rojo: con diferencias, más oscuro cuantas más hay. Medido el %s."
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Measuring…"
+msgstr "Midiendo…"

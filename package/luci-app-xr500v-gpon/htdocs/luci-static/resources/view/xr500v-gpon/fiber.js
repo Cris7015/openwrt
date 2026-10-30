@@ -34,6 +34,18 @@ var callAround = rpc.declare({
 	params: [ 't' ]
 });
 
+var callEyeScan = rpc.declare({
+	object: 'xr500v.gpon',
+	method: 'eye_scan'
+});
+
+var EYE_ERRORS = {
+	no_module: _('The lab module xr500v_eye.ko is not installed.'),
+	not_aligned: _('The eye sampler did not realign. Try again.'),
+	realign_failed: _('The eye sampler did not accept the command.'),
+	scan_failed: _('The scan did not complete.')
+};
+
 var EVENTS_SHOWN = 100;	/* rows in the Events tab */
 var EVENTS_KEPT = 500;	/* the recorder's whole list, for the graphs */
 
@@ -410,6 +422,69 @@ return view.extend({
 		]);
 	},
 
+	renderEye: function(res) {
+		if (!L.isObject(res))
+			return E('em', {}, [ _('No answer from the monitor.') ]);
+		if (!res.ok)
+			return E('div', { 'class': 'alert-message warning' }, [ EYE_ERRORS[res.error] || String(res.error) ]);
+
+		var step = res.step, max = res.max, cnt = {}, hs = [], vs = [], h, v;
+
+		(res.points || []).forEach(function(p) { cnt[p[0] * 128 + p[1]] = p[2]; });
+		for (h = 0; h < 128; h += step)
+			hs.push(h);
+		for (v = 128 - step; v >= 0; v -= step)
+			vs.push(v);
+
+		/* the clean span along the threshold-0 row and the phase-0 column */
+		function span(list, key) {
+			var z = list.filter(function(x) { return cnt[key(x)] === 0; });
+			return z.length ? [ z[0] - 64, z[z.length - 1] - 64 ] : null;
+		}
+		var hOpen = span(hs, function(x) { return x * 128 + 64; }),
+		    vOpen = span(vs.slice().reverse(), function(x) { return 64 * 128 + x; }),
+		    LABEL = 'padding:0 4px 0 0;font-size:10px;line-height:8px;text-align:right;white-space:nowrap;overflow:visible',
+		    CELL = 'width:8px;height:8px;padding:0;border:0';
+
+		var rows = vs.map(function(v) {
+			return E('tr', {}, [ E('td', { 'style': LABEL }, [ ((v - 64) % 16 == 0) ? '%+d'.format(v - 64) : '' ]) ]
+				.concat(hs.map(function(h) {
+					var c = cnt[h * 128 + v];
+					var bg = (c == null) ? 'transparent' : (c == 0) ? 'rgba(76,175,80,.55)'
+						: 'rgba(244,67,54,%.2f)'.format(0.15 + 0.85 * Math.min(1, c / max));
+
+					return E('td', { 'style': CELL + ';background:' + bg,
+						'title': (c != null) ? _('phase %+d, threshold %+d: %d').format(h - 64, v - 64, c) : '' });
+				})));
+		});
+		var axis = E('tr', {}, [ E('td') ].concat(hs.map(function(h) {
+			return E('td', { 'style': 'padding:0;font-size:10px;white-space:nowrap;overflow:visible' },
+				[ ((h - 64) % 32 == 0) ? '%+d'.format(h - 64) : '' ]);
+		})));
+
+		return E([], [
+			E('p', {}, [
+				hOpen ? _('At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes).').format(hOpen[0], hOpen[1], hOpen[1] - hOpen[0] + step) : _('No clean point at threshold 0.'),
+				' ',
+				vOpen ? _('At phase 0, from threshold %+d to %+d.').format(vOpen[0], vOpen[1]) : ''
+			]),
+			E('table', { 'style': 'border-collapse:collapse;margin:8px 0' }, rows.concat([ axis ])),
+			E('div', { 'class': 'cbi-section-descr' }, [
+				_('Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s.').format(datetime(res.t))
+			])
+		]);
+	},
+
+	measureEye: function(ev) {
+		dom.content(this.eye, [ E('em', { 'class': 'spinning' }, [ _('Measuring…') ]) ]);
+
+		return callEyeScan().then(L.bind(function(res) {
+			dom.content(this.eye, this.renderEye(res));
+		}, this)).catch(L.bind(function(err) {
+			dom.content(this.eye, E('div', { 'class': 'alert-message warning' }, [ String(err) ]));
+		}, this));
+	},
+
 	renderEvents: function(events) {
 		return table([ _('Time'), _('Severity'), _('Event'), '' ], (events || []).slice(0, EVENTS_SHOWN).map(L.bind(function(e) {
 			return [ datetime(e.t), tag(e.severity), analysis.eventText(e),
@@ -517,6 +592,7 @@ return view.extend({
 		this.counters = E('div', {}, this.renderCounters(summary));
 		this.events = E('div', {}, this.renderEvents(events));
 		this.alerts = E('div', {}, this.renderAlerts(summary));
+		this.eye = E('div', {}, [ E('em', {}, [ _('Not measured yet.') ]) ]);
 
 		return m.render().then(L.bind(function(mapEl) {
 			var tabs = E('div', {}, [
@@ -541,6 +617,16 @@ return view.extend({
 				]),
 				E('div', { 'data-tab': 'events', 'data-tab-title': _('Events') }, [
 					E('div', { 'class': 'cbi-section' }, this.events)
+				]),
+				E('div', { 'data-tab': 'eye', 'data-tab-title': _('Eye') }, [
+					E('div', { 'class': 'cbi-section' }, [
+						E('div', { 'class': 'cbi-section-descr' }, [
+							_('Lab measurement of the received signal with the PHY eye sampler: each cell counts the bits where a sample at that phase and threshold disagrees with the data. The data path is not touched; the sweep takes a few seconds.')
+						]),
+						E('button', { 'class': 'cbi-button cbi-button-action',
+							'click': ui.createHandlerFn(this, 'measureEye') }, [ _('Measure the eye') ]),
+						this.eye
+					])
 				]),
 				E('div', { 'data-tab': 'alerts', 'data-tab-title': _('Alerts') }, [
 					E('div', { 'class': 'cbi-section' }, [ E('h3', {}, [ _('Active alerts') ]), this.alerts ]),

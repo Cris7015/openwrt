@@ -8,6 +8,9 @@
 			"uci": [ "xr500v-gpon" ]
 		},
 		"write": {
+			"ubus": {
+				"xr500v.gpon": [ "eye_scan" ]
+			},
 			"uci": [ "xr500v-gpon" ]
 		}
 	}

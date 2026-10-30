@@ -618,3 +618,63 @@ msgstr ""
 #: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
 msgid "Counters not ready yet"
 msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The lab module xr500v_eye.ko is not installed."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The eye sampler did not realign. Try again."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The eye sampler did not accept the command."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "The scan did not complete."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Not measured yet."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Eye"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Lab measurement of the received signal with the PHY eye sampler: each cell counts the bits where a sample at that phase and threshold disagrees with the data. The data path is not touched; the sweep takes a few seconds."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Measure the eye"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "No answer from the monitor."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "phase %+d, threshold %+d: %d"
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "At threshold 0 the eye is clean from phase %+d to %+d (%d of 128 codes)."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "No clean point at threshold 0."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "At phase 0, from threshold %+d to %+d."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Rows: decision threshold. Columns: sampling phase. Green: no disagreement; red: disagreements, darker for more. Measured %s."
+msgstr ""
+
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+msgid "Measuring…"
+msgstr ""

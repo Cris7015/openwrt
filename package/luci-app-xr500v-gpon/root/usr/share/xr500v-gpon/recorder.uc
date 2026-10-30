@@ -20,6 +20,7 @@ import { cursor } from 'uci';
 import {
 	normalize_status, parse_bip, thresholds, evaluate, detect, aggregate, ring_push
 } from 'lib';
+import { eye_scan } from 'eye';
 
 const CLOCK_MIN = 1704067200;	// 2024-01-01: older means the clock is not synced yet
 const XMAC = '/sys/bus/platform/drivers/airoha-xpon/1fb60000.xmac';
@@ -647,6 +648,7 @@ function daemon() {
 		events: { args: { ...sid, limit: 0 }, call: (req) => ({ events: events_list(req.args.limit) }) },
 		around: { args: { ...sid, t: 0 }, call: (req) => around(req.args.t) },
 		persist: { args: sid, call: () => ({ ok: persist(true) }) },	/* stop_service */
+		eye_scan: { args: sid, call: () => eye_scan() },	/* lab: needs xr500v_eye.ko */
 		reload: { args: sid, call: () => { load_config(); return { ok: true }; } }
 	});
 	let tick = () => {
