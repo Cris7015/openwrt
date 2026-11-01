@@ -1,0 +1,65 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: xpon: start the GEM MIB poll only after a successful probe
+
+gpon_mib_init() queued gem_mib_work (60 s) at the start of
+airoha_xpon_probe(). On the XR500v the first probe defers at ~3 s;
+devres then frees priv, which is devm memory, while the delayed work
+is still pending, and its timer fires on the freed priv ~63 s later.
+
+Depending on who had reused that kmalloc-8k object, the work ran on
+stale data and re-armed itself every 60 s, the timer wheel tripped over
+a zeroed timer (WARNING at kernel/time/timer.c:1786, seen at 66.5 s on
+two boots) or the CPU jumped to garbage and the router panicked (two
+boots in a row of a test image). CONFIG_DEBUG_OBJECTS_FREE reported it
+as "free active object type: timer_list hint: gpon_mib_work_fn" from
+devres_release_all() in the failed probe.
+
+Queue the work only once the probe has succeeded, and cancel it on the
+error path so that nothing stays queued on priv. Fixes the per-GEM MIB
+patches (994, 996).
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index b6ea6d2..260ab52 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1232,7 +1232,20 @@ static void gpon_mib_init(struct xpon_priv *priv)
+ 		priv->gem_mib[i].gem = GPON_MAX_GEM_ID;
+ 	/* The table is built when the first GEM ports come up. */
+ 	priv->gem_mib_enabled = gem_mib;
+-	if (gem_mib)
++}
++
++/*
++ * Start polling only once the probe has succeeded: priv is devm memory, and
++ * a probe that fails or defers frees it while a work queued here would
++ * still be pending. That is what happened on every boot since the MIB went
++ * on by default: the first probe defers at ~3 s, its 60 s work fired on the
++ * freed priv at ~66 s, and depending on who had reused the memory it ran
++ * on stale data, hit a zeroed timer (WARN in expire_timers) or jumped to
++ * garbage and panicked.
++ */
++static void gpon_mib_start(struct xpon_priv *priv)
++{
++	if (priv->gem_mib_enabled)
+ 		schedule_delayed_work(&priv->gem_mib_work,
+ 				      msecs_to_jiffies(GPON_MIB_POLL_MS));
+ }
+@@ -5058,6 +5071,7 @@ static int airoha_xpon_probe(struct platform_device *pdev)
+ 	else
+ 		dev_info(dev, "EPON probe complete: datapath=%s irq=%d\n",
+ 			 priv->gdm_dev->name, priv->irq);
++	gpon_mib_start(priv);
+ 	return 0;
+ 
+ err_unregister_xpon:
+@@ -5077,6 +5091,8 @@ err_cleanup_mode:
+ 	else
+ 		airoha_xpon_cleanup_epon(priv);
+ err_put_gdm:
++	/* Nothing may stay queued on priv: devres frees it after this. */
++	cancel_delayed_work_sync(&priv->gem_mib_work);
+ 	if (priv->gdm_dev) {
+ 		dev_put(priv->gdm_dev);
+ 		priv->gdm_dev = NULL;
