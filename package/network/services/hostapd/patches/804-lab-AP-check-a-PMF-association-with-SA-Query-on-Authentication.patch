@@ -1,0 +1,128 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] lab: AP: check a PMF association with SA Query on Authentication
+
+With PMF, handle_auth() keeps the station entry of an associated STA, so
+that an unprotected Authentication frame cannot tear down a protected
+association, and the old association is only checked by the SA Query
+that a later (Re)Association Request starts.
+
+A STA that lost its association without the AP seeing the
+Deauthentication (out of range, the frame lost) may never get that far.
+On the XR500v (mt76x2e), with a 250 Mbit/s UDP flow to such a STA, the
+kept entry held the hardware queue full of retries to a peer without
+the BA session (480/512 descriptors, 87 % of the channel busy for ~40
+frames/s), the Authentication responses left 0.2-1 s late, the STA gave
+up after its 100 ms timeouts and could not reconnect for minutes, until
+the flow stopped. Removing the entry by hand (del_client) let it back in
+within 2 s while the flow was still running.
+
+Start the SA Query when such an Authentication frame arrives. If it
+times out, the peer no longer has the PTK: re-add the driver entry, as
+handle_auth() does without PMF, which drops the frames queued for the
+old association. A STA that still has the PTK answers the protected SA
+Query and keeps its association, as with the (Re)Association check.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 2ce4940..62e22cc 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4708,6 +4708,29 @@ static void handle_auth(struct hostapd_data *hapd,
+ 		}
+ 	}
+ 
++	/*
++	 * lab: with PMF the entry above is kept, and the old association is
++	 * only checked by the SA Query of a later (Re)Association Request.
++	 * A STA that lost its association without the AP seeing the
++	 * Deauthentication (out of range, frame lost) then cannot get that
++	 * far while a downstream flow keeps the old entry's hardware queue
++	 * full of retries: the Authentication responses leave hundreds of
++	 * milliseconds late and the STA gives up. Check the old association
++	 * now; ap_sa_query_timer() drops it if the SA Query times out, and a
++	 * STA that still has the PTK answers it and keeps its association.
++	 */
++	if (FULL_AP_CLIENT_STATE_SUPP(hapd->iface->drv_flags) &&
++	    (sta->flags & WLAN_STA_MFP) && ap_sta_is_authorized(sta) &&
++	    !(hapd->conf->mesh & MESH_ENABLED) &&
++	    !(sta->added_unassoc) && auth_alg != WLAN_AUTH_PASN &&
++	    auth_alg != WLAN_AUTH_FT && sta->sa_query_count == 0) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_DEBUG,
++			       "Authentication from a PMF-associated STA; checking the old association with SA Query");
++		sta->sa_query_from_auth = true;
++		ap_sta_start_sa_query(hapd, sta);
++	}
++
+ 	switch (auth_alg) {
+ 	case WLAN_AUTH_OPEN:
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index faf4ec3..3c769c8 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1640,6 +1640,7 @@ int ap_check_sa_query_timeout(struct hostapd_data *hapd, struct sta_info *sta)
+ 		os_free(sta->sa_query_trans_id);
+ 		sta->sa_query_trans_id = NULL;
+ 		sta->sa_query_count = 0;
++		sta->sa_query_from_auth = false;
+ 		eloop_cancel_timeout(ap_sa_query_timer, hapd, sta);
+ 		return 1;
+ 	}
+@@ -1659,9 +1660,31 @@ static void ap_sa_query_timer(void *eloop_ctx, void *timeout_ctx)
+ 		   " (count=%d)",
+ 		   hapd->conf->iface, MAC2STR(sta->addr), sta->sa_query_count);
+ 
+-	if (sta->sa_query_count > 0 &&
+-	    ap_check_sa_query_timeout(hapd, sta))
+-		return;
++	if (sta->sa_query_count > 0) {
++		bool from_auth = sta->sa_query_from_auth;
++
++		if (ap_check_sa_query_timeout(hapd, sta)) {
++			/*
++			 * lab: the peer that sent Authentication while still
++			 * associated with PMF did not answer the protected SA
++			 * Query, so it no longer has the PTK and the old
++			 * association is gone. Re-add the driver entry, as
++			 * handle_auth() does without PMF: that drops the
++			 * frames still queued and retried for the old
++			 * association, which otherwise hold the hardware queue
++			 * and delay every response to the new attempt for as
++			 * long as a downstream flow keeps it full.
++			 */
++			if (from_auth) {
++				hostapd_logger(hapd, sta->addr,
++					       HOSTAPD_MODULE_IEEE80211,
++					       HOSTAPD_LEVEL_INFO,
++					       "SA Query after Authentication timed out; dropping the old association");
++				ap_sta_re_add(hapd, sta);
++			}
++			return;
++		}
++	}
+ 	if (sta->sa_query_count >= 1000)
+ 		return;
+ 
+@@ -1713,6 +1736,7 @@ void ap_sta_stop_sa_query(struct hostapd_data *hapd, struct sta_info *sta)
+ 	os_free(sta->sa_query_trans_id);
+ 	sta->sa_query_trans_id = NULL;
+ 	sta->sa_query_count = 0;
++	sta->sa_query_from_auth = false;
+ }
+ 
+ 
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 63d99f1..70a66f7 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -230,6 +230,8 @@ struct sta_info {
+ 	int sa_query_count; /* number of pending SA Query requests;
+ 			     * 0 = no SA Query in progress */
+ 	int sa_query_timed_out;
++	/* lab: the pending SA Query was started by an Authentication frame */
++	bool sa_query_from_auth;
+ 	u8 *sa_query_trans_id; /* buffer of WLAN_SA_QUERY_TR_ID_LEN *
+ 				* sa_query_count octets of pending SA Query
+ 				* transaction identifiers */
