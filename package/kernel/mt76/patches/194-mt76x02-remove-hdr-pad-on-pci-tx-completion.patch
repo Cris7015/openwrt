@@ -1,0 +1,32 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] wifi: mt76: mt76x02: remove the header pad on PCI tx completion
+
+mt76_dma_tx_queue_skb() pads the 802.11 header for MT_DRV_TX_ALIGNED4_SKBS
+drivers (mt76x2e, mt76x0e), but mt76x02_tx_complete_skb() hands the frame
+back to mac80211 with the pad still in it; the USB driver removes it.
+mac80211 can send such a frame again (filtered for a sleeping station,
+IEEE80211_TX_INTFL_RETRANSMISSION) without reserving headroom again, so the
+second pass either has no headroom for the pad (skb_under_panic, patch 100
+guards it) or carries the old pad as two bytes of payload.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+index 79af110..fe017b4 100644
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -1054,6 +1054,14 @@ void mt76x02_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e)
+ 	txwi = (struct mt76x02_txwi *)txwi_ptr;
+ 	trace_mac_txdone(mdev, txwi->wcid, txwi->pktid);
+ 
++	/* Undo the header padding of mt76_dma_tx_queue_skb(), as the USB
++	 * driver does: mac80211 may queue the frame again, for instance
++	 * after it was filtered for a sleeping station, and expects it back
++	 * as it handed it over.
++	 */
++	if (ieee80211_get_hdrlen_from_skb(e->skb) % 4)
++		mt76x02_remove_hdr_pad(e->skb, 2);
++
+ 	mt76_tx_complete_skb(mdev, e->wcid, e->skb);
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_tx_complete_skb);
