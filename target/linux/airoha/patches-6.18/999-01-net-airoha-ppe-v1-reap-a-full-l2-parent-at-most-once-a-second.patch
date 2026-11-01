@@ -1,0 +1,128 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: ppe: v1: reap a full L2 parent at most once a second
+
+When an L2 bridge parent already has AIROHA_PPE_V1_L2_MAX_SUBFLOWS
+subflows, every packet of every new connection that reaches rx_check
+walked the whole v1 flow list looking for idle subflows (one uncached
+FoE read and one REG_FE_FOE_TS read per child) and then flushed the
+whole PPE cache, under v1.lock with BH disabled, even when nothing was
+freed. On the XR500v in bridge mode this happened 4066 times in ~20 h.
+
+Reap at most once a second per parent, and flush the PPE cache only
+when the reap actually released a hardware slot. Count the reaps and
+the subflows they freed in debugfs (l2_reaps, l2_reaped).
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 7a3541c..3b0c578 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -832,6 +832,8 @@ struct airoha_flow_table_entry {
+ 	u8 v1_l2_dmac[ETH_ALEN];
+ 	u16 v1_l2_vlan;
+ 	u16 v1_children;
++	/* v1 L2 parent: jiffy of the last reap of its idle subflows. */
++	unsigned long v1_l2_reap_at;
+ 
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+@@ -1191,6 +1193,8 @@ struct airoha_ppe_v1 {
+ 	struct list_head l2_flows;
+ 	u32 l2_subflows;
+ 	u32 l2_subflow_full;
++	u32 l2_reaps;
++	u32 l2_reaped;
+ 	u32 l2_lookups;
+ 	u32 l2_misses;
+ 	struct airoha_flow_table_entry **foe_owner;
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index b9cf9e5..650fb70 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3207,6 +3207,11 @@ static void airoha_ppe_v1_bind_flow(struct airoha_ppe *ppe,
+ static unsigned long airoha_ppe_v1_flow_lastused(struct airoha_ppe *ppe,
+ 						 struct airoha_flow_table_entry *flow);
+ 
++/*
++ * In bridge mode all the traffic of the house is a single MAC pair per
++ * direction, so this caps how many of its connections the PPE carries.
++ * Do not raise it before rx_check stops walking every flow per packet.
++ */
+ #define AIROHA_PPE_V1_L2_MAX_SUBFLOWS	256
+ #define AIROHA_PPE_V1_L2_SUBFLOW_IDLE	(30 * HZ)
+ 
+@@ -3244,12 +3249,16 @@ static void airoha_foe_v1_entry_apply_output(struct airoha_foe_entry *entry,
+ 	airoha_foe_v1_l2(entry)[0] = airoha_foe_v1_l2(tmpl)[0];
+ }
+ 
+-/* Free the subflows of @parent that have been idle, or all of them. */
+-static void airoha_ppe_v1_l2_reap(struct airoha_ppe *ppe,
+-				  struct airoha_flow_table_entry *parent,
+-				  bool all)
++/*
++ * Free the subflows of @parent that have been idle, or all of them, and
++ * return how many were freed.
++ */
++static unsigned int airoha_ppe_v1_l2_reap(struct airoha_ppe *ppe,
++					  struct airoha_flow_table_entry *parent,
++					  bool all)
+ {
+ 	struct airoha_flow_table_entry *flow, *tmp;
++	unsigned int freed = 0;
+ 
+ 	lockdep_assert_held(&ppe->v1.lock);
+ 	list_for_each_entry_safe(flow, tmp, &ppe->v1.flows, v1_list) {
+@@ -3264,7 +3273,10 @@ static void airoha_ppe_v1_l2_reap(struct airoha_ppe *ppe,
+ 		list_del(&flow->v1_list);
+ 		parent->v1_children--;
+ 		kfree(flow);
++		freed++;
+ 	}
++
++	return freed;
+ }
+ 
+ static struct airoha_flow_table_entry *
+@@ -3278,8 +3290,26 @@ airoha_ppe_v1_l2_subflow(struct airoha_ppe *ppe,
+ 	__be16 dport = cpu_to_be16(tuple->dest_port);
+ 
+ 	if (parent->v1_children >= AIROHA_PPE_V1_L2_MAX_SUBFLOWS) {
+-		airoha_ppe_v1_l2_reap(ppe, parent, false);
+-		airoha_ppe_v1_cache_clean(ppe);
++		unsigned long now = jiffies;
++
++		/*
++		 * Every packet of a new connection lands here while the parent
++		 * is full. Walking all the flows and flushing the whole PPE
++		 * cache for each of them costs a lot of softirq time under
++		 * the lock, so reap at most once a second per parent and flush
++		 * the cache only when a hardware slot was actually released.
++		 */
++		if (!time_in_range(now, parent->v1_l2_reap_at,
++				   parent->v1_l2_reap_at + HZ)) {
++			unsigned int freed;
++
++			parent->v1_l2_reap_at = now;
++			freed = airoha_ppe_v1_l2_reap(ppe, parent, false);
++			ppe->v1.l2_reaps++;
++			ppe->v1.l2_reaped += freed;
++			if (freed)
++				airoha_ppe_v1_cache_clean(ppe);
++		}
+ 		if (parent->v1_children >= AIROHA_PPE_V1_L2_MAX_SUBFLOWS) {
+ 			ppe->v1.l2_subflow_full++;
+ 			return NULL;
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+index caadf17..da1a214 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -603,6 +603,8 @@ static int airoha_ppe_v1_debugfs_regs_show(struct seq_file *m, void *private)
+ 	seq_printf(m, "l2_subflows=%u\n", READ_ONCE(ppe->v1.l2_subflows));
+ 	seq_printf(m, "l2_subflow_full=%u\n",
+ 		   READ_ONCE(ppe->v1.l2_subflow_full));
++	seq_printf(m, "l2_reaps=%u\n", READ_ONCE(ppe->v1.l2_reaps));
++	seq_printf(m, "l2_reaped=%u\n", READ_ONCE(ppe->v1.l2_reaped));
+ 	seq_printf(m, "l2_lookups=%u\n", READ_ONCE(ppe->v1.l2_lookups));
+ 	seq_printf(m, "l2_misses=%u\n", READ_ONCE(ppe->v1.l2_misses));
+ 	seq_printf(m, "flows=%u\n", flows);
