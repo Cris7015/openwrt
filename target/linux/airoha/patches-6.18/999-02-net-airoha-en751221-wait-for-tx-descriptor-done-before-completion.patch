@@ -1,0 +1,164 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] net: airoha: en751221: wait for the TX descriptor before consuming its completion
+
+econet_poll_tx_complete() marked a done-list entry as consumed before it
+looked at the descriptor. If the entry ever got ahead of the descriptor
+write-back, the WARN_ON_ONCE path left the slot and its skb held for
+good, and a repeated completion of a slot already freed dereferenced a
+NULL skb.
+
+Like the RX side (989), spin briefly for DONE or DROPPED and otherwise
+leave the entry for the next poll, keeping the TX done IRQs masked; an
+entry that never gets it is consumed as before after
+ECONET_RX_DONE_POLLS polls. Skip completions of a slot without an skb.
+tx_wait_done, tx_wait_gave_up and tx_stale_skip count the three cases.
+
+While at it, read only the info word of the descriptor: copying the
+whole 32-byte descriptor cost eight uncached reads per sent frame.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -920,12 +920,69 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/* EN751221: TX completions that had to wait for DONE, give-ups, and
++ * completions of a slot that holds no frame.
++ */
++static unsigned int tx_wait_done[2], tx_wait_gave_up[2], tx_stale_skip[2];
++module_param_array(tx_wait_done, uint, NULL, 0444);
++MODULE_PARM_DESC(tx_wait_done, "EN751221 TX completions found before their descriptor DONE, per QDMA");
++module_param_array(tx_wait_gave_up, uint, NULL, 0444);
++MODULE_PARM_DESC(tx_wait_gave_up, "EN751221 TX completions consumed without DONE after waiting, per QDMA");
++module_param_array(tx_stale_skip, uint, NULL, 0444);
++MODULE_PARM_DESC(tx_stale_skip, "EN751221 TX completions of a slot without a frame, per QDMA");
++
++/*
++ * A completion used to be consumed before its descriptor was looked at: if
++ * the done list ever got ahead of the descriptor write-back, the slot and
++ * its skb were held forever. Like the RX side, spin briefly for DONE (or
++ * DROPPED) and otherwise leave the completion for the next poll; one that
++ * never gets it is consumed as before after ECONET_RX_DONE_POLLS polls.
++ * Malformed completions are reported by the caller.
++ */
++static bool econet_tx_done_ready(struct econet_tx_doneq *done_q, u32 val)
++{
++	struct airoha_qdma_mips *qdma = done_q->qdma;
++	unsigned int id = qdma->qdma->id & 1;
++	u32 qid = FIELD_GET(EN751221_QDMA_IRQ_RING_IDX_MASK, val);
++	u32 index = FIELD_GET(EN751221_QDMA_IRQ_DESC_IDX_MASK, val);
++	struct econet_q_tx *q;
++	int spin;
++
++	if (qid >= ARRAY_SIZE(qdma->q_tx))
++		return true;
++	q = &qdma->q_tx[qid];
++	if (!q->ndesc || index >= q->ndesc)
++		return true;
++
++	for (spin = 0; spin < ECONET_RX_DONE_SPIN; spin++) {
++		if (READ_ONCE(q->desc[index].info.word) &
++		    (DESC_INFO_DONE | DESC_INFO_DROPPED)) {
++			if (spin)
++				tx_wait_done[id]++;
++			done_q->wait_polls = 0;
++			return true;
++		}
++		cpu_relax();
++	}
++
++	if (++done_q->wait_polls < ECONET_RX_DONE_POLLS) {
++		if (done_q->wait_polls == 1)
++			tx_wait_done[id]++;
++		return false;
++	}
++
++	tx_wait_gave_up[id]++;
++	done_q->wait_polls = 0;
++	return true;
++}
++
+ static int econet_poll_tx_complete(struct napi_struct *napi, int budget)
+ {
+ 	struct qregs_doneq_state state;
+ 	struct econet_tx_doneq *done_q;
+ 	struct net_device *wake_dev = NULL;
+ 	struct airoha_qdma_mips *qdma;
++	bool stalled = false;
+ 	int irq_queued;
+ 	u32 done = 0, head;
+ 
+@@ -940,16 +997,20 @@
+ 	dma_rmb();
+ 
+ 	while (irq_queued > 0 && done < budget) {
+-		u32 index, qid, val = done_q->q[head];
++		u32 index, qid, info, val = done_q->q[head];
+ 		struct econet_q_tx_ent *e;
+ 		struct econet_q_tx *q;
+ 		struct netdev_queue *txq;
+ 		struct sk_buff *skb;
+-		struct desc desc;
+ 
+ 		if (val == 0xffffffffU)
+ 			break;
+ 
++		if (!econet_tx_done_ready(done_q, val)) {
++			stalled = true;
++			break;
++		}
++
+ 		done_q->q[head] = 0xffffffffU; /* mark as done */
+ 		head = (head + 1) % done_q->size;
+ 		irq_queued--;
+@@ -969,14 +1030,22 @@
+ 
+ 		guard(spinlock)(&q->lock_bh);
+ 
+-		desc = q->desc[index];
+-
+-		if (WARN_ON_ONCE(!is_desc_info_done(&desc.info) &&
+-				 !is_desc_info_dropped(&desc.info)))
++		/*
++		 * Only the DONE/DROPPED word is needed: copying the whole
++		 * descriptor cost eight uncached reads per sent frame.
++		 */
++		info = READ_ONCE(q->desc[index].info.word);
++		if (WARN_ON_ONCE(!(info & (DESC_INFO_DONE |
++					   DESC_INFO_DROPPED))))
+ 			continue;
+ 
+ 		e = &q->entry[index];
+ 		skb = e->skb;
++		if (unlikely(!skb)) {
++			/* A repeated completion of a slot already freed. */
++			tx_stale_skip[qdma->qdma->id & 1]++;
++			continue;
++		}
+ 
+ 		dma_unmap_single(qdma->qdma->eth->dev, e->dma_addr, e->dma_len,
+ 				 DMA_TO_DEVICE);
+@@ -1037,6 +1106,10 @@
+ 		econet_wreg(done & 0x7f, &qdma->regs->done_queue.pop_back);
+ 	}
+ 
++	/* Waiting for a descriptor write-back: poll again, IRQs stay masked. */
++	if (stalled)
++		return budget;
++
+ 	if (done < budget && napi_complete(napi)) {
+ 		int chain;
+ 
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -4969,6 +4969,8 @@
+ 	/* No lock, access only in NAPI */
+ 	u32 				*q;
+ 	struct qregs_doneq __iomem	*regs;
++	/* Polls spent waiting for the DONE of the head completion. */
++	int				wait_polls;
+ 
+ 	/* Not modified after init */
+ 	struct airoha_qdma_mips 		*qdma;
