@@ -1,0 +1,116 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] wifi: mt76: mt76x02: back off the watchdog when resets do not recover the radio
+
+When the MCU does not come back from a watchdog reset, mt76x2_start()
+ignores the load_cr timeout, the restart completes, MT76_RESTART is
+cleared and the next MCU command times out again, so mt76x02_wdt_work()
+resets the radio every ~2 s forever. On 24-oct-2026 the XR500v did it
+107 times until the router was rebooted; every round holds the RTNL and
+the wiphy lock for about a second, which stalls netifd, hostapd on the
+other radio and LuCI, and the radio never recovered.
+
+After 4 resets in 60 s, stop resetting for 10 minutes and then try again
+with a fresh window. A radio that can come back still does; one that
+cannot costs a few seconds of stall every ten minutes. wdt_gave_up in
+debugfs shows the back-off and re-arms the watchdog when set to N.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+---
+diff --git a/mt76x02.h b/mt76x02.h
+index 839abad..7e2259d 100644
+--- a/mt76x02.h
++++ b/mt76x02.h
+@@ -120,6 +120,11 @@ struct mt76x02_dev {
+ 	u8 tx_hang_check[4];
+ 	u8 beacon_hang_check;
+ 	u8 mcu_timeout;
++	/* watchdog resets in the window that began at wdt_window */
++	u8 wdt_resets;
++	bool wdt_gave_up;
++	unsigned long wdt_window;
++	unsigned long wdt_retry_at;
+ 
+ 	struct mt76x02_rate_power rate_power;
+ 
+diff --git a/mt76x02_debugfs.c b/mt76x02_debugfs.c
+index d81f696..ab6d4eb 100644
+--- a/mt76x02_debugfs.c
++++ b/mt76x02_debugfs.c
+@@ -153,5 +153,7 @@ void mt76x02_init_debugfs(struct mt76x02_dev *dev)
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "agc", dir, read_agc);
+ 
+ 	debugfs_create_u32("tx_hang_reset", 0400, dir, &dev->tx_hang_reset);
++	/* Y while the watchdog backs off; write N to re-arm it now. */
++	debugfs_create_bool("wdt_gave_up", 0600, dir, &dev->wdt_gave_up);
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_init_debugfs);
+diff --git a/mt76x02_mmio.c b/mt76x02_mmio.c
+index a89be0f..9fcf339 100644
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -691,6 +691,44 @@ void mt76x02_reconfig_complete(struct ieee80211_hw *hw,
+ }
+ EXPORT_SYMBOL_GPL(mt76x02_reconfig_complete);
+ 
++#define MT_WDT_MAX_RESETS	4
++#define MT_WDT_RESET_WINDOW	(60 * HZ)
++#define MT_WDT_BACKOFF		(10 * 60 * HZ)
++
++/*
++ * When the MCU does not come back from a reset, its commands keep timing
++ * out, mcu_timeout is set again right after the restart and the watchdog
++ * resets the radio every ~2 s forever (24-oct-2026: 107 resets until the
++ * router was rebooted). Each restart holds the RTNL and the wiphy lock for
++ * about a second, which stalls netifd, hostapd on the other radio and LuCI,
++ * and the radio does not recover anyway. After MT_WDT_MAX_RESETS resets in
++ * MT_WDT_RESET_WINDOW, stop resetting for MT_WDT_BACKOFF and then try again
++ * with a new window, so a radio that can come back still does, at a few
++ * seconds of stall every ten minutes instead of half of every two seconds.
++ */
++static bool mt76x02_wdt_give_up(struct mt76x02_dev *dev)
++{
++	unsigned long now = jiffies;
++
++	if (!dev->wdt_resets ||
++	    time_after(now, dev->wdt_window + MT_WDT_RESET_WINDOW)) {
++		dev->wdt_window = now;
++		dev->wdt_resets = 0;
++	}
++
++	if (++dev->wdt_resets <= MT_WDT_MAX_RESETS)
++		return false;
++
++	dev->wdt_resets = 0;
++	dev->wdt_retry_at = now + MT_WDT_BACKOFF;
++	WRITE_ONCE(dev->wdt_gave_up, true);
++	dev_err(dev->mt76.dev,
++		"watchdog: %d resets in %d s did not recover the radio, next try in %d s\n",
++		MT_WDT_MAX_RESETS, MT_WDT_RESET_WINDOW / HZ,
++		MT_WDT_BACKOFF / HZ);
++	return true;
++}
++
+ static void mt76x02_check_tx_hang(struct mt76x02_dev *dev)
+ {
+ 	bool tx_hang, mcu_timeout;
+@@ -698,11 +736,20 @@ static void mt76x02_check_tx_hang(struct mt76x02_dev *dev)
+ 	if (test_bit(MT76_RESTART, &dev->mphy.state))
+ 		return;
+ 
++	if (READ_ONCE(dev->wdt_gave_up)) {
++		if (time_before(jiffies, dev->wdt_retry_at))
++			return;
++		WRITE_ONCE(dev->wdt_gave_up, false);
++	}
++
+ 	tx_hang = mt76x02_tx_hang(dev);
+ 	mcu_timeout = READ_ONCE(dev->mcu_timeout);
+ 	if (!tx_hang && !mcu_timeout)
+ 		return;
+ 
++	if (mt76x02_wdt_give_up(dev))
++		return;
++
+ 	mt76x02_capture_watchdog(dev, tx_hang, mcu_timeout);
+ 	mt76x02_watchdog_reset(dev);
+ 
