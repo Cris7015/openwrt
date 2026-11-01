@@ -10,16 +10,16 @@ that limits WiFi download and whose ring 1 overflows into GDM drops,
 plus a pkt_addr store that the refill rewrites anyway.
 
 With rx_lean_desc=Y, read just those two words on QDMA0 and skip the
-store. QDMA1 keeps the full copy. Off by default, so it can be A/B
-tested in one boot.
+store. QDMA1 keeps the full copy. On by default: an A/B on the XR500v
+(TCP download through WHNAT, same 493 Mbit/s) gave -2.0 points of total
+CPU, -3.7 points on napi/qdma_eth-0 and 19 % fewer TCP retransmissions;
+N restores the full copy.
 
 Signed-off-by: Cristian Papa <pcristian292@gmail.com>
 ---
-diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
-index e06052a..dae3965 100644
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -420,6 +420,18 @@ static unsigned int rx_overflow[2];
+@@ -420,6 +420,19 @@
  module_param_array(rx_overflow, uint, NULL, 0444);
  MODULE_PARM_DESC(rx_overflow, "EN751221 RX descriptors with the overflow bit, dropped, per QDMA");
  
@@ -28,17 +28,18 @@ index e06052a..dae3965 100644
 + * msg.erx.bitfield_0 of a descriptor; the other words matter for QDMA1
 + * (xPON OAM and GEM) only. Copying the whole descriptor costs eight
 + * uncached loads per frame on the thread that empties ring 1, and the
-+ * pkt_addr clear is rewritten by the refill anyway. Off by default for an
-+ * A/B in one boot.
++ * pkt_addr clear is rewritten by the refill anyway. On by default since the
++ * A/B of 1-nov-2026 (-2 pts of CPU, -3.7 pts on napi/qdma_eth-0 at the same
++ * WiFi download rate); N restores the full copy.
 + */
-+static bool rx_lean_desc;
++static bool rx_lean_desc = true;
 +module_param(rx_lean_desc, bool, 0644);
 +MODULE_PARM_DESC(rx_lean_desc, "lab: EN751221 QDMA0 RX reads only the descriptor words it uses");
 +
  static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
  				     enum dma_data_direction dir,
  				     struct airoha_whnat_batch *batch)
-@@ -431,11 +443,22 @@ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+@@ -431,11 +444,22 @@
  	struct page *page;
  	struct desc desc;
  	u16 ingress_gem;
@@ -62,7 +63,7 @@ index e06052a..dae3965 100644
  
  	dma_sync_single_for_cpu(q->qdma->qdma->eth->dev, e->dma_addr, e->dma_len, dir);
  
-@@ -443,7 +466,8 @@ static void econet_qdma_rx_process_one(struct econet_q_rx *q, u32 cpu_i,
+@@ -443,7 +467,8 @@
  	e->dma_addr = 0;
  
  	/* Make debug more readable */
