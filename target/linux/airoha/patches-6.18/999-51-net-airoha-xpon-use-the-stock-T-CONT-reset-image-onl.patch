@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:04:21 -0300
+Subject: [PATCH 42/48] net: airoha: xpon: use the stock T-CONT reset image
+ only on EN751221
+
+The 0x00ff00ff image written to the T-CONT pair registers on session
+stop comes from the stock EN751221 gponDevResetAllocId(). Use it only
+there; on EN7523/EN7528 write TCONT_PAIR_INVALID, which clears the
+valid bits just as __gpon_set_tcont_hw() already does for one entry.
+The PLOAMd filter and the stock AES sequence were limited to EN751221
+in their own fixes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 6c4e8bf..229bbf4 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3597,10 +3597,16 @@ static void gpon_clear_hw_tables(struct xpon_priv *priv)
+ 	}
+ 
+ 	if (READ_ONCE(gpon_stop_clear_tconts)) {
++		/* The reset image is the stock EN751221 one; elsewhere just
++		 * clear the valid bits.
++		 */
++		u32 image = gpon_stock_en751221_csr(priv) ?
++			    GPON_TCONT_PAIR_RESET : TCONT_PAIR_INVALID;
++
+ 		mutex_lock(&priv->tcont_lock);
+ 		for (reg = GPON_TCONT_ID_0_1; reg <= GPON_TCONT_ID_14_15;
+ 		     reg += 4)
+-			gpon_write(priv, reg, GPON_TCONT_PAIR_RESET);
++			gpon_write(priv, reg, image);
+ 		for (index = 16; index < GPON_MAX_TCONT; index++)
+ 			if (priv->tcont_alloc_id[index] !=
+ 			    GPON_TCONT_UNASSIGNED &&

@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:02:49 -0300
+Subject: [PATCH 37/48] net: airoha: xpon: reset the relock reference on every
+ new ranging
+
+"watch the PHY relock in O5 and optionally compensate it" reset the
+psync-to-SOF reference and the MAC fine delay only in O2. An ONU that
+goes O6 -> broadcast POPUP -> O4 -> Ranging_Time -> O5 is ranged again
+with the PHY as it is now, but gpon_psync_check() kept comparing with
+the old reference: with gpon_relock_comp=1 it would correct the fine
+delay a second time on top of a fresh ranging (up to +/-7 steps of 8
+bits); with the default it only logged a misleading difference.
+
+Reset the reference and put the fine delay back to the board base on
+entering O4 as well as O2 (gpon_relock_reset()).
+
+The earlier message and comment called the correction "absolute". That
+meant computed from the base each time (fine = base + diff / 2) rather
+than accumulated; the correction itself is signed, truncated towards
+zero, as in the stock gpon_detect_phy_ready() (srl/addu/sra at
+0xf490..0xf4a4). The comment now says so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 40 ++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index b00b7e5..09c9977 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2878,8 +2878,12 @@ DEFINE_DEBUGFS_ATTRIBUTE(gpon_lab_err_ctrl_fops, gpon_lab_err_ctrl_get,
+  *  - after a relock it is read every 1 ms until three reads agree (at most
+  *    ten);
+  *  - diff = now - reference; if |diff| <= 15 the MAC fine delay
+- *    DBG_DLY[15:8] is set to base + diff / 2 (truncated, absolute, one
+- *    fine step is 8 bits), otherwise nothing is changed;
++ *    DBG_DLY[15:8] is set to base + diff / 2, signed and truncated towards
++ *    zero, computed from the base each time rather than added to the
++ *    current value (one fine step is 8 bits); otherwise nothing changes;
++ *  - every new ranging (O2, and O4 after a broadcast POPUP) measures the
++ *    EqD with the PHY as it is, so the reference and the fine delay are
++ *    reset there;
+  *  - base is the board fine delay: 0x14 on this board (match data), not the
+  *    0x1c default the stock binary starts from and its board config then
+  *    overrides (the stock O5 register reads fine 0x14, which 0x1c +/- 7
+@@ -2982,6 +2986,21 @@ static void gpon_psync_check(struct xpon_priv *priv)
+ 	gpon_set_fine_delay(priv, fine);
+ }
+ 
++/* A new ranging is about to measure the EqD: start from the board base. */
++static void gpon_relock_reset(struct xpon_priv *priv, const char *when)
++{
++	u8 base = priv->match_data->gpon_fine_delay;
++
++	priv->psync_sof_o5 = U32_MAX;
++	if (priv->fine_delay == base)
++		return;
++
++	dev_info_ratelimited(priv->dev,
++			     "GPON %s: MAC fine delay %#x -> %#x for the next ranging\n",
++			     when, priv->fine_delay, base);
++	gpon_set_fine_delay(priv, base);
++}
++
+ static void gpon_log_psync_sof(struct xpon_priv *priv, const char *when)
+ {
+ 	u32 delay;
+@@ -3129,16 +3148,7 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		priv->byte_delay = 0;
+ 		priv->bit_delay = 0;
+ 		gpon_set_bit_delay(priv, 0);
+-		priv->psync_sof_o5 = U32_MAX;
+-		/* A new ranging measures against the board fine delay. */
+-		if (priv->fine_delay != priv->match_data->gpon_fine_delay) {
+-			dev_info_ratelimited(priv->dev,
+-					     "GPON O2: MAC fine delay %#x -> %#x for the next ranging\n",
+-					     priv->fine_delay,
+-					     priv->match_data->gpon_fine_delay);
+-			gpon_set_fine_delay(priv,
+-					    priv->match_data->gpon_fine_delay);
+-		}
++		gpon_relock_reset(priv, "O2");
+ 		/*
+ 		 * TO1 limits the serial-number and ranging states; O2 waits
+ 		 * for Upstream_Overhead without a timeout. The stock driver
+@@ -3156,6 +3166,12 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		}
+ 		fallthrough;
+ 	case GPON_O4_RANGING:
++		/*
++		 * O4 from O6 (broadcast POPUP) re-ranges without passing O2:
++		 * the reference of the old ranging no longer applies.
++		 */
++		if (state == GPON_O4_RANGING)
++			gpon_relock_reset(priv, "O4");
+ 		/* Start / restart TO1, as the stock driver does in O3 and O4. */
+ 		mod_delayed_work(priv->fsm_wq, &priv->to1_work,
+ 				 msecs_to_jiffies(GPON_TO1_MS));

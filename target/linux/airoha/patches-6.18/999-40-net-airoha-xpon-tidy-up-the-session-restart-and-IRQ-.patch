@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:24:07 -0300
+Subject: [PATCH 31/48] net: airoha: xpon: tidy up the session restart and IRQ
+ status changes
+
+- gpon_count_irq_status() walked a u32 through a cast to unsigned long;
+  use an unsigned long so for_each_set_bit() never reads past it.
+- Move the "serial-number diagnostics" comment back above the code it
+  describes; the random delay draw had been inserted between them.
+- The clean reactivation path restarts the session like a
+  Deactivate_ONU-ID. That drops the OMCI session, the T-CONT table and
+  the FE channels, but by default not the GEM table (see
+  gpon_stop_clear_gems), so stop saying it releases GEM ports.
+
+No functional change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c |  7 ++--
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 37 +++++++++++-----------
+ 2 files changed, 23 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index f7f0962..1717f6d 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -364,9 +364,10 @@ static void handle_disable_sn(struct ploam_priv *pp,
+ 			 * Activation starts over, without the ONU-ID, the
+ 			 * equalization delay or the PLOAM history of the
+ 			 * session the OLT stopped. The hardware layer may
+-			 * restart the whole session (and with it release the
+-			 * T-CONTs and GEM ports of the stopped one); its enable
+-			 * path then calls ploam_start(). Otherwise go to O2 here.
++			 * restart the whole session, as after Deactivate_ONU-ID,
++			 * to drop the T-CONTs and OMCI session of the stopped
++			 * one; its enable path then calls ploam_start().
++			 * Otherwise go to O2 here.
+ 			 */
+ 			if (pp->ops->reactivate &&
+ 			    pp->ops->reactivate(pp->hw_priv))
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index c372bc3..29f69b6 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3172,11 +3172,12 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ }
+ 
+ /*
+- * A new activation must not inherit the Alloc-IDs, GEM ports and OMCC of a
+- * session the OLT stopped (G.984.3: they belong to the ONU-ID). The soft
++ * A new activation must not inherit the Alloc-IDs, OMCC and OMCI session of
++ * a session the OLT stopped (G.984.3: they belong to the ONU-ID). The soft
+  * returns to O2 -- Disable_Serial_Number (enable) out of O7, and TO1 in an
+- * O4 entered from O6 by a broadcast POPUP -- kept all of them in hardware.
+- * With this set, both restart the whole session like a Deactivate_ONU-ID.
++ * O4 entered from O6 by a broadcast POPUP -- kept all of them. With this
++ * set, both restart the whole session exactly like a Deactivate_ONU-ID
++ * (gpon_disable(): OMCI session reset, T-CONT table, FE channels).
+  */
+ static bool gpon_clean_reactivation = true;
+ module_param(gpon_clean_reactivation, bool, 0644);
+@@ -3714,10 +3715,10 @@ static void gpon_ber_timer_fn(struct timer_list *t)
+ static void gpon_count_irq_status(struct xpon_priv *priv, u32 disabled,
+ 				  bool keep)
+ {
+-	u32 fresh = disabled & ~priv->irq_status_latched;
++	unsigned long fresh = disabled & ~priv->irq_status_latched;
+ 	unsigned int bit;
+ 
+-	for_each_set_bit(bit, (unsigned long *)&fresh, 32)
++	for_each_set_bit(bit, &fresh, 32)
+ 		WRITE_ONCE(priv->irq_status_seen[bit],
+ 			   priv->irq_status_seen[bit] + 1);
+ 	/* A bit still latched from the previous pass is not a new event. */
+@@ -3811,9 +3812,9 @@ static void gpon_link_sync_state(struct xpon_priv *priv, bool link, bool lost)
+ 		return;
+ 
+ 	/*
+-	 * O4 entered from O6 by a broadcast POPUP still holds the T-CONTs and
+-	 * GEM ports of the session; release them with a full restart instead
+-	 * of a soft O1, like TO1 does in that state.
++	 * O4 entered from O6 by a broadcast POPUP still holds the T-CONTs,
++	 * OMCC and OMCI session of the session; restart it as after
++	 * Deactivate_ONU-ID instead of a soft O1, like TO1 does there.
+ 	 */
+ 	if (priv->gpon_session_o5 && READ_ONCE(gpon_clean_reactivation)) {
+ 		dev_warn_ratelimited(priv->dev,
+@@ -3924,13 +3925,13 @@ static void gpon_to1_work_fn(struct work_struct *work)
+ 
+ 	/*
+ 	 * Only O4 entered from O6 by a broadcast POPUP gets here after O5.
+-	 * The T-CONTs, GEM ports and OMCC of that session are still in
+-	 * hardware; a soft return to O2 would carry them into the next
+-	 * activation, possibly with another ONU-ID.
++	 * The T-CONTs, OMCC and OMCI session of that session are still set
++	 * up; a soft return to O2 would carry them into the next activation,
++	 * possibly with another ONU-ID. Restart as after Deactivate_ONU-ID.
+ 	 */
+ 	if (priv->gpon_session_o5 && READ_ONCE(gpon_clean_reactivation)) {
+ 		dev_warn_ratelimited(priv->dev,
+-				     "GPON TO1 expired in O%d after this session reached O5: restarting the session to release its Alloc-IDs and GEM ports\n",
++				     "GPON TO1 expired in O%d after this session reached O5: restarting the session as after Deactivate_ONU-ID\n",
+ 				     (int)st);
+ 		priv->to1_failures = 0;
+ 		gpon_disable(priv);
+@@ -4230,16 +4231,16 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 
+ 		gpon_process_ploam_queue(priv);
+ 
+-		/*
+-		 * Keep the serial-number diagnostics compact: one line only when
+-		 * the MAC receives a serial grant, sends Serial_Number_ONU, or
+-		 * crosses the serial-request threshold.
+-		 */
+ 		/* Draw the delay for the next serial-number response. */
+ 		if ((active & INT_SN_ONU_SEND_O3) &&
+ 		    ploam_get_state(priv->ploam) == GPON_O3_SERIAL_NUMBER)
+ 			gpon_sn_new_random_delay(priv);
+ 
++		/*
++		 * Keep the serial-number diagnostics compact: one line only when
++		 * the MAC receives a serial grant, sends Serial_Number_ONU, or
++		 * crosses the serial-request threshold.
++		 */
+ 		if (active & (INT_SN_REQ_RECV | INT_SN_ONU_SEND_O3 |
+ 			      INT_SN_REQ_CRS)) {
+ 			sn_cfg = gpon_read(priv, GPON_SN_MSG_CFG);

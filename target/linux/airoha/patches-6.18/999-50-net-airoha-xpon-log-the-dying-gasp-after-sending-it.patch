@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:04:21 -0300
+Subject: [PATCH 41/48] net: airoha: xpon: log the dying gasp after sending it
+
+The dying-gasp handler printed its warning before queueing the PLOAM and
+the OMCI dying gasp. On the 115200 baud console a line costs about
+5 ms of the few the supply has left. Queue both messages first and log
+afterwards, folding the "outside O5" note into the same line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 797424f..6c4e8bf 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -4293,16 +4293,19 @@ MODULE_PARM_DESC(gpon_dying_gasp_o5_only,
+ static void gpon_handle_dying_gasp(struct xpon_priv *priv)
+ {
+ 	enum gpon_state st = ploam_get_state(priv->ploam);
++	bool queued = false;
+ 	int ret;
+ 
+-	dev_warn(priv->dev, "GPON dying-gasp interrupt in %s\n",
+-		 gpon_state_name(st));
+-	if (!READ_ONCE(gpon_dying_gasp_o5_only) || st == GPON_O5_OPERATION)
++	/* Queue both messages first; a console line costs milliseconds. */
++	if (!READ_ONCE(gpon_dying_gasp_o5_only) || st == GPON_O5_OPERATION) {
+ 		ploam_notify_dying_gasp(priv->ploam);
+-	else
+-		dev_warn_ratelimited(priv->dev,
+-				     "GPON dying gasp outside O5: no Dying_Gasp PLOAM queued\n");
++		queued = true;
++	}
+ 	ret = airoha_gpon_omci_send_dying_gasp(&priv->omci);
++
++	dev_warn(priv->dev, "GPON dying-gasp interrupt in %s%s\n",
++		 gpon_state_name(st),
++		 queued ? "" : ": outside O5, no Dying_Gasp PLOAM queued");
+ 	if (ret && ret != -EOPNOTSUPP && ret != -ENOLINK)
+ 		dev_warn(priv->dev, "failed to send OMCI dying gasp: %d\n",
+ 			 ret);

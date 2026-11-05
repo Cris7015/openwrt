@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:01:32 -0300
+Subject: [PATCH 02/48] net: xpon: omci: drop OMCI frames that fail the CRC
+
+The baseline OMCI trailer carries a CRC-32 (G.984.4/G.988 message
+format). A frame that fails it must be discarded so the OLT retransmits
+it after its timeout.
+
+The EN751221 and EN7523 receive paths flag such frames with
+AIROHA_XPON_OAM_RX_F_CRC_ERROR, the glue turns that into
+OMCI_F_CRC_ERROR and the core stores it in the skb control block, but
+the agent never looked at it: any 44 or 48 byte frame was decoded and
+executed. A corrupted Set or Create could apply wrong attribute values
+under a valid TCI, or answer a TCI the OLT never sent; the clean
+retransmission then missed the duplicate cache and ran again, returning
+"instance exists" for a Create or counting a Set twice in MIB data sync.
+
+Skip the agent for flagged frames, keep forwarding them to the netlink
+observer with the flag, and count them in a new rx_crc_errors sysfs
+attribute.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/core.c     | 11 ++++++++++-
+ net/xpon/omci/internal.h |  1 +
+ net/xpon/omci/sysfs.c    |  2 ++
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/net/xpon/omci/core.c b/net/xpon/omci/core.c
+index f97d43a..2e850bb 100644
+--- a/net/xpon/omci/core.c
++++ b/net/xpon/omci/core.c
+@@ -1185,7 +1185,16 @@ static void omci_rx_work(struct work_struct *work)
+ 		}
+ 		spin_unlock_bh(&odev->state_lock);
+ 
+-		omci_agent_receive(odev, skb);
++		/*
++		 * The OMCI trailer carries a CRC-32: a frame that fails it is
++		 * discarded and the OLT retransmits it. Executing it would apply
++		 * whatever the corruption left and answer a TCI the OLT may never
++		 * have sent. The observer still gets it, with the flag.
++		 */
++		if (cb->flags & OMCI_F_CRC_ERROR)
++			atomic64_inc(&odev->rx_crc_errors);
++		else
++			omci_agent_receive(odev, skb);
+ 
+ 		mutex_lock(&odev->owner_lock);
+ 		if (odev->owner_portid && odev->owner_net) {
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index 4263609..37adfcc 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -194,6 +194,7 @@ struct omci_device {
+ 	atomic64_t rx_packets;
+ 	atomic64_t rx_bytes;
+ 	atomic64_t rx_dropped;
++	atomic64_t rx_crc_errors;
+ 	atomic64_t tx_packets;
+ 	atomic64_t tx_bytes;
+ 	atomic64_t tx_errors;
+diff --git a/net/xpon/omci/sysfs.c b/net/xpon/omci/sysfs.c
+index dea3323..d5999dd 100644
+--- a/net/xpon/omci/sysfs.c
++++ b/net/xpon/omci/sysfs.c
+@@ -149,6 +149,7 @@ static DEVICE_ATTR_RO(_name)
+ OMCI_ATOMIC64_ATTR_RO(rx_packets, rx_packets);
+ OMCI_ATOMIC64_ATTR_RO(rx_bytes, rx_bytes);
+ OMCI_ATOMIC64_ATTR_RO(rx_dropped, rx_dropped);
++OMCI_ATOMIC64_ATTR_RO(rx_crc_errors, rx_crc_errors);
+ OMCI_ATOMIC64_ATTR_RO(tx_packets, tx_packets);
+ OMCI_ATOMIC64_ATTR_RO(tx_bytes, tx_bytes);
+ OMCI_ATOMIC64_ATTR_RO(tx_errors, tx_errors);
+@@ -685,6 +686,7 @@ static struct attribute *omci_attrs[] = {
+ 	&dev_attr_rx_packets.attr,
+ 	&dev_attr_rx_bytes.attr,
+ 	&dev_attr_rx_dropped.attr,
++	&dev_attr_rx_crc_errors.attr,
+ 	&dev_attr_tx_packets.attr,
+ 	&dev_attr_tx_bytes.attr,
+ 	&dev_attr_tx_errors.attr,

@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:04:14 -0300
+Subject: [PATCH 09/48] net: xpon: omci: stay on the baseline message set
+
+The agent decodes extended OMCI messages (device identifier 0x0b), but
+the Get response of every managed entity except ME 341 and the MIB
+upload next response are only built in the baseline layout: an extended
+Get answer put the attribute values where G.988 expects the two failure
+masks, and an extended MIB upload next answer was a baseline record.
+
+ONU2-G advertises 0xa0 by default (G.988 2010, baseline only), so an OLT
+should not send extended messages, but the OMCC version could be set to
+any non-zero value through sysfs or the netlink configuration, including
+the code points that announce the extended set.
+
+Refuse those code points (0x96 and 0xb0-0xbf) as OMCC version and ignore
+extended requests, counting them as unsupported, instead of answering
+them with malformed contents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 025dc95..45f1066 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -200,6 +200,15 @@ static bool omci_agent_result_can_be_faked(u8 result)
+ #define OMCI_OLT_G_EQUIPMENT_ID_MASK	0x4000
+ #define OMCI_OLT_G_VERSION_MASK	0x2000
+ #define OMCI_OMCC_VERSION_G988_2010_BASELINE	0xa0
++
++/*
++ * G.988 ONU2-G OMCC version code points: 0x96 and 0xb0-0xbf announce the
++ * extended message set as well as the baseline one.
++ */
++static bool omci_omcc_version_extended(u8 version)
++{
++	return version == 0x96 || (version & 0xf0) == 0xb0;
++}
+ #define OMCI_OLT_G_TIME_OF_DAY_MASK	0x1000
+ #define OMCI_OLT_G_TIME_OF_DAY_LEN	14
+ 
+@@ -4897,6 +4906,19 @@ void omci_agent_receive(struct omci_device *odev, const struct sk_buff *skb)
+ 	if (ret)
+ 		return;
+ 	omci_agent_log_wire(odev, "RX", skb->data, skb->len);
++	/*
++	 * ONU2-G advertises a baseline-only OMCC version, and several
++	 * responses (Get, MIB upload next) are only built in the baseline
++	 * layout: an extended message would get a malformed answer.
++	 */
++	if (request.device_id == OMCI_EXTENDED_DEV_ID) {
++		dev_dbg(odev->parent,
++			"OMCI extended message ignored: tci=%#06x type=%#04x class=%u\n",
++			request.transaction_id, request.message_type,
++			request.class_id);
++		atomic64_inc(&agent->unsupported);
++		return;
++	}
+ 	ani_g_test = omci_agent_is_ani_g_test(&request);
+ 	request_hash = jhash(skb->data, skb->len, 0);
+ 
+@@ -5397,7 +5419,7 @@ __omci_agent_config_set_source(struct omci_device *odev, u16 key,
+ 			break;
+ 		}
+ 		scalar = *(const u8 *)value;
+-		if (!scalar) {
++		if (!scalar || omci_omcc_version_extended(scalar)) {
+ 			ret = -EINVAL;
+ 			break;
+ 		}

@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:07:39 -0300
+Subject: [PATCH 18/48] net: airoha: xpon: filter Upstream_Overhead and EBL in
+ hardware in O5
+
+G.984.3 has the ONU process Upstream_Overhead in O2 and
+Extended_Burst_Length in O3; an ONU in operation must not act on the
+copies the OLT keeps broadcasting for discovery. The stock driver enables
+the MAC filter for both on entering O5: gpon_act_change_gpon_state(5)
+calls gponDevSetFilterExtBurstLengthPLOAM(1) and
+gponDevSetFilterUpstreamOverheadPLOAM(1), which set bits 8 and 0 of
+0x4360 (PLOAMD_FILTER_IN_O5); 0x360 = 0x101 was also read back live from
+the stock firmware. This driver never wrote the register, so every
+broadcast landed in the PLOAMd FIFO and cost an interrupt, a drain and
+an FSM wake-up just to be discarded in software.
+
+Set the filter on entering O5 and keep it in O6. The stock driver relies
+on its MAC reset to clear it before the next activation; the EN751221
+MAC is not reset here, so clear it explicitly in every other state and
+in gpon_reset_activation_context(). Otherwise an ONU sent back to O2
+would never see Upstream_Overhead again.
+
+Behind airoha_xpon.gpon_o5_ploam_filter (0644, default on, replicates
+the stock driver). The O5 log line now prints the register.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 31 +++++++++++++++++++++--
+ drivers/net/ethernet/airoha/airoha_xpon.h |  5 ++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 4229f51..ad531e2 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -676,11 +676,33 @@ static void gpon_adjust_mac_rx_delay(struct xpon_priv *priv)
+ 		 FIELD_PREP(DBG_DLY_FIX_PHY_RX_DLY_MASK, fixed));
+ }
+ 
++/*
++ * The stock driver sets PLOAMD_FILTER_IN_O5 (0x4360 bits 0 and 8) on
++ * entering O5, so the MAC drops the periodic broadcast Upstream_Overhead
++ * and Extended_Burst_Length an operational ONU must not act on. Its MAC
++ * reset clears the filter for the next activation; this driver does not
++ * reset the EN751221 MAC, so clear it explicitly outside O5/O6.
++ */
++static bool gpon_o5_ploam_filter = true;
++module_param(gpon_o5_ploam_filter, bool, 0644);
++MODULE_PARM_DESC(gpon_o5_ploam_filter,
++		 "Filter Upstream_Overhead/Extended_Burst_Length in hardware in O5, as the stock driver (default: on)");
++
++static void gpon_set_o5_ploam_filter(struct xpon_priv *priv, bool o5)
++{
++	u32 bits = PLOAMD_FILTER_UPSTREAM_OVERHEAD |
++		   PLOAMD_FILTER_EXT_BURST_LEN;
++
++	gpon_rmw(priv, GPON_DBG_PLOAMD_FILTER, bits,
++		 o5 && READ_ONCE(gpon_o5_ploam_filter) ? bits : 0);
++}
++
+ static void gpon_reset_activation_context(struct xpon_priv *priv)
+ {
+ 	u32 sn_cfg;
+ 
+ 	gpon_clear_bits(priv, GPON_GBL_CFG, GBL_CFG_US_FEC_EN);
++	gpon_set_o5_ploam_filter(priv, false);
+ 	gpon_write(priv, GPON_ONU_ID, PLOAM_ONU_UNASSIGNED);
+ 	gpon_write(priv, GPON_ACTIVATION_ST, GPON_O1_INITIAL);
+ 	gpon_write(priv, GPON_PRE_ASSIGNED_DLY, 0);
+@@ -2788,6 +2810,9 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 
+ 	/* Keep the hardware activation state in sync with the PLOAM FSM. */
+ 	gpon_write(priv, GPON_ACTIVATION_ST, state & 0x7);
++	/* O6 keeps what O5 set; every other state needs both messages. */
++	if (state != GPON_O6_POPUP)
++		gpon_set_o5_ploam_filter(priv, state == GPON_O5_OPERATION);
+ 	gpon_bip_set_active(priv, state == GPON_O5_OPERATION);
+ 	dev_info(priv->dev, "GPON state -> %s (%u), activation_reg=%#08x\n",
+ 		 gpon_state_name(state), state,
+@@ -2896,8 +2921,10 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 				  jiffies +
+ 				  msecs_to_jiffies(priv->ber_interval_ms));
+ 		priv->to1_failures = 0;
+-		dev_info(priv->dev, "GPON O5: operational, ONU-ID=%u\n",
+-			 ploam_get_onu_id(priv->ploam));
++		dev_info(priv->dev,
++			 "GPON O5: operational, ONU-ID=%u, PLOAMd O5 filter=%#x\n",
++			 ploam_get_onu_id(priv->ploam),
++			 gpon_read(priv, GPON_DBG_PLOAMD_FILTER));
+ 		gpon_log_psync_sof(priv, "O5");
+ 		gpon_lab_o5_config(priv);
+ 		break;
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 1c29ba2..6533613 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -141,6 +141,7 @@ struct airoha_xpon_match_data {
+ #define GPON_DBG_GEM_HEC_TWO_ERR_CNT	0x334
+ #define GPON_DBG_GEM_HEC_UC_ERR_CNT	0x338
+ #define GPON_DBG_DBA_BACKDOOR	0x340
++#define GPON_DBG_PLOAMD_FILTER	0x360	/* PLOAMD_FILTER_IN_O5 */
+ #define GPON_DBG_SW_RESYNC	0x364
+ #define GPON_MAC_SET		0x3A0
+ /* Debug / TX sync (EN7521 EqD adjustment) */
+@@ -315,6 +316,10 @@ struct airoha_xpon_match_data {
+ #define DBG_PROBE_RX_DELAY_SEL		0x0000000f
+ #define DBG_PROBE_RX_DELAY_MASK		GENMASK(23, 12)
+ 
++/* PLOAMD_FILTER_IN_O5 (stock gponDevSetFilter*PLOAM) */
++#define PLOAMD_FILTER_UPSTREAM_OVERHEAD	BIT(0)
++#define PLOAMD_FILTER_EXT_BURST_LEN	BIT(8)
++
+ /* DBG_ERR_CTRL: hardware resync enables (EN7521 SDK register header) */
+ #define DBG_ERR_CTRL_RESYNC_MASK	GENMASK(4, 1)
+ 

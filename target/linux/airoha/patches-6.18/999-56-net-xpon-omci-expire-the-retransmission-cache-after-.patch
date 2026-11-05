@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:20:53 -0300
+Subject: [PATCH 47/48] net: xpon: omci: expire the retransmission cache after
+ 10 seconds
+
+The cache keeps the last exchange of each TCI priority so that a
+retransmission is answered without executing it again. An entry of the
+priority the OLT rarely uses stayed there indefinitely, so an OLT that
+reused a TCI with identical contents long after, a periodic Get with a
+fixed TCI for instance, would have been handed the stale answer.
+
+A retransmission follows its request within the OLT retry timeout: only
+treat a request as one within 10 seconds of the cached answer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c    | 7 +++++++
+ net/xpon/omci/internal.h | 2 ++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index b98ce26..3a83581 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -105,6 +105,11 @@ static bool omci_agent_result_can_be_faked(u8 result)
+ #define OMCI_OMCI_ME_TYPE_TABLE_MASK		BIT(15)
+ #define OMCI_OMCI_MESSAGE_TYPE_TABLE_MASK	BIT(14)
+ #define OMCI_TABLE_SNAPSHOT_TIMEOUT		(60 * HZ)
++/*
++ * A retransmission follows its request within the OLT retry timeout; an
++ * identical request later than this is a new one and is executed.
++ */
++#define OMCI_DUPLICATE_TIMEOUT			(10 * HZ)
+ #define OMCI_BASELINE_TABLE_FRAGMENT_LEN	29
+ 
+ /* G.988 I.4 PM interval; the sample period bounds what a MAC restart loses */
+@@ -4976,6 +4981,7 @@ omci_agent_cache_exchange_locked(struct omci_agent *agent,
+ 	exchange->response = cached_response;
+ 	exchange->hash = jhash(request->data, request->len, 0);
+ 	exchange->fake = fake;
++	exchange->stamp = jiffies;
+ 	return 0;
+ }
+ 
+@@ -5042,6 +5048,7 @@ void omci_agent_receive(struct omci_device *odev, const struct sk_buff *skb)
+ 
+ 	exchange = omci_agent_exchange_slot(agent, skb);
+ 	if (exchange->request && exchange->response &&
++	    time_before(jiffies, exchange->stamp + OMCI_DUPLICATE_TIMEOUT) &&
+ 	    exchange->hash == request_hash &&
+ 	    exchange->request->len == skb->len &&
+ 	    !memcmp(exchange->request->data, skb->data, skb->len)) {
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index 24d4c7a..f580296 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -92,10 +92,12 @@ struct omci_service_state {
+  * @response: the response sent for it
+  * @hash: jhash of @request
+  * @fake: @response was a compatibility fake
++ * @stamp: jiffies when @response was sent
+  */
+ struct omci_agent_exchange {
+ 	struct sk_buff *request;
+ 	struct sk_buff *response;
++	unsigned long stamp;
+ 	u32 hash;
+ 	bool fake;
+ };

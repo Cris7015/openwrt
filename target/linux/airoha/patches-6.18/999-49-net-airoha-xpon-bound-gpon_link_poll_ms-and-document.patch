@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:04:03 -0300
+Subject: [PATCH 40/48] net: airoha: xpon: bound gpon_link_poll_ms and document
+ the ISR ack risk
+
+Every link poll reads PHY TRANS_STATUS (0x5e0) through
+airoha_xpon_phy_get_link_state(), and in O5 also the psync-to-SOF
+delay. gpon_link_poll_ms accepted 10 ms, which multiplies those reads
+by 25. Clamp it to 100..1000 ms and say in its description that
+lowering it is not recommended. The default stays 250 ms.
+
+gpon_isr_ack_enabled_only leaves the disabled G_INT_STATUS bits latched.
+On the EN751221 the MAC interrupt reaches the CPU through the QDMA_WAN
+aggregator, and it is not verified that the aggregator masks with
+G_INT_ENABLE: if it does not, a latched bit could keep the line asserted
+and cause an interrupt storm. gpon_irq_status also saturates at one
+event per bit in that mode. Say both in the description; it stays off
+by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index e263f16..797424f 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2137,7 +2137,7 @@ static DEVICE_ATTR_RO(gpon_gem_delin);
+ static bool gpon_isr_ack_enabled_only;
+ module_param(gpon_isr_ack_enabled_only, bool, 0644);
+ MODULE_PARM_DESC(gpon_isr_ack_enabled_only,
+-		 "Acknowledge only enabled G_INT_STATUS bits, as the stock driver (default: off)");
++		 "Acknowledge only enabled G_INT_STATUS bits, as the stock driver; leaves disabled bits latched, which may keep the QDMA_WAN-aggregated line asserted (IRQ storm) if the aggregator does not mask with G_INT_ENABLE, and saturates gpon_irq_status at one event per bit. Keep off outside the lab (default: off)");
+ 
+ /* G_INT_STATUS bits seen set while not enabled as interrupts. */
+ static ssize_t gpon_irq_status_show(struct device *dev,
+@@ -3870,20 +3870,26 @@ MODULE_PARM_DESC(gpon_los_o1,
+  * loss only at the next sample of this poll. 250 ms misses a short loss
+  * in O5 completely. A shorter period reacts faster but also turns a
+  * transient not-ready sample into O6, and O6 without a POPUP ends in a
+- * full restart; keep the old period unless asked otherwise.
++ * full restart. Every sample also reads PHY TRANS_STATUS (0x5e0) and, in
++ * O5, the psync-to-SOF delay, so the period is not taken below 100 ms;
++ * keep the old period unless asked otherwise.
+  */
++#define GPON_LINK_POLL_MIN_MS	100
++#define GPON_LINK_POLL_MAX_MS	1000
++
+ static unsigned int gpon_link_poll_ms = XPON_LINK_POLL_MS;
+ module_param(gpon_link_poll_ms, uint, 0644);
+ MODULE_PARM_DESC(gpon_link_poll_ms,
+-		 "GPON PHY link/LOS poll period in ms, 10..1000 (default: 250)");
++		 "GPON PHY link/LOS poll period in ms, 100..1000; each sample reads PHY 0x5e0, lowering it is not recommended (default: 250)");
+ 
+ static unsigned long airoha_xpon_link_poll_jiffies(struct xpon_priv *priv)
+ {
+ 	if (priv->mode != AIROHA_XPON_MODE_GPON)
+ 		return msecs_to_jiffies(XPON_LINK_POLL_MS);
+ 
+-	return msecs_to_jiffies(clamp(READ_ONCE(gpon_link_poll_ms), 10U,
+-				      1000U));
++	return msecs_to_jiffies(clamp(READ_ONCE(gpon_link_poll_ms),
++				      (unsigned int)GPON_LINK_POLL_MIN_MS,
++				      (unsigned int)GPON_LINK_POLL_MAX_MS));
+ }
+ 
+ /*

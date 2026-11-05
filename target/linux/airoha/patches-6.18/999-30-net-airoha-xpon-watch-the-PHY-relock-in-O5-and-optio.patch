@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:12:01 -0300
+Subject: [PATCH 21/48] net: airoha: xpon: watch the PHY relock in O5 and
+ optionally compensate it
+
+After a PHY relock the downstream framing can land a few PHY units away
+from where it was when the OLT ranged the ONU, and every upstream burst
+moves with it. The stock driver corrects for it in
+gpon_detect_phy_ready(), called on every PHY-ready event; from its
+disassembly:
+
+ - the reference is 0x2d4[15:0] (psync-to-SOF, 4 upstream bits per unit)
+   read in gpon_act_change_gpon_state(5) when none is stored yet;
+ - after a relock it reads 0x2d4 every 1 ms until three reads agree, at
+   most ten times;
+ - diff = now - reference; if |diff| < 16 it sets the MAC fine delay
+   (DBG_DLY[15:8], one step = 8 bits) to base + diff / 2, truncated
+   towards zero and absolute, otherwise it changes nothing;
+ - base is priv+0x126: 0x1c from gpon_init, overridden only by the board
+   configuration (gpon_cmd_proc). The stock O5 register on this board
+   reads fine 0x14, which 0x1c +/- 7 cannot produce, so the board base
+   is 0x14 = match_data->gpon_fine_delay. Using 0x1c would shift the
+   burst by 64 bits.
+
+This driver kept the reference (patch 995) but only logged it on O5/O6
+entry, and the PHY raises no ready/LOF interrupt: a relock shorter than
+the 250 ms link poll never showed up anywhere, while the bursts stayed
+shifted.
+
+Sample the delay in the link poll while in O5 and on returning to O5
+from O6 without a new ranging; on a change, apply the stock stability
+check and log what happened (rate limited): the new delay, the
+difference from ranging, and the fine delay the stock driver would
+program. Unlike the stock driver, an unstable read is not acted on. The
+fine delay goes back to the board base on O2, before the next ranging.
+
+Writing the correction is a new mechanism here, without field
+validation, and the stock binary gates it on an SCU strap (0x8c bit 29
+on this chip family) that we do not read. So only the log is on by
+default; airoha_xpon.gpon_relock_comp=1 (0644) applies the correction.
+Only PHY 0x2d4 is read, as patch 995 already does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 126 ++++++++++++++++++++--
+ drivers/net/ethernet/airoha/airoha_xpon.h |   4 +
+ 2 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index a3cccc0..af1e6e5 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -613,6 +613,7 @@ static int gpon_prepare_hardware(struct xpon_priv *priv)
+ 	gpon_rmw(priv, GPON_DBG_DLY, DBG_DLY_FINE_INT_MASK,
+ 		 FIELD_PREP(DBG_DLY_FINE_INT_MASK,
+ 			    priv->match_data->gpon_fine_delay));
++	priv->fine_delay = priv->match_data->gpon_fine_delay;
+ 	if (!priv->match_data->en7523_gpon_defaults &&
+ 	    !priv->match_data->gpon_reset_dbg_dly &&
+ 	    !priv->match_data->gpon_adjust_rx_delay)
+@@ -2747,12 +2748,111 @@ DEFINE_DEBUGFS_ATTRIBUTE(gpon_lab_err_ctrl_fops, gpon_lab_err_ctrl_get,
+ 			 gpon_lab_err_ctrl_set, "0x%08llx\n");
+ 
+ /*
+- * The vendor driver stores the PHY psync-to-SOF delay on reaching O5
+- * and, when the PHY relocks without a new ranging, moves the MAC fine
+- * delay by half the change. That path (O6 left through a Popup within
+- * TO2) has not been seen on the XR500v yet: log the delay so that it can
+- * be measured before anything is corrected.
++ * PHY relock compensation, as the stock gpon_detect_phy_ready() does it
++ * (checked in its disassembly):
++ *  - the psync-to-SOF delay (PHY 0x2d4[15:0], 4 upstream bits per unit) is
++ *    the reference taken on reaching O5;
++ *  - after a relock it is read every 1 ms until three reads agree (at most
++ *    ten);
++ *  - diff = now - reference; if |diff| <= 15 the MAC fine delay
++ *    DBG_DLY[15:8] is set to base + diff / 2 (truncated, absolute, one
++ *    fine step is 8 bits), otherwise nothing is changed;
++ *  - base is the board fine delay: 0x14 on this board (match data), not the
++ *    0x1c default the stock binary starts from and its board config then
++ *    overrides (the stock O5 register reads fine 0x14, which 0x1c +/- 7
++ *    cannot reach).
++ * This driver has no PHY-ready interrupt, so the delay is also sampled by
++ * the 250 ms link poll in O5: a relock shorter than the poll leaves no LOS
++ * trace but still moves the delay. A change is always logged; applying the
++ * correction is a new mechanism here, with no field validation yet, and
++ * the stock binary gates it on an SCU strap we cannot read back, so it is
++ * off unless airoha_xpon.gpon_relock_comp=1.
+  */
++static bool gpon_relock_comp;
++module_param(gpon_relock_comp, bool, 0644);
++MODULE_PARM_DESC(gpon_relock_comp,
++		 "Correct the MAC fine delay after a PHY relock in O5, as the stock driver (default: off, log only)");
++
++#define GPON_RELOCK_MAX_DIFF	15
++
++static void gpon_set_fine_delay(struct xpon_priv *priv, u8 fine)
++{
++	gpon_rmw(priv, GPON_DBG_DLY, DBG_DLY_FINE_INT_MASK,
++		 FIELD_PREP(DBG_DLY_FINE_INT_MASK, fine));
++	priv->fine_delay = fine;
++}
++
++/* Stock: up to ten reads 1 ms apart, three equal in a row. */
++static bool gpon_psync_read_stable(struct xpon_priv *priv, u32 *delay)
++{
++	u32 prev = *delay, cur;
++	int same = 1, i;
++
++	for (i = 0; i < 10 && same < 3; i++) {
++		usleep_range(1000, 1200);
++		if (airoha_xpon_phy_get_psync_sof_delay(priv->phy, &cur))
++			return false;
++		same = cur == prev ? same + 1 : 1;
++		prev = cur;
++	}
++
++	*delay = prev;
++	return same >= 3;
++}
++
++static void gpon_psync_check(struct xpon_priv *priv)
++{
++	u8 base = priv->match_data->gpon_fine_delay, fine;
++	u32 delay, prev;
++	int diff;
++
++	if (priv->psync_sof_o5 == U32_MAX ||
++	    airoha_xpon_phy_get_psync_sof_delay(priv->phy, &delay) ||
++	    delay == priv->psync_sof_last)
++		return;
++
++	if (!gpon_psync_read_stable(priv, &delay)) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON PHY psync-to-SOF delay unstable in O5 (last %u), not compensating\n",
++				     delay);
++		return;
++	}
++	if (delay == priv->psync_sof_last)
++		return;
++
++	prev = priv->psync_sof_last;
++	priv->psync_sof_last = delay;
++	diff = (int)delay - (int)priv->psync_sof_o5;
++
++	if (abs(diff) > GPON_RELOCK_MAX_DIFF) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON PHY relock in O5: psync-to-SOF %u -> %u, %d from ranging: outside +/-%d, MAC fine delay left at %#x\n",
++				     prev, delay, diff, GPON_RELOCK_MAX_DIFF,
++				     priv->fine_delay);
++		return;
++	}
++
++	fine = base + diff / 2;
++	if (fine == priv->fine_delay) {
++		dev_info_ratelimited(priv->dev,
++				     "GPON PHY relock in O5: psync-to-SOF %u -> %u, %d from ranging, MAC fine delay %#x unchanged\n",
++				     prev, delay, diff, fine);
++		return;
++	}
++
++	if (!READ_ONCE(gpon_relock_comp)) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON PHY relock in O5: psync-to-SOF %u -> %u, %d from ranging; stock would set MAC fine delay %#x -> %#x (gpon_relock_comp=0)\n",
++				     prev, delay, diff, priv->fine_delay, fine);
++		return;
++	}
++
++	dev_warn_ratelimited(priv->dev,
++			     "GPON PHY relock in O5: psync-to-SOF %u -> %u, %d from ranging: MAC fine delay %#x -> %#x\n",
++			     prev, delay, diff, priv->fine_delay, fine);
++	gpon_set_fine_delay(priv, fine);
++}
++
+ static void gpon_log_psync_sof(struct xpon_priv *priv, const char *when)
+ {
+ 	u32 delay;
+@@ -2761,6 +2861,7 @@ static void gpon_log_psync_sof(struct xpon_priv *priv, const char *when)
+ 		return;
+ 	if (priv->psync_sof_o5 == U32_MAX) {
+ 		priv->psync_sof_o5 = delay;
++		priv->psync_sof_last = delay;
+ 		dev_info(priv->dev, "GPON %s: PHY psync-to-SOF delay %u\n",
+ 			 when, delay);
+ 		return;
+@@ -2900,6 +3001,15 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		priv->bit_delay = 0;
+ 		gpon_set_bit_delay(priv, 0);
+ 		priv->psync_sof_o5 = U32_MAX;
++		/* A new ranging measures against the board fine delay. */
++		if (priv->fine_delay != priv->match_data->gpon_fine_delay) {
++			dev_info_ratelimited(priv->dev,
++					     "GPON O2: MAC fine delay %#x -> %#x for the next ranging\n",
++					     priv->fine_delay,
++					     priv->match_data->gpon_fine_delay);
++			gpon_set_fine_delay(priv,
++					    priv->match_data->gpon_fine_delay);
++		}
+ 		/*
+ 		 * TO1 limits the serial-number and ranging states; O2 waits
+ 		 * for Upstream_Overhead without a timeout. The stock driver
+@@ -2927,6 +3037,8 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 			 ploam_get_onu_id(priv->ploam),
+ 			 gpon_read(priv, GPON_DBG_PLOAMD_FILTER));
+ 		gpon_log_psync_sof(priv, "O5");
++		/* Back from O6 without a new ranging: check for a relock now. */
++		gpon_psync_check(priv);
+ 		gpon_lab_o5_config(priv);
+ 		break;
+ 	case GPON_O6_POPUP:
+@@ -3540,8 +3652,10 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 	}
+ 
+ 	if (link && priv->mode == AIROHA_XPON_MODE_GPON &&
+-	    ploam_get_state(priv->ploam) == GPON_O5_OPERATION)
++	    ploam_get_state(priv->ploam) == GPON_O5_OPERATION) {
+ 		gpon_bip_poll(priv);
++		gpon_psync_check(priv);
++	}
+ 
+ 	if (!link && priv->mode == AIROHA_XPON_MODE_GPON &&
+ 	    ploam_get_state(priv->ploam) == GPON_O5_OPERATION) {
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index f91f7cf..291787c 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -563,6 +563,10 @@ struct xpon_priv {
+ 	u32			bit_delay;
+ 	/* PHY psync-to-SOF delay when this session reached O5, or U32_MAX */
+ 	u32			psync_sof_o5;
++	/* Last stable psync-to-SOF delay seen in O5 */
++	u32			psync_sof_last;
++	/* MAC fine delay (DBG_DLY[15:8]) currently programmed */
++	u8			fine_delay;
+ 
+ 	/* Consecutive TO1 expiries; cleared on O5. */
+ 	unsigned int		to1_failures;

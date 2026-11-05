@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:21:21 -0300
+Subject: [PATCH 48/48] net: xpon: omci: ignore an extended OMCC version
+ instead of failing
+
+"stay on the baseline message set" refused the OMCC version code points
+that announce the extended message set with -EINVAL. The OMCI agent
+configuration applies its keys one by one and stops at the first error,
+so such a value also left the hardware and software versions and the
+reboot policy that follow it unapplied.
+
+Keep the current OMCC version and warn instead, so that only that one
+value is ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 3a83581..0c2ff80 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -5532,10 +5532,22 @@ __omci_agent_config_set_source(struct omci_device *odev, u16 key,
+ 			break;
+ 		}
+ 		scalar = *(const u8 *)value;
+-		if (!scalar || omci_omcc_version_extended(scalar)) {
++		if (!scalar) {
+ 			ret = -EINVAL;
+ 			break;
+ 		}
++		/*
++		 * The agent only speaks the baseline message set. Ignore a
++		 * code point that announces the extended one, but do not fail:
++		 * a configuration applies its keys in order and would stop
++		 * before the hardware and software versions.
++		 */
++		if (omci_omcc_version_extended(scalar)) {
++			dev_warn(odev->parent,
++				 "OMCC version %#04x announces the extended message set, ignored (keeping %#04x)\n",
++				 scalar, agent->config.omcc_version);
++			break;
++		}
+ 		changed = agent->config.omcc_version != scalar;
+ 		agent->config.omcc_version = scalar;
+ 		agent->config.omcc_version_source = source;

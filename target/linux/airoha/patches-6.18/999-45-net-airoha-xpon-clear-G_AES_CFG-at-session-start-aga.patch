@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:01:22 -0300
+Subject: [PATCH 36/48] net: airoha: xpon: clear G_AES_CFG at session start
+ again
+
+"switch the AES key the way the stock driver does" also stopped
+gpon_enable() from writing G_AES_CFG = 0, and its message wrongly said
+the field link does not use that path: session start is on it. The
+stock driver does not need that write because it resets the MAC
+between sessions (gpon_dev_reset_GPON_MAC()), which returns 0x4060 to
+its reset value. The EN751221 MAC is not reset here, so a
+Key_Switching_Time programmed in one session stayed armed in the next
+and could switch to the freshly loaded shadow key at a stale
+superframe. Write G_AES_CFG = 0 at every session start again, as before
+the series; only Request_Key leaves the register alone, as the stock
+driver does.
+
+While here:
+ - Key_Switching_Time with a software switch (switch time 0) that the
+   MAC does not confirm in 3 ms (bit 31 of 0x4084) is no longer
+   acknowledged: set_key_switch_time() returns an error, in line with
+   "acknowledge only commands that were applied in O5".
+ - Test the raw 32-bit value for the software switch, as
+   gponDevSetKeySwithTime() does, not bits 29:0.
+ - Limit the stock sequence (0x4060 read-modify-write, 0x4084) to the
+   EN751221 it was checked against; other SoCs keep the old writes.
+
+The Movistar/Huawei OLT sends neither Request_Key nor Key_Switching_Time,
+so for the field link only the session-start write matters, and that is
+now the same as before the series.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c |  3 +-
+ drivers/net/ethernet/airoha/airoha_ploam.h |  5 +-
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 58 ++++++++++++++--------
+ 3 files changed, 42 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 1717f6d..59479ef 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -591,7 +591,8 @@ static void handle_key_switching_time(struct ploam_priv *pp,
+ 		return;
+ 
+ 	superframe = get_unaligned_be32(&c[0]);
+-	pp->ops->set_key_switch_time(pp->hw_priv, superframe);
++	if (pp->ops->set_key_switch_time(pp->hw_priv, superframe))
++		return;
+ 
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 4eebbef..5294baf 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -111,7 +111,8 @@ struct ploam_msg {
+  *   delim/delay_mode/delay_time go to the PHY and G_PRE_ASSIGNED_DLY.
+  * @set_t3_preamble: program G_PLOu_PRMBL_TYPE3 from Extended_Burst_Length.
+  * @set_key_switch_time: write the AES key-switch superframe counter to
+- *   G_AES_CFG so the shadow key becomes active at the OLT-specified frame.
++ *   G_AES_CFG so the shadow key becomes active at the OLT-specified frame;
++ *   return zero once programmed (the message is acknowledged only then).
+  * @request_new_key: OLT sent Request_Key; hardware generates a random key,
+  *   loads it into shadow registers, returns the key via the aes_key array.
+  * @set_ber_interval: update BER reporting timer to @interval_ms.
+@@ -142,7 +143,7 @@ struct ploam_ops {
+ 			     u8 t3_pbits, const u8 delim[3],
+ 			     bool delay_mode, u16 delay_time);
+ 	void (*set_t3_preamble)(void *priv, u8 o3_t3, u8 o5_t3);
+-	void (*set_key_switch_time)(void *priv, u32 superframe);
++	int (*set_key_switch_time)(void *priv, u32 superframe);
+ 	void (*request_new_key)(void *priv);
+ 	void (*set_ber_interval)(void *priv, u32 interval_ms);
+ 	int (*set_omci_gem)(void *priv, u16 gem_port_id, bool valid);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 31280b0..b00b7e5 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -891,17 +891,27 @@ static void gpon_set_serial_number_regs(struct xpon_priv *priv)
+ /*
+  * Follow the stock key switch (gponDevSetEncryptKey/gponDevSetKeySwithTime):
+  * Request_Key only loads the shadow key, Key_Switching_Time updates bits
+- * 29:0 of G_AES_CFG and keeps bits 31:30, and superframe 0 switches the key
+- * by software through G_AES_SW_SWITCH. The old behaviour wrote the whole
+- * register, 0 on every Request_Key and on every session start.
++ * 29:0 of G_AES_CFG and keeps bits 31:30, and a switch time of 0 switches
++ * the key by software through G_AES_SW_SWITCH. The old behaviour wrote the
++ * whole register, 0 on every Request_Key. Session start still writes
++ * G_AES_CFG = 0 either way: the stock driver gets the same from its MAC
++ * reset, and a switch time left by the previous session must not fire in
++ * the next one. EN751221 only (checked against its stock driver).
+  */
+ static bool gpon_aes_stock_switch = true;
+ module_param(gpon_aes_stock_switch, bool, 0644);
+ MODULE_PARM_DESC(gpon_aes_stock_switch,
+ 		 "Program the AES key switch like the stock driver (default: on)");
+ 
++static bool gpon_aes_stock(struct xpon_priv *priv)
++{
++	return READ_ONCE(gpon_aes_stock_switch) &&
++	       gpon_stock_en751221_csr(priv);
++}
++
++/* @reset_switch: also clear G_AES_CFG, i.e. drop any pending key switch. */
+ static void gpon_load_aes_shadow(struct xpon_priv *priv, const u8 key[16],
+-				  u32 switch_superframe)
++				  bool reset_switch)
+ {
+ 	int i;
+ 
+@@ -915,12 +925,8 @@ static void gpon_load_aes_shadow(struct xpon_priv *priv, const u8 key[16],
+ 		gpon_write(priv, GPON_AES_SHADOW_KEY0 + i * 4,
+ 			   get_unaligned_be32(key + (3 - i) * 4));
+ 
+-	/* The stock driver never touches G_AES_CFG when loading a key. */
+-	if (READ_ONCE(gpon_aes_stock_switch))
+-		return;
+-
+-	gpon_write(priv, GPON_AES_CFG,
+-		   switch_superframe & AES_KEY_SWITCH_CNT_MASK);
++	if (reset_switch)
++		gpon_write(priv, GPON_AES_CFG, 0);
+ }
+ 
+ static int __gpon_set_tcont_hw(struct xpon_priv *priv, unsigned int index,
+@@ -1932,20 +1938,22 @@ static void gpon_cb_set_t3_preamble(void *hw_priv, u8 o3_t3, u8 o5_t3)
+ 			 ret);
+ }
+ 
+-static void gpon_cb_set_key_switch_time(void *hw_priv, u32 superframe)
++/* Returns 0 once the switch is programmed: the PLOAM layer then ACKs it. */
++static int gpon_cb_set_key_switch_time(void *hw_priv, u32 superframe)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+ 	u32 sf = superframe & AES_KEY_SWITCH_CNT_MASK;
+ 	u32 val;
+ 	int ret;
+ 
+-	if (!READ_ONCE(gpon_aes_stock_switch)) {
++	if (!gpon_aes_stock(priv)) {
+ 		dev_info(priv->dev, "GPON AES key switch superframe=%u\n", sf);
+ 		gpon_write(priv, GPON_AES_CFG, sf);
+-		return;
++		return 0;
+ 	}
+ 
+-	if (!sf) {
++	/* The stock driver tests the raw value, not bits 29:0. */
++	if (!superframe) {
+ 		/*
+ 		 * gponDevSetKeySwithTime(0) switches at once by software: write
+ 		 * 1 to G_AES_SW_SWITCH and wait for bit 31 (up to 3 ms).
+@@ -1954,14 +1962,18 @@ static void gpon_cb_set_key_switch_time(void *hw_priv, u32 superframe)
+ 		ret = readl_poll_timeout(priv->gpon_reg + GPON_AES_SW_SWITCH,
+ 					 val, val & AES_SW_SWITCH_DONE, 10,
+ 					 3000);
+-		dev_info(priv->dev,
+-			 "GPON AES key switch by software (superframe 0)%s\n",
+-			 ret ? ": not confirmed by the MAC" : "");
+-		return;
++		if (ret)
++			dev_warn(priv->dev,
++				 "GPON AES key switch by software not confirmed by the MAC, not acknowledging it\n");
++		else
++			dev_info(priv->dev,
++				 "GPON AES key switch by software (superframe 0)\n");
++		return ret;
+ 	}
+ 
+ 	dev_info(priv->dev, "GPON AES key switch superframe=%u\n", sf);
+ 	gpon_rmw(priv, GPON_AES_CFG, AES_KEY_SWITCH_CNT_MASK, sf);
++	return 0;
+ }
+ 
+ static void gpon_cb_request_new_key(void *hw_priv)
+@@ -1970,8 +1982,11 @@ static void gpon_cb_request_new_key(void *hw_priv)
+ 
+ 	dev_info(priv->dev, "GPON generating a new AES key\n");
+ 	get_random_bytes(priv->aes_key, 16);
+-	/* Load into shadow registers; switch time set later by Key_Switching_Time */
+-	gpon_load_aes_shadow(priv, priv->aes_key, 0);
++	/*
++	 * Load into shadow registers; switch time set later by
++	 * Key_Switching_Time. The stock driver leaves G_AES_CFG alone here.
++	 */
++	gpon_load_aes_shadow(priv, priv->aes_key, !gpon_aes_stock(priv));
+ 	/* Inform PLOAM layer of the key so it can transmit Encryption_Key */
+ 	ploam_set_aes_key(priv->ploam, priv->aes_key);
+ }
+@@ -3383,7 +3398,8 @@ static int gpon_enable(struct xpon_priv *priv)
+ 	}
+ 
+ 	gpon_set_serial_number_regs(priv);
+-	gpon_load_aes_shadow(priv, priv->aes_key, 0);
++	/* No switch time from the previous session may survive into this one. */
++	gpon_load_aes_shadow(priv, priv->aes_key, true);
+ 	/*
+ 	 * Nothing flushes the upstream PLOAM FIFO between sessions here; a
+ 	 * smaller free count than after boot means the previous session left

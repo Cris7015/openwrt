@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:28:54 -0300
+Subject: [PATCH 34/48] net: xpon: omci: size the Get layout buffer from the
+ layouts
+
+The priority queue and traffic scheduler Get paths convert their layout
+into a stack buffer of attribute descriptors. Size it from the priority
+queue layout and check at build time that the traffic scheduler one
+fits, instead of a separate constant that could drift.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 90bc151..4658e81 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -92,8 +92,6 @@ static bool omci_agent_result_can_be_faked(u8 result)
+ #define OMCI_PRIORITY_QUEUE_BP_OCCUR_MASK	0x0020
+ #define OMCI_PRIORITY_QUEUE_BP_CLEAR_MASK	0x0010
+ 
+-#define OMCI_PRIORITY_QUEUE_ATTRS		12
+-
+ #define OMCI_TRAFFIC_SCHEDULER_TCONT_MASK	0x8000
+ #define OMCI_TRAFFIC_SCHEDULER_PARENT_MASK	0x4000
+ #define OMCI_TRAFFIC_SCHEDULER_POLICY_MASK	0x2000
+@@ -4310,7 +4308,7 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 				size_t response_capacity,
+ 				size_t *response_len)
+ {
+-	struct omci_attr_desc layout[OMCI_PRIORITY_QUEUE_ATTRS];
++	struct omci_attr_desc layout[ARRAY_SIZE(omci_priority_queue_layout)];
+ 	struct omci_agent *agent = &odev->agent;
+ 	const struct omci_attr_desc *attrs;
+ 	const struct omci_me_desc *desc;
+@@ -4320,6 +4318,8 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 	u16 failed = 0;
+ 	u16 mask;
+ 
++	BUILD_BUG_ON(ARRAY_SIZE(omci_traffic_scheduler_layout) >
++		     ARRAY_SIZE(omci_priority_queue_layout));
+ 	if (content_len < 2 || response_capacity < 1)
+ 		return OMCI_RESULT_PARAMETER_ERROR;
+ 	mask = get_unaligned_be16(content);

@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:04:35 -0300
+Subject: [PATCH 43/48] net: airoha: ploam: say why an O7 ONU ignores PLOAMs
+
+Setting pp->onu_id to 0xFF in O7 makes messages directed to the old
+ONU-ID fail the ONU-ID filter. 0xFF is also the broadcast ID, though, so
+broadcasts still pass the filter and the "onu_id != pp->onu_id" checks of
+the directed handlers; what keeps an O7 ONU from acting on them are the
+per-handler state checks, as in O1-O3. Spell that out in the comment.
+
+Corrections to earlier messages of this series, which are left as they
+are:
+ - "do not arm TO1 in O2" (f3086a2) said the O2 arming queued a
+   pointless work "every 10 s". It was one per O2 entry: the TO1 handler
+   returns in O2 without re-arming.
+ - "do not carry a stopped session into the next activation" (ab9afd0)
+   has the same inexact wording as the comment fixed here.
+
+No functional change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 59479ef..97db290 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -382,8 +382,12 @@ static void handle_disable_sn(struct ploam_priv *pp,
+ 			pp->emergency_state = true;
+ 			/*
+ 			 * An ONU in O7 does not respond to the OLT. Drop the
+-			 * ONU-ID so directed messages to it, possibly meant for
+-			 * another ONU the OLT gives the ID to, are ignored.
++			 * ONU-ID so messages directed to the old one, possibly
++			 * meant for another ONU the OLT gives the ID to, fail
++			 * the ONU-ID filter. 0xFF is also the broadcast ID, so
++			 * broadcasts (and the handlers' "own ONU-ID" checks)
++			 * still pass, as in O1-O3; the per-handler state checks
++			 * are what keep an O7 ONU from acting on them.
+ 			 */
+ 			pp->onu_id = PLOAM_ONU_UNASSIGNED;
+ 			ploam_set_state(pp, GPON_O7_EMERGENCY_STOP);

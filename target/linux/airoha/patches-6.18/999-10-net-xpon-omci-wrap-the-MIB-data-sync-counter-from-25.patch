@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:01:12 -0300
+Subject: [PATCH 01/48] net: xpon: omci: wrap the MIB data sync counter from
+ 255 to 1
+
+G.988 (ONU data, MIB data sync; MIB synchronisation annex) reserves the
+value 0 for the state right after a MIB reset or instantiation. Every
+successful Create, Delete and Set from the OLT moves the counter on, and
+it wraps from 255 to 1. The OLT keeps the same sequence and audits it
+against the ONU data ME.
+
+The agent incremented a u8 and so went from 255 to 0. After 256 changes
+since the last MIB reset the ONU reported "just reset" and from then on
+stayed one behind the OLT on every wrap, which a MIB audit treats as a
+lost MIB and answers with a MIB reset and a full re-provisioning.
+
+MIB data sync is also writable. A Set of it stored the value and then
+counted the Set on top, so what the OLT wrote never read back. Keep the
+written value instead of incrementing in that case.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 19 +++++++++++++++++--
+ net/xpon/omci/me.h    |  2 ++
+ 2 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 708c896..7acc45d 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -703,9 +703,16 @@ static void omci_agent_set_mib_sync_locked(struct omci_agent *agent, u8 sync)
+ 		object->data[0] = sync;
+ }
+ 
++/*
++ * G.988 ONU data, MIB data sync: 0 only follows a MIB reset; each
++ * successful Create, Delete and Set the OLT sends moves it on, from 255
++ * to 1, never back to 0.
++ */
+ static void omci_agent_increment_mib_sync_locked(struct omci_agent *agent)
+ {
+-	omci_agent_set_mib_sync_locked(agent, (u8)(agent->mib_sync + 1));
++	u8 sync = agent->mib_sync + 1;
++
++	omci_agent_set_mib_sync_locked(agent, sync ? sync : 1);
+ }
+ 
+ static int omci_mib_store_locked(struct omci_agent *agent,
+@@ -3935,7 +3942,15 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 		if (ret)
+ 			goto rollback_processing;
+ 	}
+-	omci_agent_increment_mib_sync_locked(agent);
++	/*
++	 * MIB data sync is writable: the OLT aligns its copy by setting it,
++	 * so keep the value it wrote instead of counting the Set on top.
++	 */
++	if (class_id == OMCI_CLASS_ONU_DATA && !entity_id &&
++	    (mask & OMCI_ONU_DATA_MIB_SYNC_MASK))
++		omci_agent_set_mib_sync_locked(agent, object->data[0]);
++	else
++		omci_agent_increment_mib_sync_locked(agent);
+ 	ret = OMCI_RESULT_SUCCESS;
+ 	goto out_free_previous;
+ 
+diff --git a/net/xpon/omci/me.h b/net/xpon/omci/me.h
+index 11ae49b..ca150a6 100644
+--- a/net/xpon/omci/me.h
++++ b/net/xpon/omci/me.h
+@@ -11,6 +11,8 @@ struct omci_me_class;
+ struct omci_mib_object;
+ 
+ #define OMCI_CLASS_ONU_DATA		2
++/* ONU data attribute 1, MIB data sync */
++#define OMCI_ONU_DATA_MIB_SYNC_MASK	BIT(15)
+ #define OMCI_CLASS_CARDHOLDER		5
+ #define OMCI_CLASS_CIRCUIT_PACK		6
+ #define OMCI_CLASS_SOFTWARE_IMAGE	7

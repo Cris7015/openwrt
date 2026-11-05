@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:04:03 -0300
+Subject: [PATCH 39/48] net: airoha: xpon: put the SN delay back when random
+ delay is turned off
+
+With gpon_sn_random_delay cleared at runtime, the last random value
+stayed in G_SN_MSG_CFG[11:0] until the next session start, and the soft
+TO1 -> O2 -> O3 cycles kept answering serial-number requests with it.
+Remember the field before the first random draw and write it back on
+the next O3 entry or serial-number send after the parameter is cleared.
+With the parameter never set nothing is written, as before.
+
+The description now also says that it is not verified whether the MAC
+applies the delay or only reports it in Serial_Number_ONU; if it only
+reports it the OLT would compute the RTD up to 48 us off, so it must be
+tested before it is enabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 27 ++++++++++++++++++++---
+ drivers/net/ethernet/airoha/airoha_xpon.h |  3 +++
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 7690dfd..e263f16 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -736,16 +736,35 @@ static void gpon_set_o5_ploam_filter(struct xpon_priv *priv, bool o5)
+ static bool gpon_sn_random_delay;
+ module_param(gpon_sn_random_delay, bool, 0644);
+ MODULE_PARM_DESC(gpon_sn_random_delay,
+-		 "Randomise the Serial_Number_ONU delay (0..48 us) in O3 (default: off)");
++		 "Randomise the Serial_Number_ONU delay (0..48 us) in O3; not verified that the MAC applies it rather than only reporting it, test first (default: off)");
+ 
+ /* 48 us / (256 bits / 1.24416 Gbit/s) */
+ #define GPON_SN_RANDOM_DELAY_MAX	233
+ 
++/*
++ * Draws a new delay while the parameter is set. When it is cleared, the
++ * field gets back the value it had before the first random draw, so the
++ * soft TO1 -> O2 -> O3 cycles do not keep answering with a stale delay.
++ */
+ static void gpon_sn_new_random_delay(struct xpon_priv *priv)
+ {
+-	if (!READ_ONCE(gpon_sn_random_delay))
++	if (!READ_ONCE(gpon_sn_random_delay)) {
++		if (priv->sn_delay_saved) {
++			gpon_rmw(priv, GPON_SN_MSG_CFG,
++				 SN_MSG_CFG_RANDOM_DELAY_MASK,
++				 FIELD_PREP(SN_MSG_CFG_RANDOM_DELAY_MASK,
++					    priv->sn_delay_orig));
++			priv->sn_delay_saved = false;
++		}
+ 		return;
++	}
+ 
++	if (!priv->sn_delay_saved) {
++		priv->sn_delay_orig = FIELD_GET(SN_MSG_CFG_RANDOM_DELAY_MASK,
++						gpon_read(priv,
++							  GPON_SN_MSG_CFG));
++		priv->sn_delay_saved = true;
++	}
+ 	gpon_rmw(priv, GPON_SN_MSG_CFG, SN_MSG_CFG_RANDOM_DELAY_MASK,
+ 		 FIELD_PREP(SN_MSG_CFG_RANDOM_DELAY_MASK,
+ 			    get_random_u32_below(GPON_SN_RANDOM_DELAY_MAX + 1)));
+@@ -781,6 +800,8 @@ static void gpon_reset_activation_context(struct xpon_priv *priv)
+ 				     priv->match_data->gpon_sn_tx_power_mode);
+ 	}
+ 	gpon_write(priv, GPON_SN_MSG_CFG, sn_cfg);
++	/* The random delay field was just rewritten for this session. */
++	priv->sn_delay_saved = false;
+ 	priv->byte_delay = 0;
+ 	priv->bit_delay = 0;
+ }
+@@ -3173,8 +3194,8 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		cancel_delayed_work(&priv->to1_work);
+ 		break;
+ 	case GPON_O3_SERIAL_NUMBER:
++		gpon_sn_new_random_delay(priv);
+ 		if (READ_ONCE(gpon_sn_random_delay)) {
+-			gpon_sn_new_random_delay(priv);
+ 			dev_info_ratelimited(priv->dev,
+ 					     "GPON O3: Serial_Number_ONU random delay %lu x 32 bytes\n",
+ 					     FIELD_GET(SN_MSG_CFG_RANDOM_DELAY_MASK,
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 4a299fd..f38b90e 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -583,6 +583,9 @@ struct xpon_priv {
+ 	const char		*restart_reason;
+ 	/* In O1 because of LOS/LOF in O2-O4; O2 again when the link is back */
+ 	bool			los_in_o1;
++	/* G_SN_MSG_CFG random delay before gpon_sn_random_delay drew one */
++	u16			sn_delay_orig;
++	bool			sn_delay_saved;
+ 	/* PLOAMD_FILTER_IN_O5 bits 0/8 as found before the first write */
+ 	u32			ploamd_filter_boot;
+ 	bool			ploamd_filter_saved;

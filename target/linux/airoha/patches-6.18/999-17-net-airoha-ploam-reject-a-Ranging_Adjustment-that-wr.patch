@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:03:21 -0300
+Subject: [PATCH 08/48] net: airoha: ploam: reject a Ranging_Adjustment that
+ wraps the EqD
+
+handle_ranging_adjustment() computed the new equalisation delay as
+pp->eqd -/+ offset in u32 without any bound. A decrease larger than the
+ranged EqD (or an increase past U32_MAX) wrapped around, and the
+resulting value went straight to adjust_eqd_o5(), which would move every
+upstream burst by an absurd amount and take the ONU off the PON.
+
+An EqD is a non-negative bit count, so such a message cannot be a valid
+adjustment. Keep the ranged EqD, log the message (rate limited) and do
+not acknowledge it, so the OLT sees the command was not executed.
+
+The Huawei OLT this was tested against never sends Ranging_Adjustment;
+the change only affects malformed messages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 6137733..898fd30 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -13,6 +13,8 @@
+  * content bytes are compared, matching the seven-byte vendor comparison.
+  */
+ 
++#include <linux/limits.h>
++#include <linux/printk.h>
+ #include <linux/slab.h>
+ #include <linux/random.h>
+ #include <linux/string.h>
+@@ -582,6 +584,19 @@ static void handle_ranging_adjustment(struct ploam_priv *pp,
+ 		/* c[0] BE: bits[7:2]=resv, bit[1]=s_bit, bit[0]=resv */
+ 		s_bit = (c[0] >> 1) & 1;
+ 		eqd_offset = get_unaligned_be32(&c[1]);
++		/*
++		 * The EqD is an unsigned bit count. A decrease larger than the
++		 * current EqD, or an increase that wraps it, cannot be a valid
++		 * adjustment: applying it would move the bursts by ~2^32 bits.
++		 * Keep the ranged EqD and do not acknowledge the message.
++		 */
++		if (s_bit ? eqd_offset > pp->eqd :
++			    eqd_offset > U32_MAX - pp->eqd) {
++			pr_warn_ratelimited("airoha-ploam: ignoring Ranging_Adjustment %c%u on EqD %u: out of range\n",
++					    s_bit ? '-' : '+', eqd_offset,
++					    pp->eqd);
++			return;
++		}
+ 		if (eqd_offset != 0) {
+ 			u32 new_eqd = s_bit ? pp->eqd - eqd_offset
+ 					    : pp->eqd + eqd_offset;

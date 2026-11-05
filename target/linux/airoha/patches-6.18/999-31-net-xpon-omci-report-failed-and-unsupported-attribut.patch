@@ -1,0 +1,1038 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:15:10 -0300
+Subject: [PATCH 22/48] net: xpon: omci: report failed and unsupported
+ attributes with result 9
+
+G.988 (Annex A) defines result 9, "attribute(s) failed or unknown", for
+Get and Set. A baseline Get response then carries the values of the
+attributes that could be read, the optional-attribute mask (attributes
+the ONU does not support) in content bytes 29-30 and the attribute
+execution mask (attributes that failed, including those that do not fit)
+in bytes 31-32. A Set response carries the same two masks in bytes 2-5.
+
+Except for ME 341, the agent answered every such Get with a lone result
+byte: build_response() truncated the content, and the failure paths had
+put the mask where the extended layout keeps it anyway. The OLT could not
+tell which attribute failed and got none of the values it could have
+read. A Set with an attribute the descriptor does not know, or one that
+is read-only, came back as "parameter error".
+
+Lay out every Get response through one encoder, shared by the managed
+entities with a descriptor, ONU-G, ONU2-G, priority queues, traffic
+schedulers and the ANI-G optical levels. A Get that is answered in full
+keeps exactly its previous bytes, including the up to 29 bytes of values
+the agent has always returned, so nothing the OLT reads today changes.
+Answer a Set that names unsupported or read-only attributes with result
+9 and the two masks; for a non-datapath ME, apply the attributes that
+precede any unknown one, while a datapath ME stays all or nothing.
+
+Count these answers in a new agent_attribute_failures sysfs attribute.
+
+A userspace comparison of every attribute mask on the provisioned ME
+instances shows no difference for any Get the agent answered with
+success before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c    | 459 +++++++++++++++++----------------------
+ net/xpon/omci/internal.h |   2 +
+ net/xpon/omci/me.c       | 178 +++++++++++++--
+ net/xpon/omci/me.h       |  36 ++-
+ net/xpon/omci/sysfs.c    |   2 +
+ 5 files changed, 395 insertions(+), 282 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index eb4a48b..e154d2c 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -52,15 +52,6 @@
+ /* Message type bit 6, acknowledgement */
+ #define OMCI_MSG_TYPE_AK		0x20
+ 
+-#define OMCI_RESULT_SUCCESS		0
+-#define OMCI_RESULT_PROCESSING_ERROR	1
+-#define OMCI_RESULT_NOT_SUPPORTED	2
+-#define OMCI_RESULT_PARAMETER_ERROR	3
+-#define OMCI_RESULT_UNKNOWN_ME		4
+-#define OMCI_RESULT_UNKNOWN_INSTANCE	5
+-#define OMCI_RESULT_DEVICE_BUSY	6
+-#define OMCI_RESULT_INSTANCE_EXISTS	7
+-#define OMCI_RESULT_ATTRIBUTE_FAILED	9
+ 
+ #define OMCI_BRIDGE_TP_PPTP_ETH_UNI	1
+ #define OMCI_BRIDGE_TP_8021P_MAPPER	3
+@@ -100,6 +91,8 @@ static bool omci_agent_result_can_be_faked(u8 result)
+ #define OMCI_PRIORITY_QUEUE_BP_OCCUR_MASK	0x0020
+ #define OMCI_PRIORITY_QUEUE_BP_CLEAR_MASK	0x0010
+ 
++#define OMCI_PRIORITY_QUEUE_ATTRS		12
++
+ #define OMCI_TRAFFIC_SCHEDULER_TCONT_MASK	0x8000
+ #define OMCI_TRAFFIC_SCHEDULER_PARENT_MASK	0x4000
+ #define OMCI_TRAFFIC_SCHEDULER_POLICY_MASK	0x2000
+@@ -212,48 +205,40 @@ static bool omci_omcc_version_extended(u8 version)
+ #define OMCI_OLT_G_TIME_OF_DAY_MASK	0x1000
+ #define OMCI_OLT_G_TIME_OF_DAY_LEN	14
+ 
+-#define OMCI_ONU_G_ATTR_MASK		GENMASK(15, 3)
+-#define OMCI_ONU2_G_ATTR_MASK		GENMASK(15, 2)
+-
+-#define OMCI_ATTR_VALUE_ZERO		U8_MAX
+-
+-struct omci_get_attr_layout {
+-	u16 mask;
+-	u8 offset;
+-	u8 len;
+-};
+-
+-static const struct omci_get_attr_layout omci_onu_g_attr_layout[] = {
+-	{ BIT(15), 0, 4 },		/* Vendor ID */
+-	{ BIT(14), 4, 14 },		/* Version */
+-	{ BIT(13), 18, 8 },		/* Serial number */
+-	{ BIT(12), 26, 1 },		/* Traffic management option */
+-	{ BIT(11), 27, 1 },		/* Deprecated */
+-	{ BIT(10), 28, 1 },		/* Battery backup */
+-	{ BIT(9), 29, 1 },		/* Administrative state */
+-	{ BIT(8), 30, 1 },		/* Operational state */
+-	{ BIT(7), 31, 1 },		/* ONU survival time */
+-	{ BIT(6), OMCI_ATTR_VALUE_ZERO, 24 },	/* Logical ONU ID */
+-	{ BIT(5), OMCI_ATTR_VALUE_ZERO, 12 },	/* Logical password */
+-	{ BIT(4), OMCI_ATTR_VALUE_ZERO, 1 },	/* Credentials status */
+-	{ BIT(3), OMCI_ATTR_VALUE_ZERO, 1 },	/* Extended TC layer */
++#define OMCI_ZERO	OMCI_ATTR_OFFSET_ZERO
++
++/* Attribute layout of the ONU-G and ONU2-G instances, G.988 order */
++static const struct omci_attr_desc omci_onu_g_attrs[] = {
++	OMCI_ATTR(15, 0, 4, OMCI_R),		/* Vendor ID */
++	OMCI_ATTR(14, 4, 14, OMCI_R),		/* Version */
++	OMCI_ATTR(13, 18, 8, OMCI_R),		/* Serial number */
++	OMCI_ATTR(12, 26, 1, OMCI_R),		/* Traffic management option */
++	OMCI_ATTR(11, 27, 1, OMCI_R),		/* Deprecated */
++	OMCI_ATTR(10, 28, 1, OMCI_R),		/* Battery backup */
++	OMCI_ATTR(9, 29, 1, OMCI_R),		/* Administrative state */
++	OMCI_ATTR(8, 30, 1, OMCI_R),		/* Operational state */
++	OMCI_ATTR(7, 31, 1, OMCI_R),		/* ONU survival time */
++	OMCI_ATTR(6, OMCI_ZERO, 24, OMCI_R),	/* Logical ONU ID */
++	OMCI_ATTR(5, OMCI_ZERO, 12, OMCI_R),	/* Logical password */
++	OMCI_ATTR(4, OMCI_ZERO, 1, OMCI_R),	/* Credentials status */
++	OMCI_ATTR(3, OMCI_ZERO, 1, OMCI_R),	/* Extended TC layer */
+ };
+ 
+-static const struct omci_get_attr_layout omci_onu2_g_attr_layout[] = {
+-	{ BIT(15), 0, 20 },		/* Equipment ID */
+-	{ BIT(14), 20, 1 },		/* OMCC version */
+-	{ BIT(13), 21, 2 },		/* Vendor product code */
+-	{ BIT(12), 23, 1 },		/* Security capability */
+-	{ BIT(11), 24, 1 },		/* Security mode */
+-	{ BIT(10), 25, 2 },		/* Total priority queues */
+-	{ BIT(9), 27, 1 },		/* Total traffic schedulers */
+-	{ BIT(8), 28, 1 },		/* Deprecated */
+-	{ BIT(7), 29, 2 },		/* Total GEM port IDs */
+-	{ BIT(6), OMCI_ATTR_VALUE_ZERO, 4 },	/* System uptime */
+-	{ BIT(5), OMCI_ATTR_VALUE_ZERO, 2 },	/* Connectivity capability */
+-	{ BIT(4), 31, 1 },		/* Connectivity mode */
+-	{ BIT(3), OMCI_ATTR_VALUE_ZERO, 2 },	/* QoS configuration */
+-	{ BIT(2), OMCI_ATTR_VALUE_ZERO, 2 },	/* Priority queue scale */
++static const struct omci_attr_desc omci_onu2_g_attrs[] = {
++	OMCI_ATTR(15, 0, 20, OMCI_R),		/* Equipment ID */
++	OMCI_ATTR(14, 20, 1, OMCI_R),		/* OMCC version */
++	OMCI_ATTR(13, 21, 2, OMCI_R),		/* Vendor product code */
++	OMCI_ATTR(12, 23, 1, OMCI_R),		/* Security capability */
++	OMCI_ATTR(11, 24, 1, OMCI_R),		/* Security mode */
++	OMCI_ATTR(10, 25, 2, OMCI_R),		/* Total priority queues */
++	OMCI_ATTR(9, 27, 1, OMCI_R),		/* Total traffic schedulers */
++	OMCI_ATTR(8, 28, 1, OMCI_R),		/* Deprecated */
++	OMCI_ATTR(7, 29, 2, OMCI_R),		/* Total GEM port IDs */
++	OMCI_ATTR(6, OMCI_ZERO, 4, OMCI_R),	/* System uptime */
++	OMCI_ATTR(5, OMCI_ZERO, 2, OMCI_R),	/* Connectivity capability */
++	OMCI_ATTR(4, 31, 1, OMCI_R),		/* Connectivity mode */
++	OMCI_ATTR(3, OMCI_ZERO, 2, OMCI_R),	/* QoS configuration */
++	OMCI_ATTR(2, OMCI_ZERO, 2, OMCI_R),	/* Priority queue scale */
+ };
+ 
+ static const u8 *omci_olt_g_consume(const u8 **data, size_t *len,
+@@ -602,51 +587,22 @@ static int omci_attr_parse_set(struct omci_mib_object *object, u16 mask,
+ 	return 0;
+ }
+ 
+-static int omci_attr_serialize(const struct omci_mib_object *object, u16 mask,
+-			       u8 *data, size_t len, size_t *encoded_len,
+-			       const struct omci_attr_layout *layout,
+-			       size_t layout_count, u16 supported_mask)
++/* A priority queue or traffic scheduler layout as Get encoder attributes */
++static unsigned int omci_layout_attrs(const struct omci_attr_layout *layout,
++				      size_t count,
++				      struct omci_attr_desc *attrs)
+ {
+-	size_t used = 0;
+ 	size_t i;
+ 
+-	if (mask & ~supported_mask)
+-		return -EINVAL;
+-
+-	for (i = 0; i < layout_count; i++) {
+-		if (!(mask & layout[i].mask))
+-			continue;
+-		if (len - used < layout[i].length)
+-			return -ENOSPC;
+-		memcpy(data + used, object->data + layout[i].offset,
+-		       layout[i].length);
+-		used += layout[i].length;
++	for (i = 0; i < count; i++) {
++		attrs[i].mask = layout[i].mask;
++		attrs[i].offset = layout[i].offset;
++		attrs[i].len = layout[i].length;
++		attrs[i].access = OMCI_ATTR_ACCESS_READ |
++				  OMCI_ATTR_ACCESS_WRITE;
+ 	}
+ 
+-	*encoded_len = used;
+-	return 0;
+-}
+-
+-static int
+-omci_priority_queue_serialize(const struct omci_mib_object *object,
+-			      u16 mask, u8 *data, size_t len,
+-			      size_t *encoded_len)
+-{
+-	return omci_attr_serialize(object, mask, data, len, encoded_len,
+-				   omci_priority_queue_layout,
+-				   ARRAY_SIZE(omci_priority_queue_layout),
+-				   OMCI_PRIORITY_QUEUE_ATTR_MASK);
+-}
+-
+-static int
+-omci_traffic_scheduler_serialize(const struct omci_mib_object *object,
+-				 u16 mask, u8 *data, size_t len,
+-				 size_t *encoded_len)
+-{
+-	return omci_attr_serialize(object, mask, data, len, encoded_len,
+-				   omci_traffic_scheduler_layout,
+-				   ARRAY_SIZE(omci_traffic_scheduler_layout),
+-				   OMCI_TRAFFIC_SCHEDULER_ATTR_MASK);
++	return count;
+ }
+ 
+ static int omci_mib_parse_create(struct omci_mib_object *object,
+@@ -3919,9 +3875,59 @@ out:
+ 	return result;
+ }
+ 
++/*
++ * Work out which attributes of a Set can be executed (G.988 Set response).
++ * An attribute without a descriptor is unsupported and goes to the
++ * optional-attribute mask; a read-only one fails and goes to the
++ * attribute execution mask. The values of a Set are packed in attribute
++ * order, so the attributes that precede the first unsupported one can
++ * still be parsed. A datapath ME is all or nothing, as before, so that a
++ * partly applied Set never reshapes the services.
++ *
++ * Returns the attributes to apply; 0 with *@opt or *@exec set means none.
++ */
++static u16 omci_agent_set_attrs(const struct omci_me_desc *desc, u16 class_id,
++				u16 mask, u16 *opt, u16 *exec)
++{
++	u16 unsupported = 0, readonly = 0, supported, apply;
++	unsigned int lowest;
++
++	*opt = 0;
++	*exec = 0;
++	if (desc) {
++		unsupported = omci_me_unsupported_mask(desc->attrs,
++						       desc->num_attrs,
++						       mask, 0) |
++			      (mask & ~desc->valid_attr_mask);
++		readonly = omci_me_unsupported_mask(desc->attrs,
++						    desc->num_attrs,
++						    mask & ~unsupported,
++						    OMCI_ATTR_ACCESS_WRITE);
++	} else if (class_id == OMCI_CLASS_PRIORITY_QUEUE) {
++		unsupported = mask & ~OMCI_PRIORITY_QUEUE_ATTR_MASK;
++	} else if (class_id == OMCI_CLASS_TRAFFIC_SCHEDULER) {
++		unsupported = mask & ~OMCI_TRAFFIC_SCHEDULER_ATTR_MASK;
++	}
++	if (!unsupported && !readonly)
++		return mask;
++
++	supported = mask & ~unsupported;
++	apply = supported & ~readonly;
++	lowest = apply & -(unsigned int)apply;
++	*opt = unsupported;
++	if (!desc || (desc->flags & OMCI_ME_F_DATAPATH) || !apply ||
++	    (unsupported & ~(lowest - 1))) {
++		*exec = supported;
++		return 0;
++	}
++	*exec = readonly;
++	return apply;
++}
++
+ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 				u16 entity_id, u8 action, const u8 *content,
+-				size_t content_len, bool *profile_changed)
++				size_t content_len, bool *profile_changed,
++				u16 *opt_mask, u16 *exec_mask)
+ {
+ 	struct omci_agent *agent = &odev->agent;
+ 	const struct omci_me_desc *desc;
+@@ -3931,9 +3937,12 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 	bool hardware_applied = false;
+ 	bool allow_create;
+ 	bool existed;
++	u16 apply;
+ 	u16 mask;
+ 	int ret;
+ 
++	*opt_mask = 0;
++	*exec_mask = 0;
+ 	if (content_len < 2)
+ 		return OMCI_RESULT_PARAMETER_ERROR;
+ 	if (!omci_me_active(agent, class_id))
+@@ -3943,6 +3952,9 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 
+ 	mask = get_unaligned_be16(content);
+ 	desc = omci_me_lookup(agent, class_id);
++	apply = omci_agent_set_attrs(desc, class_id, mask, opt_mask, exec_mask);
++	if (!apply && (*opt_mask || *exec_mask))
++		return OMCI_RESULT_ATTRIBUTE_FAILED;
+ 	allow_create = agent->permissive || agent->fake_omci ||
+ 		omci_agent_profile_has_quirk(agent,
+ 					     OMCI_OLT_QUIRK_ALLOW_SET_CREATE);
+@@ -3966,7 +3978,7 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 		object->owner_profile = agent->profile_effective;
+ 
+ 	if (desc) {
+-		ret = omci_me_decode_set(desc, object, mask, content + 2,
++		ret = omci_me_decode_set(desc, object, mask, apply, content + 2,
+ 					 content_len - 2);
+ 	} else if (class_id == OMCI_CLASS_PRIORITY_QUEUE ||
+ 		   class_id == OMCI_CLASS_TRAFFIC_SCHEDULER) {
+@@ -3981,7 +3993,7 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 	if (!ret && desc && (class_id == OMCI_CLASS_OLT_G ||
+ 				     class_id == OMCI_CLASS_VLAN_TAGGING_FILTER_DATA ||
+ 				     class_id == OMCI_CLASS_EXTENDED_VLAN))
+-		ret = omci_mib_parse_set(object, mask, content + 2,
++		ret = omci_mib_parse_set(object, apply, content + 2,
+ 					 content_len - 2);
+ 	if (!ret && !desc && class_id == OMCI_CLASS_OLT_G)
+ 		ret = omci_mib_parse_set(object, mask, content + 2,
+@@ -4012,11 +4024,13 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 	 * so keep the value it wrote instead of counting the Set on top.
+ 	 */
+ 	if (class_id == OMCI_CLASS_ONU_DATA && !entity_id &&
+-	    (mask & OMCI_ONU_DATA_MIB_SYNC_MASK))
++	    (apply & OMCI_ONU_DATA_MIB_SYNC_MASK))
+ 		omci_agent_set_mib_sync_locked(agent, object->data[0]);
+ 	else
+ 		omci_agent_increment_mib_sync_locked(agent);
+-	ret = OMCI_RESULT_SUCCESS;
++	/* Part of the Set was refused: the masks say which attributes. */
++	ret = *opt_mask || *exec_mask ? OMCI_RESULT_ATTRIBUTE_FAILED :
++					OMCI_RESULT_SUCCESS;
+ 	goto out_free_previous;
+ 
+ rollback_parameter:
+@@ -4154,60 +4168,43 @@ static u16 omci_bias_ua_to_test_level(u32 bias_ua)
+ 	return min_t(u32, DIV_ROUND_CLOSEST(bias_ua, 2), 65535);
+ }
+ 
+-static u8 omci_agent_get_ani_g_telemetry(struct omci_device *odev, u16 mask,
+-					 u8 *response_content,
+-					 size_t response_capacity,
+-					 size_t *response_len)
+-{
++/*
++ * ANI-G optical signal level (attribute 10) and transmit optical level
++ * (attribute 14) are measured when the OLT asks for them. Levels the
++ * optical frontend cannot measure are reported as failed attributes.
++ */
++static u8 omci_agent_get_ani_g_levels(struct omci_device *odev, u16 mask,
++				      bool extended, u8 *response_content,
++				      size_t response_capacity,
++				      size_t *response_len)
++{
++	static const struct omci_attr_desc attrs[] = {
++		OMCI_ATTR(6, 0, 2, OMCI_R),	/* Optical signal level */
++		OMCI_ATTR(2, 2, 2, OMCI_R),	/* Transmit optical level */
++	};
+ 	struct omci_telemetry telemetry = {};
+-	u8 *data = response_content + 3;
+-	size_t used = 3;
+-	u16 level;
++	u8 levels[4] = {};
++	u16 failed = 0;
+ 	int ret;
+ 
+-	if (response_capacity < 3)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	memset(response_content, 0, response_capacity);
+ 	ret = odev->ops->get_telemetry(odev, &telemetry);
+ 	if (ret)
+ 		return OMCI_RESULT_PROCESSING_ERROR;
+ 
+-	if ((mask & OMCI_ANI_G_RX_LEVEL_MASK) &&
+-	    !(telemetry.valid & OMCI_TELEMETRY_F_BOSA_RX_POWER))
+-		goto attribute_failed;
+-	if ((mask & OMCI_ANI_G_TX_LEVEL_MASK) &&
+-	    !(telemetry.valid & OMCI_TELEMETRY_F_BOSA_TX_POWER))
+-		goto attribute_failed;
+-	if (hweight16(mask & OMCI_ANI_G_OPTICAL_LEVEL_MASK) * sizeof(u16) >
+-	    response_capacity - used)
+-		goto attribute_failed;
+-
+-	response_content[0] = OMCI_RESULT_SUCCESS;
+-	put_unaligned_be16(mask, response_content + 1);
+-	if (mask & OMCI_ANI_G_RX_LEVEL_MASK) {
+-		level = (u16)omci_power_nw_to_ani_g_level(
+-			telemetry.bosa_rx_power_nw);
+-		put_unaligned_be16(level, data);
+-		data += 2;
+-		used += 2;
+-	}
+-	if (mask & OMCI_ANI_G_TX_LEVEL_MASK) {
+-		level = (u16)omci_power_nw_to_ani_g_level(
+-			telemetry.bosa_tx_power_nw);
+-		put_unaligned_be16(level, data);
+-		used += 2;
+-	}
+-	*response_len = used;
+-	return OMCI_RESULT_SUCCESS;
++	if (telemetry.valid & OMCI_TELEMETRY_F_BOSA_RX_POWER)
++		put_unaligned_be16((u16)omci_power_nw_to_ani_g_level(
++					telemetry.bosa_rx_power_nw), levels);
++	else
++		failed |= OMCI_ANI_G_RX_LEVEL_MASK;
++	if (telemetry.valid & OMCI_TELEMETRY_F_BOSA_TX_POWER)
++		put_unaligned_be16((u16)omci_power_nw_to_ani_g_level(
++					telemetry.bosa_tx_power_nw), levels + 2);
++	else
++		failed |= OMCI_ANI_G_TX_LEVEL_MASK;
+ 
+-attribute_failed:
+-	if (response_capacity < 5)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	response_content[0] = OMCI_RESULT_ATTRIBUTE_FAILED;
+-	put_unaligned_be16(0, response_content + 1);
+-	put_unaligned_be16(mask, response_content + 3);
+-	*response_len = 5;
+-	return OMCI_RESULT_ATTRIBUTE_FAILED;
++	return omci_me_get_encode(attrs, ARRAY_SIZE(attrs), levels, mask,
++				  failed, extended, response_content,
++				  response_capacity, response_len);
+ }
+ 
+ static bool omci_agent_get_uses_ani_g_telemetry(u16 class_id, u16 entity_id,
+@@ -4219,57 +4216,6 @@ static bool omci_agent_get_uses_ani_g_telemetry(u16 class_id, u16 entity_id,
+ 	       !(mask & ~OMCI_ANI_G_OPTICAL_LEVEL_MASK);
+ }
+ 
+-static u8 omci_agent_get_masked_object(const struct omci_mib_object *object,
+-				       const struct omci_get_attr_layout *layout,
+-				       size_t layout_len, u16 supported_mask,
+-				       u16 mask, u8 *response_content,
+-				       size_t response_capacity,
+-				       size_t *response_len)
+-{
+-	u8 *data = response_content + 3;
+-	size_t available;
+-	size_t used = 3;
+-	unsigned int i;
+-
+-	if (response_capacity < 3)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	memset(response_content, 0, response_capacity);
+-	available = response_capacity - used;
+-	if (!mask || mask & ~supported_mask)
+-		goto attribute_failed;
+-
+-	for (i = 0; i < layout_len; i++) {
+-		const struct omci_get_attr_layout *attr = &layout[i];
+-
+-		if (!(mask & attr->mask))
+-			continue;
+-		if (attr->len > available)
+-			goto attribute_failed;
+-
+-		if (attr->offset == OMCI_ATTR_VALUE_ZERO)
+-			memset(data, 0, attr->len);
+-		else
+-			memcpy(data, object->data + attr->offset, attr->len);
+-		data += attr->len;
+-		used += attr->len;
+-		available -= attr->len;
+-	}
+-
+-	response_content[0] = OMCI_RESULT_SUCCESS;
+-	put_unaligned_be16(mask, response_content + 1);
+-	*response_len = used;
+-	return OMCI_RESULT_SUCCESS;
+-
+-attribute_failed:
+-	if (response_capacity < 5)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	response_content[0] = OMCI_RESULT_ATTRIBUTE_FAILED;
+-	put_unaligned_be16(0, response_content + 1);
+-	put_unaligned_be16(mask, response_content + 3);
+-	*response_len = 5;
+-	return OMCI_RESULT_ATTRIBUTE_FAILED;
+-}
+-
+ static int
+ omci_agent_refresh_nokia_optical(struct omci_device *odev,
+ 				 struct omci_mib_object *object)
+@@ -4322,18 +4268,20 @@ omci_agent_refresh_nokia_optical(struct omci_device *odev,
+ }
+ 
+ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+-				u16 entity_id, const u8 *content,
+-				size_t content_len, u8 *response_content,
++				u16 entity_id, bool extended,
++				const u8 *content, size_t content_len,
++				u8 *response_content,
+ 				size_t response_capacity,
+ 				size_t *response_len)
+ {
++	struct omci_attr_desc layout[OMCI_PRIORITY_QUEUE_ATTRS];
+ 	struct omci_agent *agent = &odev->agent;
++	const struct omci_attr_desc *attrs;
+ 	const struct omci_me_desc *desc;
+ 	struct omci_mib_object *object;
+-	size_t encoded_len = 0;
+-	u16 encoded_mask;
++	unsigned int num_attrs;
++	size_t encoded_len;
+ 	u16 mask;
+-	int ret;
+ 
+ 	if (content_len < 2 || response_capacity < 1)
+ 		return OMCI_RESULT_PARAMETER_ERROR;
+@@ -4356,10 +4304,10 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 
+ 	if (omci_agent_get_uses_ani_g_telemetry(class_id, entity_id, mask) &&
+ 	    odev->ops && odev->ops->get_telemetry)
+-		return omci_agent_get_ani_g_telemetry(odev, mask,
+-						      response_content,
+-						      response_capacity,
+-						      response_len);
++		return omci_agent_get_ani_g_levels(odev, mask, extended,
++						   response_content,
++						   response_capacity,
++						   response_len);
+ 
+ 	object = omci_get_or_create_locked(agent, class_id, entity_id,
+ 					   agent->permissive ||
+@@ -4370,70 +4318,53 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 	    omci_agent_refresh_nokia_optical(odev, object))
+ 		return OMCI_RESULT_PROCESSING_ERROR;
+ 
++	desc = omci_me_lookup(agent, class_id);
+ 	switch (class_id) {
+ 	case OMCI_CLASS_ONU_G:
+-		return omci_agent_get_masked_object(
+-			object, omci_onu_g_attr_layout,
+-			ARRAY_SIZE(omci_onu_g_attr_layout), OMCI_ONU_G_ATTR_MASK,
+-			mask, response_content, response_capacity, response_len);
++		attrs = omci_onu_g_attrs;
++		num_attrs = ARRAY_SIZE(omci_onu_g_attrs);
++		break;
+ 	case OMCI_CLASS_ONU2_G:
+-		return omci_agent_get_masked_object(
+-			object, omci_onu2_g_attr_layout,
+-			ARRAY_SIZE(omci_onu2_g_attr_layout), OMCI_ONU2_G_ATTR_MASK,
+-			mask, response_content, response_capacity, response_len);
+-	default:
++		attrs = omci_onu2_g_attrs;
++		num_attrs = ARRAY_SIZE(omci_onu2_g_attrs);
+ 		break;
+-	}
+-
+-	if (response_capacity < 3)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	memset(response_content, 0, response_capacity);
+-	response_content[0] = OMCI_RESULT_SUCCESS;
+-	if (class_id == OMCI_CLASS_PRIORITY_QUEUE) {
+-		put_unaligned_be16(mask, response_content + 1);
+-		ret = omci_priority_queue_serialize(object, mask,
+-					    response_content + 3,
+-					    response_capacity - 3,
+-					    &encoded_len);
+-		if (ret)
+-			goto attribute_failed;
+-	} else if (class_id == OMCI_CLASS_TRAFFIC_SCHEDULER) {
+-		put_unaligned_be16(mask, response_content + 1);
+-		ret = omci_traffic_scheduler_serialize(object, mask,
+-					       response_content + 3,
+-					       response_capacity - 3,
+-					       &encoded_len);
+-		if (ret)
+-			goto attribute_failed;
+-	} else {
+-		desc = omci_me_lookup(agent, class_id);
++	case OMCI_CLASS_PRIORITY_QUEUE:
++		num_attrs = omci_layout_attrs(omci_priority_queue_layout,
++					      ARRAY_SIZE(omci_priority_queue_layout),
++					      layout);
++		attrs = layout;
++		break;
++	case OMCI_CLASS_TRAFFIC_SCHEDULER:
++		num_attrs = omci_layout_attrs(omci_traffic_scheduler_layout,
++					      ARRAY_SIZE(omci_traffic_scheduler_layout),
++					      layout);
++		attrs = layout;
++		break;
++	default:
+ 		if (!desc) {
++			/*
++			 * No attribute layout: hand back what is stored. This
++			 * is the shadow behaviour for MEs without a descriptor.
++			 */
++			if (response_capacity < 3)
++				return OMCI_RESULT_PARAMETER_ERROR;
++			memset(response_content, 0, response_capacity);
+ 			encoded_len = min_t(size_t, object->data_len,
+ 					    response_capacity - 3);
++			response_content[0] = OMCI_RESULT_SUCCESS;
+ 			put_unaligned_be16(mask, response_content + 1);
+ 			memcpy(response_content + 3, object->data, encoded_len);
+ 			*response_len = 3 + encoded_len;
+ 			return OMCI_RESULT_SUCCESS;
+ 		}
+-		ret = omci_me_encode_attributes(desc, object, mask,
+-						response_content + 3,
+-						response_capacity - 3,
+-						&encoded_mask, &encoded_len);
+-		if (ret || encoded_mask != mask)
+-			goto attribute_failed;
+-		put_unaligned_be16(encoded_mask, response_content + 1);
++		attrs = desc->attrs;
++		num_attrs = desc->num_attrs;
++		break;
+ 	}
+-	*response_len = 3 + encoded_len;
+-	return OMCI_RESULT_SUCCESS;
+ 
+-attribute_failed:
+-	if (response_capacity < 5)
+-		return OMCI_RESULT_PARAMETER_ERROR;
+-	response_content[0] = OMCI_RESULT_ATTRIBUTE_FAILED;
+-	put_unaligned_be16(0, response_content + 1);
+-	put_unaligned_be16(mask, response_content + 3);
+-	*response_len = 5;
+-	return OMCI_RESULT_ATTRIBUTE_FAILED;
++	return omci_me_get_encode(attrs, num_attrs, object->data, mask, 0,
++				  extended, response_content,
++				  response_capacity, response_len);
+ }
+ 
+ static void omci_test_result_put(u8 *field, u8 type, u16 value)
+@@ -4694,6 +4625,8 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 	u16 class_id = request->class_id;
+ 	u16 entity_id = request->entity_id;
+ 	bool shadow_missing;
++	u16 opt_mask = 0;
++	u16 exec_mask = 0;
+ 	u16 sequence;
+ 	u16 mask = 0;
+ 	u8 result = OMCI_RESULT_SUCCESS;
+@@ -4733,7 +4666,8 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 		result = omci_agent_set_locked(odev, class_id, entity_id, action,
+ 					      request->payload,
+ 					      request->payload_len,
+-					      profile_changed);
++					      profile_changed, &opt_mask,
++					      &exec_mask);
+ 		if (omci_agent_should_fake_result(agent, class_id, result)) {
+ 			result = OMCI_RESULT_SUCCESS;
+ 			*fake = true;
+@@ -4746,8 +4680,15 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 		if (capacity < 5)
+ 			return -EMSGSIZE;
+ 		content[0] = result;
+-		put_unaligned_be16(0, content + 1);
+-		put_unaligned_be16(result ? mask : 0, content + 3);
++		if (result == OMCI_RESULT_ATTRIBUTE_FAILED) {
++			/* Unsupported and failed attributes (G.988 Set response) */
++			put_unaligned_be16(opt_mask, content + 1);
++			put_unaligned_be16(exec_mask, content + 3);
++			atomic64_inc(&agent->attribute_failures);
++		} else {
++			put_unaligned_be16(0, content + 1);
++			put_unaligned_be16(result ? mask : 0, content + 3);
++		}
+ 		*content_len = 5;
+ 		break;
+ 	case OMCI_MSG_TYPE_GET:
+@@ -4758,6 +4699,8 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 							content_len);
+ 		else
+ 			result = omci_agent_get_locked(odev, class_id, entity_id,
++						      request->device_id ==
++						      OMCI_EXTENDED_DEV_ID,
+ 						      request->payload,
+ 						      request->payload_len,
+ 						      content, capacity,
+@@ -4770,13 +4713,17 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 			   !agent->permissive && shadow_missing) {
+ 			*fake = true;
+ 		}
+-		/* ME 341 answers result 9 with the attribute masks filled in. */
++		/*
++		 * Result 9 comes with the attribute masks and whatever values
++		 * could be read already laid out; other errors carry nothing.
++		 */
+ 		if (result && !*fake &&
+-		    !(class_id == OMCI_CLASS_GEM_PORT_CTP_PM &&
+-		      result == OMCI_RESULT_ATTRIBUTE_FAILED)) {
++		    result != OMCI_RESULT_ATTRIBUTE_FAILED) {
+ 			content[0] = result;
+ 			*content_len = 1;
+ 		}
++		if (result == OMCI_RESULT_ATTRIBUTE_FAILED && !*fake)
++			atomic64_inc(&agent->attribute_failures);
+ 		break;
+ 	case OMCI_MSG_TYPE_GET_NEXT:
+ 		result = omci_agent_get_next_locked(odev, class_id, entity_id,
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index 974c95e..e2b3010 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -174,6 +174,8 @@ struct omci_agent {
+ 	atomic64_t duplicates;
+ 	atomic64_t unsupported;
+ 	atomic64_t fake_responses;
++	/* Get and Set answered with result 9, attribute failed or unknown */
++	atomic64_t attribute_failures;
+ };
+ 
+ struct omci_device {
+diff --git a/net/xpon/omci/me.c b/net/xpon/omci/me.c
+index 4dd9d5c..6e699ab 100644
+--- a/net/xpon/omci/me.c
++++ b/net/xpon/omci/me.c
+@@ -6,6 +6,7 @@
+ #include <linux/errno.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
++#include <linux/unaligned.h>
+ #include <net/xpon/omci.h>
+ 
+ #include "internal.h"
+@@ -336,15 +337,6 @@ static const struct omci_class_name omci_classes[] = {
+ 	{ 452, "TWDM channel OMCI performance monitoring history data" },
+ };
+ 
+-#define OMCI_ATTR(_bit, _offset, _len, _access) \
+-	{ .mask = BIT(_bit), .offset = (_offset), .len = (_len), \
+-	  .access = (_access) }
+-
+-#define OMCI_RW_SC	(OMCI_ATTR_ACCESS_READ | OMCI_ATTR_ACCESS_WRITE | \
+-			 OMCI_ATTR_ACCESS_SET_CREATE)
+-#define OMCI_RW		(OMCI_ATTR_ACCESS_READ | OMCI_ATTR_ACCESS_WRITE)
+-#define OMCI_R		OMCI_ATTR_ACCESS_READ
+-
+ static const struct omci_attr_desc omci_software_image_attrs[] = {
+ 	OMCI_ATTR(15, 0, OMCI_SOFTWARE_VERSION_LEN, OMCI_R),
+ 	OMCI_ATTR(14, 14, 1, OMCI_R),
+@@ -977,10 +969,13 @@ int omci_me_decode_create(const struct omci_me_desc *desc,
+ 
+ 		if (!(attr->access & OMCI_ATTR_ACCESS_SET_CREATE))
+ 			continue;
+-		if (attr->offset + attr->len > sizeof(object->data) ||
+-		    len < attr->len)
++		if (len < attr->len)
+ 			return -EINVAL;
+-		memcpy(object->data + attr->offset, data, attr->len);
++		if (attr->offset != OMCI_ATTR_OFFSET_ZERO) {
++			if (attr->offset + attr->len > sizeof(object->data))
++				return -EINVAL;
++			memcpy(object->data + attr->offset, data, attr->len);
++		}
+ 		data += attr->len;
+ 		len -= attr->len;
+ 		mask |= attr->mask;
+@@ -990,16 +985,21 @@ int omci_me_decode_create(const struct omci_me_desc *desc,
+ 	return 0;
+ }
+ 
++/*
++ * Store the attributes of @apply out of a Set whose values are laid out
++ * by @mask. Attributes in @mask but not in @apply are skipped; an
++ * attribute the descriptor does not know ends the parse, as its size and
++ * so the position of whatever follows it are unknown. The caller only
++ * applies attributes that precede any unknown one.
++ */
+ int omci_me_decode_set(const struct omci_me_desc *desc,
+-			       struct omci_mib_object *object, u16 mask,
+-			       const u8 *data, size_t len)
++		       struct omci_mib_object *object, u16 mask, u16 apply,
++		       const u8 *data, size_t len)
+ {
+ 	unsigned int bit;
+ 
+ 	if (!desc)
+ 		return 0;
+-	if (mask & ~desc->valid_attr_mask)
+-		return -EINVAL;
+ 
+ 	for (bit = 0; bit < 16; bit++) {
+ 		const struct omci_attr_desc *attr;
+@@ -1008,20 +1008,149 @@ int omci_me_decode_set(const struct omci_me_desc *desc,
+ 		if (!(mask & attr_mask))
+ 			continue;
+ 		attr = omci_me_find_attr(desc, attr_mask);
+-		if (!attr || !(attr->access & OMCI_ATTR_ACCESS_WRITE))
+-			return -EACCES;
+-		if (attr->offset + attr->len > sizeof(object->data) ||
+-		    len < attr->len)
++		if (!attr || !(desc->valid_attr_mask & attr_mask)) {
++			if (apply & (attr_mask | (attr_mask - 1)))
++				return -EINVAL;
++			break;
++		}
++		if (len < attr->len)
+ 			return -EINVAL;
+-		memcpy(object->data + attr->offset, data, attr->len);
++		if ((apply & attr_mask) &&
++		    attr->offset != OMCI_ATTR_OFFSET_ZERO) {
++			if (attr->offset + attr->len > sizeof(object->data))
++				return -EINVAL;
++			memcpy(object->data + attr->offset, data, attr->len);
++		}
+ 		data += attr->len;
+ 		len -= attr->len;
+ 	}
+-	object->attr_mask |= mask;
++	object->attr_mask |= apply;
+ 
+ 	return 0;
+ }
+ 
++/*
++ * The attributes of @mask that @attrs does not describe with @access:
++ * pass OMCI_ATTR_ACCESS_READ for a Get, OMCI_ATTR_ACCESS_WRITE for a Set.
++ */
++u16 omci_me_unsupported_mask(const struct omci_attr_desc *attrs,
++			     unsigned int num_attrs, u16 mask, u8 access)
++{
++	u16 known = 0;
++	unsigned int i;
++
++	for (i = 0; i < num_attrs; i++)
++		if ((attrs[i].access & access) == access)
++			known |= attrs[i].mask;
++
++	return mask & ~known;
++}
++
++static const struct omci_attr_desc *
++omci_me_find_attr_array(const struct omci_attr_desc *attrs,
++			unsigned int num_attrs, u16 mask)
++{
++	unsigned int i;
++
++	for (i = 0; i < num_attrs; i++)
++		if (attrs[i].mask == mask)
++			return &attrs[i];
++
++	return NULL;
++}
++
++static void omci_me_put_value(u8 *dest, const struct omci_attr_desc *attr,
++			      const u8 *data)
++{
++	if (attr->offset == OMCI_ATTR_OFFSET_ZERO)
++		memset(dest, 0, attr->len);
++	else
++		memcpy(dest, data + attr->offset, attr->len);
++}
++
++/*
++ * Lay out a Get response (G.988 Annex A). Baseline: result, attribute mask,
++ * 25 bytes of values, then the optional-attribute mask (attributes not
++ * supported) and the attribute execution mask (attributes that failed) in
++ * content bytes 29-32; the masks only mean something with result 9.
++ * Extended: result, attribute mask, the two masks, then the values.
++ *
++ * The values of the attributes that can be read are returned in attribute
++ * order. Attributes in @failed, attributes that do not fit and attributes
++ * @attrs does not describe as readable are reported in the masks with
++ * result 9 (attribute failed or unknown).
++ *
++ * A baseline Get the agent used to answer in full, with up to 29 bytes of
++ * values and no failure, is still answered the same way, so that an OLT
++ * that asks for more than 25 bytes keeps getting what it got before.
++ */
++u8 omci_me_get_encode(const struct omci_attr_desc *attrs,
++		      unsigned int num_attrs, const u8 *data, u16 mask,
++		      u16 failed, bool extended, u8 *content,
++		      size_t capacity, size_t *content_len)
++{
++	size_t values = extended ? 7 : 3;
++	u16 unsupported, encoded = 0;
++	size_t room, total = 0, used = 0;
++	unsigned int bit;
++	u8 result;
++
++	if (capacity < (extended ? 7 : 32))
++		return OMCI_RESULT_PARAMETER_ERROR;
++	memset(content, 0, capacity);
++	unsupported = omci_me_unsupported_mask(attrs, num_attrs, mask,
++					       OMCI_ATTR_ACCESS_READ);
++	failed &= mask & ~unsupported;
++
++	for (bit = 0; bit < 16; bit++) {
++		const struct omci_attr_desc *attr;
++		u16 attr_mask = BIT(15 - bit);
++
++		if (!(mask & attr_mask & ~unsupported & ~failed))
++			continue;
++		attr = omci_me_find_attr_array(attrs, num_attrs, attr_mask);
++		total += attr->len;
++	}
++
++	room = capacity - values;
++	if (!extended && (unsupported || failed || total > room))
++		room = 25;
++
++	for (bit = 0; bit < 16; bit++) {
++		const struct omci_attr_desc *attr;
++		u16 attr_mask = BIT(15 - bit);
++
++		if (!(mask & attr_mask & ~unsupported & ~failed))
++			continue;
++		attr = omci_me_find_attr_array(attrs, num_attrs, attr_mask);
++		if (attr->len > room - used) {
++			failed |= attr_mask;
++			continue;
++		}
++		omci_me_put_value(content + values + used, attr, data);
++		used += attr->len;
++		encoded |= attr_mask;
++	}
++
++	result = unsupported || failed ? OMCI_RESULT_ATTRIBUTE_FAILED :
++					 OMCI_RESULT_SUCCESS;
++	content[0] = result;
++	put_unaligned_be16(encoded, content + 1);
++	if (extended) {
++		put_unaligned_be16(unsupported, content + 3);
++		put_unaligned_be16(failed, content + 5);
++		*content_len = values + used;
++	} else if (result) {
++		put_unaligned_be16(unsupported, content + 28);
++		put_unaligned_be16(failed, content + 30);
++		*content_len = 32;
++	} else {
++		*content_len = values + used;
++	}
++
++	return result;
++}
++
+ int omci_me_encode_attributes(const struct omci_me_desc *desc,
+ 			      const struct omci_mib_object *object,
+ 			      u16 mask, u8 *data, size_t len,
+@@ -1043,11 +1172,12 @@ int omci_me_encode_attributes(const struct omci_me_desc *desc,
+ 		attr = omci_me_find_attr(desc, attr_mask);
+ 		if (!attr || !(attr->access & OMCI_ATTR_ACCESS_READ))
+ 			continue;
+-		if (attr->offset + attr->len > sizeof(object->data))
++		if (attr->offset != OMCI_ATTR_OFFSET_ZERO &&
++		    attr->offset + attr->len > sizeof(object->data))
+ 			return -EINVAL;
+ 		if (len - used < attr->len)
+ 			break;
+-		memcpy(data + used, object->data + attr->offset, attr->len);
++		omci_me_put_value(data + used, attr, object->data);
+ 		used += attr->len;
+ 		encoded |= attr_mask;
+ 	}
+diff --git a/net/xpon/omci/me.h b/net/xpon/omci/me.h
+index ca150a6..4fab10a 100644
+--- a/net/xpon/omci/me.h
++++ b/net/xpon/omci/me.h
+@@ -84,6 +84,17 @@ struct omci_mib_object;
+ #define OMCI_CLASS_NOKIA_VLAN_DS_SUPPLEMENTAL	65305
+ #define OMCI_CLASS_NOKIA_VLAN_US_POLICER	65306
+ 
++/* G.988 result codes */
++#define OMCI_RESULT_SUCCESS		0
++#define OMCI_RESULT_PROCESSING_ERROR	1
++#define OMCI_RESULT_NOT_SUPPORTED	2
++#define OMCI_RESULT_PARAMETER_ERROR	3
++#define OMCI_RESULT_UNKNOWN_ME		4
++#define OMCI_RESULT_UNKNOWN_INSTANCE	5
++#define OMCI_RESULT_DEVICE_BUSY	6
++#define OMCI_RESULT_INSTANCE_EXISTS	7
++#define OMCI_RESULT_ATTRIBUTE_FAILED	9
++
+ #define OMCI_ME_ACTION_CREATE		BIT(4)
+ #define OMCI_ME_ACTION_DELETE		BIT(6)
+ #define OMCI_ME_ACTION_SET		BIT(8)
+@@ -110,6 +121,12 @@ enum omci_attr_access {
+ 	OMCI_ATTR_ACCESS_SET_CREATE	= BIT(2),
+ };
+ 
++/*
++ * Attribute offset of a value the agent does not store: it reads back as
++ * zeros and a write of it is dropped.
++ */
++#define OMCI_ATTR_OFFSET_ZERO		0xff
++
+ struct omci_attr_desc {
+ 	u16 mask;
+ 	u8 offset;
+@@ -117,6 +134,15 @@ struct omci_attr_desc {
+ 	u8 access;
+ };
+ 
++#define OMCI_ATTR(_bit, _offset, _len, _access) \
++	{ .mask = BIT(_bit), .offset = (_offset), .len = (_len), \
++	  .access = (_access) }
++
++#define OMCI_RW_SC	(OMCI_ATTR_ACCESS_READ | OMCI_ATTR_ACCESS_WRITE | \
++			 OMCI_ATTR_ACCESS_SET_CREATE)
++#define OMCI_RW		(OMCI_ATTR_ACCESS_READ | OMCI_ATTR_ACCESS_WRITE)
++#define OMCI_R		OMCI_ATTR_ACCESS_READ
++
+ struct omci_me_desc {
+ 	u16 class_id;
+ 	const char *name;
+@@ -143,8 +169,14 @@ int omci_me_decode_create(const struct omci_me_desc *desc,
+ 			  struct omci_mib_object *object,
+ 			  const u8 *data, size_t len);
+ int omci_me_decode_set(const struct omci_me_desc *desc,
+-			       struct omci_mib_object *object, u16 mask,
+-			       const u8 *data, size_t len);
++		       struct omci_mib_object *object, u16 mask, u16 apply,
++		       const u8 *data, size_t len);
++u16 omci_me_unsupported_mask(const struct omci_attr_desc *attrs,
++			     unsigned int num_attrs, u16 mask, u8 access);
++u8 omci_me_get_encode(const struct omci_attr_desc *attrs,
++		      unsigned int num_attrs, const u8 *data, u16 mask,
++		      u16 failed, bool extended, u8 *content,
++		      size_t capacity, size_t *content_len);
+ int omci_me_encode_attributes(const struct omci_me_desc *desc,
+ 			      const struct omci_mib_object *object,
+ 			      u16 mask, u8 *data, size_t len,
+diff --git a/net/xpon/omci/sysfs.c b/net/xpon/omci/sysfs.c
+index d5999dd..ed02bc8 100644
+--- a/net/xpon/omci/sysfs.c
++++ b/net/xpon/omci/sysfs.c
+@@ -168,6 +168,7 @@ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_responses, responses);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_duplicates, duplicates);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_unsupported, unsupported);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_fake_responses, fake_responses);
++OMCI_AGENT_ATOMIC64_ATTR_RO(agent_attribute_failures, attribute_failures);
+ 
+ static ssize_t mib_sync_show(struct device *dev, struct device_attribute *attr,
+ 			     char *buf)
+@@ -694,6 +695,7 @@ static struct attribute *omci_attrs[] = {
+ 	&dev_attr_agent_duplicates.attr,
+ 	&dev_attr_agent_unsupported.attr,
+ 	&dev_attr_agent_fake_responses.attr,
++	&dev_attr_agent_attribute_failures.attr,
+ 	&dev_attr_mib_sync.attr,
+ 	&dev_attr_agent_operational.attr,
+ 	&dev_attr_gem_pm.attr,

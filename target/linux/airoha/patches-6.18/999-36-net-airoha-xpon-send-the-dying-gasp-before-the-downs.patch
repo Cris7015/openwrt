@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:20:32 -0300
+Subject: [PATCH 27/48] net: airoha: xpon: send the dying gasp before the
+ downstream PLOAM queue
+
+A dying-gasp interrupt leaves the ONU a few milliseconds of supply.
+gpon_irq_work_fn() first drained the whole downstream PLOAM queue, which
+can queue several ACK triplets into the upstream FIFO, and only then
+queued Dying_Gasp behind them. The stock driver sends it straight from
+the interrupt (gpon_detect_dying_gasp() calls ploam_send_dying_gasp()
+three times from xpon_dying_gasp_interrupt()). Handle the dying gasp
+first in each pass of the worker.
+
+G.984.3 has Dying_Gasp sent by an ONU in operation. Queued in O2/O3
+(with ONU-ID 0xFF), O4 or O6 it cannot be transmitted, stays in the
+upstream FIFO (nothing flushes it between sessions on the EN751221) and
+would reach the OLT in a later O5 from an ONU that is fine. The stock
+driver sends it in any state, so restricting the PLOAM to O5 is opt-in:
+airoha_xpon.gpon_dying_gasp_o5_only (0644, default off). The OMCI dying
+gasp is unchanged.
+
+To make a leftover upstream FIFO visible, log the free word count of
+G_PLOAMu_FIFO_STS (already read on every PLOAM send) at session start.
+
+No dying-gasp interrupt shows up in the field logs, so the behaviour on
+the field link is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 57 ++++++++++++++++++-----
+ 1 file changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index df42d0d..3d42f09 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3313,6 +3313,13 @@ static int gpon_enable(struct xpon_priv *priv)
+ 
+ 	gpon_set_serial_number_regs(priv);
+ 	gpon_load_aes_shadow(priv, priv->aes_key, 0);
++	/*
++	 * Nothing flushes the upstream PLOAM FIFO between sessions here; a
++	 * smaller free count than after boot means the previous session left
++	 * messages that will go out in the next O5.
++	 */
++	dev_info(priv->dev, "GPON upstream PLOAM FIFO: %u words free at session start\n",
++		 gpon_read(priv, GPON_PLOAMu_FIFO_STS) & PLOAMu_FIFO_AVAIL_MASK);
+ 
+ 	/*
+ 	 * Inspect events accumulated while the digital PHY was locking. Known
+@@ -4104,6 +4111,36 @@ static void gpon_dump_error_counters(struct xpon_priv *priv, u32 errors)
+ 			     gpon_bb_read_counter(priv, GPON_DBG_GEM_HEC_UC_ERR_CNT, GPON_BB_HECU));
+ }
+ 
++/*
++ * Dying_Gasp is sent by an ONU in operation. Queued in O2-O4 (O2/O3 with
++ * ONU-ID 0xFF) or O6 it cannot go out, stays in the upstream FIFO, which
++ * this driver does not flush on the EN751221, and reaches the OLT in the
++ * next O5 from an ONU that is fine. The stock driver sends it in any
++ * state, so restricting it to O5 is opt-in.
++ */
++static bool gpon_dying_gasp_o5_only;
++module_param(gpon_dying_gasp_o5_only, bool, 0644);
++MODULE_PARM_DESC(gpon_dying_gasp_o5_only,
++		 "Send the Dying_Gasp PLOAM only in O5 (default: off, any state but O7)");
++
++static void gpon_handle_dying_gasp(struct xpon_priv *priv)
++{
++	enum gpon_state st = ploam_get_state(priv->ploam);
++	int ret;
++
++	dev_warn(priv->dev, "GPON dying-gasp interrupt in %s\n",
++		 gpon_state_name(st));
++	if (!READ_ONCE(gpon_dying_gasp_o5_only) || st == GPON_O5_OPERATION)
++		ploam_notify_dying_gasp(priv->ploam);
++	else
++		dev_warn_ratelimited(priv->dev,
++				     "GPON dying gasp outside O5: no Dying_Gasp PLOAM queued\n");
++	ret = airoha_gpon_omci_send_dying_gasp(&priv->omci);
++	if (ret && ret != -EOPNOTSUPP && ret != -ENOLINK)
++		dev_warn(priv->dev, "failed to send OMCI dying gasp: %d\n",
++			 ret);
++}
++
+ static void gpon_irq_work_fn(struct work_struct *work)
+ {
+ 	struct xpon_priv *priv =
+@@ -4123,6 +4160,14 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 		if (!READ_ONCE(priv->mac_enabled))
+ 			break;
+ 
++		/*
++		 * Dying gasp first: the supply has a few ms left, and the
++		 * downstream PLOAMs below may queue more upstream messages
++		 * ahead of it in the FIFO.
++		 */
++		if (active & INT_DYING_GASP)
++			gpon_handle_dying_gasp(priv);
++
+ 		gpon_process_ploam_queue(priv);
+ 
+ 		/*
+@@ -4159,18 +4204,6 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 				 phy_tx_frames, phy_tx_bursts, phy_ret);
+ 		}
+ 
+-		if (active & INT_DYING_GASP) {
+-			int ret;
+-
+-			dev_warn(priv->dev, "GPON dying-gasp interrupt\n");
+-			ploam_notify_dying_gasp(priv->ploam);
+-			ret = airoha_gpon_omci_send_dying_gasp(&priv->omci);
+-			if (ret && ret != -EOPNOTSUPP && ret != -ENOLINK)
+-				dev_warn(priv->dev,
+-					 "failed to send OMCI dying gasp: %d\n",
+-					 ret);
+-		}
+-
+ 		if (active & INT_LOSS_GEM_DEL) {
+ 			/*
+ 			 * A few of these per hour are normal on a healthy link

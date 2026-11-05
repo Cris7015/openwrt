@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:19:21 -0300
+Subject: [PATCH 24/48] net: airoha: xpon: let Encrypted_Port-ID restore GEM
+ ports OMCI created
+
+"Encrypted_Port-ID must not create GEM ports" stopped the message from
+validating Port-IDs nobody created. The field logs show one case where
+that validation mattered, though: after a Deactivate_ONU-ID the Huawei
+OLT sometimes provisions nothing over OMCI again but does repeat
+Encrypted_Port-ID for every service port. Where the session start
+resets the MAC (EN7523, gpon_reset_on_start) the GEM table is empty at
+that point, and the Encrypted_Port-ID write is what made the service
+ports valid again.
+
+Track the GEM ports OMCI enabled and has not disabled in omci_gems,
+which like the agent's MIB survives session restarts, and let
+Encrypted_Port-ID put such a port back into the GEM table. A Port-ID
+OMCI never created is still only recorded.
+
+On the EN751221 the GEM table is not cleared between sessions (see
+gpon_stop_clear_gems), so the field behaviour is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 21 +++++++++++++++++++--
+ drivers/net/ethernet/airoha/airoha_xpon.h |  2 ++
+ 2 files changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index dd10093..869cd7e 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2228,7 +2228,7 @@ static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 				      bool encrypted)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+-	bool configured;
++	bool configured, restore;
+ 	int ret = 0;
+ 
+ 	if (port_id >= GPON_MAX_GEM_ID)
+@@ -2250,9 +2250,19 @@ static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 	mutex_lock(&priv->gem_mib_lock);
+ 	__assign_bit(port_id, priv->encrypted_gems, encrypted);
+ 	configured = test_bit(port_id, priv->hw_gems);
++	/*
++	 * A port OMCI created and has not deleted, but which is missing from
++	 * the GEM table (a MAC reset at session start on EN7523), is put back
++	 * as before: when the OLT skips OMCI provisioning after a reactivation
++	 * this message is what restores it.
++	 */
++	restore = !configured && test_bit(port_id, priv->omci_gems);
+ 	if (configured)
+ 		ret = gpon_write_gem_port_hw(priv, port_id, true, encrypted);
+ 	mutex_unlock(&priv->gem_mib_lock);
++	if (restore)
++		ret = __gpon_set_gem_port_hw(priv, port_id, true, encrypted,
++					     true);
+ 
+ 	if (ret)
+ 		dev_err(priv->dev,
+@@ -2262,7 +2272,8 @@ static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 		dev_info(priv->dev,
+ 			 "GPON GEM encryption update: port=%u %s%s\n",
+ 			 port_id, encrypted ? "encrypted" : "clear",
+-			 configured ? "" : " (recorded, port not created yet)");
++			 configured ? "" : restore ? " (OMCI port restored)" :
++			 " (recorded, port not created yet)");
+ 	return ret;
+ }
+ 
+@@ -2467,6 +2478,11 @@ int airoha_gpon_omci_hw_set_gem_port(void *hw_priv, u16 entity_id,
+ 	if (ret)
+ 		return ret;
+ 
++	/* Survives session restarts, like the agent's MIB. */
++	mutex_lock(&priv->gem_mib_lock);
++	__assign_bit(gem_port_id, priv->omci_gems, valid);
++	mutex_unlock(&priv->gem_mib_lock);
++
+ 	gpon_refresh_netdev_link(priv, false);
+ 	dev_info(priv->dev,
+ 		 "OMCI GEM port %u %s (ME %#x T-CONT %#x direction %u)\n",
+@@ -5216,6 +5232,7 @@ static int airoha_xpon_init_gpon(struct platform_device *pdev,
+ 					   priv, &gpon_lab_err_ctrl_fops);
+ 	bitmap_zero(priv->service_gems, GPON_MAX_GEM_ID);
+ 	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
++	bitmap_zero(priv->omci_gems, GPON_MAX_GEM_ID);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));
+ 	memset(priv->tcont_entity_id, 0xff, sizeof(priv->tcont_entity_id));
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index f720931..daed27d 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -539,6 +539,8 @@ struct xpon_priv {
+ 	DECLARE_BITMAP(service_gems, GPON_MAX_GEM_ID);
+ 	/* GEM ports the OLT made encrypted with Encrypted_Port-ID (PLOAM) */
+ 	DECLARE_BITMAP(encrypted_gems, GPON_MAX_GEM_ID);
++	/* GEM ports OMCI created and has not deleted (gem_mib_lock) */
++	DECLARE_BITMAP(omci_gems, GPON_MAX_GEM_ID);
+ 
+ 	/*
+ 	 * Per-GEM MIB counters. gem_mib_lock serialises the MIB command

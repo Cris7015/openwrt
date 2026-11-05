@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:20:05 -0300
+Subject: [PATCH 45/48] net: xpon: omci: only count CRC-flagged OMCI frames
+ unless asked to drop
+
+"drop OMCI frames that fail the CRC" made the agent ignore every frame
+the MAC flags with OMCI_F_CRC_ERROR. That is what G.988 expects of a
+frame whose trailer CRC fails, but nobody has seen the flag on a live
+OMCC yet, and the vendor stack only prints a debug message for it and
+processes the frame. If the flag were ever set on good frames, the agent
+would ignore the whole OMCC and the ONU would not be provisioned.
+
+Keep counting the flagged frames in rx_crc_errors, log them (rate
+limited, so the first one always shows), but process them as before
+unless the new drop_crc_errors sysfs attribute is set. It defaults to
+off; turn it on once the counter has shown that the flag only marks
+damaged frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/core.c     | 24 +++++++++++++++++-------
+ net/xpon/omci/internal.h |  2 ++
+ net/xpon/omci/sysfs.c    | 25 +++++++++++++++++++++++++
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/net/xpon/omci/core.c b/net/xpon/omci/core.c
+index 2e850bb..613536d 100644
+--- a/net/xpon/omci/core.c
++++ b/net/xpon/omci/core.c
+@@ -1186,15 +1186,25 @@ static void omci_rx_work(struct work_struct *work)
+ 		spin_unlock_bh(&odev->state_lock);
+ 
+ 		/*
+-		 * The OMCI trailer carries a CRC-32: a frame that fails it is
+-		 * discarded and the OLT retransmits it. Executing it would apply
+-		 * whatever the corruption left and answer a TCI the OLT may never
+-		 * have sent. The observer still gets it, with the flag.
++		 * The OMCI trailer carries a CRC-32 and G.988 expects a frame
++		 * that fails it to be discarded, the OLT retransmitting it.
++		 * Whether the MAC flag really marks only such frames has not
++		 * been seen on a live OMCC yet, and the vendor stack processes
++		 * them anyway: count them, and drop them only when
++		 * drop_crc_errors is set. The observer always gets the flag.
+ 		 */
+-		if (cb->flags & OMCI_F_CRC_ERROR)
+-			atomic64_inc(&odev->rx_crc_errors);
+-		else
++		if (cb->flags & OMCI_F_CRC_ERROR) {
++			bool drop = READ_ONCE(odev->drop_crc_errors);
++
++			dev_warn_ratelimited(odev->parent,
++					     "OMCI frame flagged with a CRC error (%lld so far), %s\n",
++					     (long long)atomic64_inc_return(&odev->rx_crc_errors),
++					     drop ? "dropped" : "processed");
++			if (!drop)
++				omci_agent_receive(odev, skb);
++		} else {
+ 			omci_agent_receive(odev, skb);
++		}
+ 
+ 		mutex_lock(&odev->owner_lock);
+ 		if (odev->owner_portid && odev->owner_net) {
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index af16e8d..24d4c7a 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -214,6 +214,8 @@ struct omci_device {
+ 	atomic64_t rx_bytes;
+ 	atomic64_t rx_dropped;
+ 	atomic64_t rx_crc_errors;
++	/* Discard OMCI frames the MAC flags with a CRC error (default off) */
++	bool drop_crc_errors;
+ 	atomic64_t tx_packets;
+ 	atomic64_t tx_bytes;
+ 	atomic64_t tx_errors;
+diff --git a/net/xpon/omci/sysfs.c b/net/xpon/omci/sysfs.c
+index ed02bc8..141bcfa 100644
+--- a/net/xpon/omci/sysfs.c
++++ b/net/xpon/omci/sysfs.c
+@@ -150,6 +150,30 @@ OMCI_ATOMIC64_ATTR_RO(rx_packets, rx_packets);
+ OMCI_ATOMIC64_ATTR_RO(rx_bytes, rx_bytes);
+ OMCI_ATOMIC64_ATTR_RO(rx_dropped, rx_dropped);
+ OMCI_ATOMIC64_ATTR_RO(rx_crc_errors, rx_crc_errors);
++
++static ssize_t drop_crc_errors_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct omci_device *odev = omci_dev_from_dev(dev);
++
++	return sysfs_emit(buf, "%u\n", READ_ONCE(odev->drop_crc_errors));
++}
++
++static ssize_t drop_crc_errors_store(struct device *dev,
++				     struct device_attribute *attr,
++				     const char *buf, size_t count)
++{
++	struct omci_device *odev = omci_dev_from_dev(dev);
++	bool value;
++	int ret;
++
++	ret = kstrtobool(buf, &value);
++	if (ret)
++		return ret;
++	WRITE_ONCE(odev->drop_crc_errors, value);
++	return count;
++}
++static DEVICE_ATTR_RW(drop_crc_errors);
+ OMCI_ATOMIC64_ATTR_RO(tx_packets, tx_packets);
+ OMCI_ATOMIC64_ATTR_RO(tx_bytes, tx_bytes);
+ OMCI_ATOMIC64_ATTR_RO(tx_errors, tx_errors);
+@@ -688,6 +712,7 @@ static struct attribute *omci_attrs[] = {
+ 	&dev_attr_rx_bytes.attr,
+ 	&dev_attr_rx_dropped.attr,
+ 	&dev_attr_rx_crc_errors.attr,
++	&dev_attr_drop_crc_errors.attr,
+ 	&dev_attr_tx_packets.attr,
+ 	&dev_attr_tx_bytes.attr,
+ 	&dev_attr_tx_errors.attr,

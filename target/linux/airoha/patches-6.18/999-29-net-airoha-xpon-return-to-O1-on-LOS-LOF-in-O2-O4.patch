@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:10:53 -0300
+Subject: [PATCH 20/48] net: airoha: xpon: return to O1 on LOS/LOF in O2-O4
+
+G.984.3 sends an ONU that detects LOS or LOF in O2, O3 or O4 back to O1,
+where it waits for downstream synchronisation before entering O2 again;
+only O5 goes to O6. The stock driver does the same: gpon_detect_los_lof()
+disables the session for states 2..4 and moves O5 to O6.
+
+This driver only reacted in O5. An ONU that lost the light while in O3
+or O4 kept its ONU-ID and its activation state until TO1 (10 s) sent it
+to O2, not O1, and an ONU in O2 stayed in O2.
+
+Add ploam_notify_sync_lost(), which forgets the activation and moves O2,
+O3 or O4 to O1 through state_changed() (so TO1 stops and G_ACTIVATION_ST
+and G_ONU_ID follow), and call it from the PHY link poll on a link
+up -> down transition. When the poll sees the link again the ONU enters
+O2 with ploam_start(). The PHY is still locking when gpon_enable() enters
+O2, so only a real up -> down transition counts; otherwise every new
+session would detour through O1 and miss the first Upstream_Overhead.
+An O4 entered from O6 by a broadcast POPUP still holds the T-CONTs of
+the session and takes the full restart path instead (see
+gpon_clean_reactivation). Both cases are logged, rate limited.
+
+Behind airoha_xpon.gpon_los_o1 (0644, default on: it is what both the
+standard and the stock driver do, and it only acts outside O5).
+
+The link poll period is also a parameter now,
+airoha_xpon.gpon_link_poll_ms (0644, 10..1000, default 250 = unchanged).
+The PHY raises no LOS/LOF interrupt, so a downstream loss shorter than
+the poll is invisible to the FSM: in two of the logged O6 entries the
+"upstream burst started late" interrupt came 213 ms and 237 ms before the
+poll reported the PHY down. A faster poll is not the default because it
+also turns a transient not-ready sample in O5 into O6, and O6 without a
+POPUP ends in a full restart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 29 ++++++-
+ drivers/net/ethernet/airoha/airoha_ploam.h |  1 +
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 92 +++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_xpon.h  |  2 +
+ 4 files changed, 120 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 1460e31..f7f0962 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -696,9 +696,9 @@ void ploam_set_identity(struct ploam_priv *pp, const u8 sn[8],
+ 	memcpy(pp->passwd, passwd, sizeof(pp->passwd));
+ }
+ 
+-void ploam_reset(struct ploam_priv *pp)
++/* Forget the activation; the state is set by the caller. */
++static void ploam_clear_session(struct ploam_priv *pp)
+ {
+-	pp->state                = GPON_O1_INITIAL;
+ 	pp->onu_id               = PLOAM_ONU_UNASSIGNED;
+ 	pp->key_exchange_pending = false;
+ 	pp->rei_seq              = 0;
+@@ -708,6 +708,12 @@ void ploam_reset(struct ploam_priv *pp)
+ 	/* emergency_state is sticky: only cleared by Disable_SN PARTICIPATE */
+ }
+ 
++void ploam_reset(struct ploam_priv *pp)
++{
++	pp->state = GPON_O1_INITIAL;
++	ploam_clear_session(pp);
++}
++
+ void ploam_start(struct ploam_priv *pp)
+ {
+ 	if (pp->state != GPON_O1_INITIAL)
+@@ -821,6 +827,25 @@ void ploam_notify_ber(struct ploam_priv *pp, u32 bip_count)
+ 		ploam_send_rei(pp, bip_count);
+ }
+ 
++/*
++ * G.984.3: LOS or LOF in O2, O3 or O4 sends the ONU back to O1, where it
++ * waits for downstream synchronisation; the caller enters O2 again with
++ * ploam_start() once the downstream is back. Unlike ploam_reset() this
++ * goes through state_changed(), so TO1 stops and the MAC follows.
++ * Returns true if the ONU was moved to O1.
++ */
++bool ploam_notify_sync_lost(struct ploam_priv *pp)
++{
++	if (pp->state != GPON_O2_STANDBY &&
++	    pp->state != GPON_O3_SERIAL_NUMBER &&
++	    pp->state != GPON_O4_RANGING)
++		return false;
++
++	ploam_clear_session(pp);
++	ploam_set_state(pp, GPON_O1_INITIAL);
++	return true;
++}
++
+ void ploam_notify_los(struct ploam_priv *pp)
+ {
+ 	/* LOS while operational: transition to O6 (popup state).
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 448ed3a..4eebbef 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -172,6 +172,7 @@ void ploam_handle_downstream(struct ploam_priv *pp,
+ void ploam_notify_dying_gasp(struct ploam_priv *pp);
+ void ploam_notify_ber(struct ploam_priv *pp, u32 bip_count);
+ void ploam_notify_los(struct ploam_priv *pp);
++bool ploam_notify_sync_lost(struct ploam_priv *pp);
+ 
+ /* State queries */
+ enum gpon_state ploam_get_state(const struct ploam_priv *pp);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index b301316..a3cccc0 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2960,6 +2960,8 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 	case GPON_O1_INITIAL:
+ 		cancel_delayed_work(&priv->to1_work);
+ 		cancel_delayed_work(&priv->to2_work);
++		/* Only the LOS/LOF return from O2-O4 gets here with the MAC on. */
++		gpon_write(priv, GPON_ONU_ID, PLOAM_ONU_UNASSIGNED);
+ 		break;
+ 	default:
+ 		break;
+@@ -3318,6 +3320,7 @@ static void gpon_disable(struct xpon_priv *priv)
+ 
+ reset_session:
+ 	priv->gpon_session_o5 = false;
++	priv->los_in_o1 = false;
+ 	ploam_reset(priv->ploam);
+ 	if (!omci_reset)
+ 		airoha_gpon_omci_reset_session(&priv->omci);
+@@ -3406,13 +3409,94 @@ static void gpon_handle_irq_status(struct xpon_priv *priv, u32 raw, u32 enabled)
+ 	queue_work(priv->fsm_wq, &priv->irq_work);
+ }
+ 
++/*
++ * G.984.3: LOS/LOF in O2, O3 or O4 sends the ONU to O1, and it re-enters O2
++ * once the downstream is back (the stock gpon_detect_los_lof() does the same
++ * for states 2..4). Before this, the FSM only reacted in O5 and an ONU that
++ * lost the light in O3/O4 kept its ONU-ID until TO1 sent it to O2.
++ */
++static bool gpon_los_o1 = true;
++module_param(gpon_los_o1, bool, 0644);
++MODULE_PARM_DESC(gpon_los_o1,
++		 "LOS/LOF in O2-O4 returns to O1 (G.984.3, stock driver) (default: on)");
++
++/*
++ * The PHY raises no LOS/LOF interrupt here, so the FSM sees a downstream
++ * loss only at the next sample of this poll. 250 ms misses a short loss
++ * in O5 completely. A shorter period reacts faster but also turns a
++ * transient not-ready sample into O6, and O6 without a POPUP ends in a
++ * full restart; keep the old period unless asked otherwise.
++ */
++static unsigned int gpon_link_poll_ms = XPON_LINK_POLL_MS;
++module_param(gpon_link_poll_ms, uint, 0644);
++MODULE_PARM_DESC(gpon_link_poll_ms,
++		 "GPON PHY link/LOS poll period in ms, 10..1000 (default: 250)");
++
++static unsigned long airoha_xpon_link_poll_jiffies(struct xpon_priv *priv)
++{
++	if (priv->mode != AIROHA_XPON_MODE_GPON)
++		return msecs_to_jiffies(XPON_LINK_POLL_MS);
++
++	return msecs_to_jiffies(clamp(READ_ONCE(gpon_link_poll_ms), 10U,
++				      1000U));
++}
++
++/*
++ * @lost: the previous sample had the link up and this one does not. Only a
++ * real loss counts: the PHY is still locking when gpon_enable() enters O2,
++ * and treating that as LOS would send every new session through O1 and
++ * make it miss the first Upstream_Overhead.
++ */
++static void gpon_link_sync_state(struct xpon_priv *priv, bool link, bool lost)
++{
++	enum gpon_state st = ploam_get_state(priv->ploam);
++
++	if (link) {
++		if (st == GPON_O1_INITIAL && priv->los_in_o1) {
++			priv->los_in_o1 = false;
++			dev_info_ratelimited(priv->dev,
++					     "GPON downstream back in O1: entering O2\n");
++			ploam_start(priv->ploam);
++		}
++		return;
++	}
++
++	if (!lost || !READ_ONCE(gpon_los_o1) ||
++	    (st != GPON_O2_STANDBY && st != GPON_O3_SERIAL_NUMBER &&
++	     st != GPON_O4_RANGING))
++		return;
++
++	/*
++	 * O4 entered from O6 by a broadcast POPUP still holds the T-CONTs and
++	 * GEM ports of the session; release them with a full restart instead
++	 * of a soft O1, like TO1 does in that state.
++	 */
++	if (priv->gpon_session_o5 && READ_ONCE(gpon_clean_reactivation)) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON LOS/LOF in %s after this session reached O5: restarting the session\n",
++				     gpon_state_name(st));
++		gpon_disable(priv);
++		if (READ_ONCE(priv->started) && READ_ONCE(priv->optical_active))
++			mod_delayed_work(priv->fsm_wq, &priv->restart_work,
++					 msecs_to_jiffies(GPON_DEACTIVATE_RESTART_MS));
++		return;
++	}
++
++	dev_warn_ratelimited(priv->dev,
++			     "GPON LOS/LOF in %s: back to O1 until the downstream returns\n",
++			     gpon_state_name(st));
++	gpon_write(priv, GPON_ONU_ID, PLOAM_ONU_UNASSIGNED);
++	if (ploam_notify_sync_lost(priv->ploam))
++		priv->los_in_o1 = true;
++}
++
+ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ {
+ 	struct xpon_priv *priv =
+ 		container_of(to_delayed_work(work), struct xpon_priv,
+ 			     phy_link_work);
+ 	u32 mac_active, mac_enable, mac_status;
+-	bool ready, los, link, changed;
++	bool ready, los, link, changed, was_up;
+ 	int ret;
+ 
+ 	if (!READ_ONCE(priv->phy_powered))
+@@ -3423,6 +3507,7 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 		goto rearm;
+ 
+ 	link = ready && !los;
++	was_up = READ_ONCE(priv->phy_link_known) && READ_ONCE(priv->phy_link_up);
+ 	changed = !READ_ONCE(priv->phy_link_known) ||
+ 		  READ_ONCE(priv->phy_link_up) != link;
+ 	WRITE_ONCE(priv->phy_link_known, true);
+@@ -3466,11 +3551,14 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 		ploam_notify_los(priv->ploam);
+ 	}
+ 
++	if (priv->mode == AIROHA_XPON_MODE_GPON && READ_ONCE(priv->mac_enabled))
++		gpon_link_sync_state(priv, link, was_up && !link);
++
+ rearm:
+ 	gpon_bb_sample(priv);
+ 	if (READ_ONCE(priv->phy_powered))
+ 		mod_delayed_work(priv->fsm_wq, &priv->phy_link_work,
+-				 msecs_to_jiffies(XPON_LINK_POLL_MS));
++				 airoha_xpon_link_poll_jiffies(priv));
+ }
+ 
+ /* TO1: O3/O4 timeout — no Ranging_Time received within 10 s → return to O2 */
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 7a31419..f91f7cf 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -570,6 +570,8 @@ struct xpon_priv {
+ 	bool			gpon_session_o5;
+ 	/* Why restart_work restarts the session (logged), or NULL */
+ 	const char		*restart_reason;
++	/* In O1 because of LOS/LOF in O2-O4; O2 again when the link is back */
++	bool			los_in_o1;
+ 
+ };
+ 

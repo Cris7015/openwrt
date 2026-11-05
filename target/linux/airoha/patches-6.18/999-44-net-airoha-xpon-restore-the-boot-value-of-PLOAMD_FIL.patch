@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:00:25 -0300
+Subject: [PATCH 35/48] net: airoha: xpon: restore the boot value of
+ PLOAMD_FILTER_IN_O5 outside O5
+
+"filter Upstream_Overhead and EBL in hardware in O5" set bits 0 and 8 of
+0x4360 in O5 and forced them to 0 in every other state and at session
+start, also with gpon_o5_ploam_filter=0. The previous driver never wrote
+the register, so the parameter did not give back the old behaviour, and
+the reset value of the two bits has never been read on this board. The
+stock driver only ever sets them, in O5, and relies on its MAC reset to
+bring the register back.
+
+Read the register before the first write and, outside O5/O6, write back
+the bits found then instead of 0; in O5 set them (cur | 0x101) as the
+stock driver does. Nothing is written when the bits already have the
+wanted value, so with the parameter off the register is never touched,
+exactly as before the series. A change of the parameter takes effect at
+the next state change; say so in its description.
+
+The register comes from the stock EN751221 xpon.ko only, so limit it to
+that SoC (gpon_stock_en751221_csr()); EN7523 and EN7528 keep the old
+behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 35 +++++++++++++++++++----
+ drivers/net/ethernet/airoha/airoha_xpon.h |  3 ++
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 8c275ff..31280b0 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -677,25 +677,50 @@ static void gpon_adjust_mac_rx_delay(struct xpon_priv *priv)
+ 		 FIELD_PREP(DBG_DLY_FIX_PHY_RX_DLY_MASK, fixed));
+ }
+ 
++/*
++ * The new MAC registers below (PLOAMD_FILTER_IN_O5, the AES software switch,
++ * the T-CONT reset image) are taken from the stock EN751221 xpon.ko and
++ * have only been checked against it; other SoCs keep the old behaviour.
++ */
++static bool gpon_stock_en751221_csr(struct xpon_priv *priv)
++{
++	return priv->match_data->version == econet_en751221;
++}
++
+ /*
+  * The stock driver sets PLOAMD_FILTER_IN_O5 (0x4360 bits 0 and 8) on
+  * entering O5, so the MAC drops the periodic broadcast Upstream_Overhead
+  * and Extended_Burst_Length an operational ONU must not act on. Its MAC
+- * reset clears the filter for the next activation; this driver does not
+- * reset the EN751221 MAC, so clear it explicitly outside O5/O6.
++ * reset puts the register back to its reset value for the next activation.
++ * This driver does not reset the EN751221 MAC, so outside O5/O6 it writes
++ * back the bits read before its first write, whatever they were; with the
++ * parameter off the register therefore never changes. A change of the
++ * parameter takes effect at the next state change.
+  */
+ static bool gpon_o5_ploam_filter = true;
+ module_param(gpon_o5_ploam_filter, bool, 0644);
+ MODULE_PARM_DESC(gpon_o5_ploam_filter,
+-		 "Filter Upstream_Overhead/Extended_Burst_Length in hardware in O5, as the stock driver (default: on)");
++		 "Filter Upstream_Overhead/Extended_Burst_Length in hardware in O5, as the stock driver; applies at the next state change (default: on)");
+ 
+ static void gpon_set_o5_ploam_filter(struct xpon_priv *priv, bool o5)
+ {
+ 	u32 bits = PLOAMD_FILTER_UPSTREAM_OVERHEAD |
+ 		   PLOAMD_FILTER_EXT_BURST_LEN;
++	u32 cur, val;
++
++	if (!gpon_stock_en751221_csr(priv))
++		return;
++
++	cur = gpon_read(priv, GPON_DBG_PLOAMD_FILTER);
++	if (!priv->ploamd_filter_saved) {
++		priv->ploamd_filter_boot = cur & bits;
++		priv->ploamd_filter_saved = true;
++	}
+ 
+-	gpon_rmw(priv, GPON_DBG_PLOAMD_FILTER, bits,
+-		 o5 && READ_ONCE(gpon_o5_ploam_filter) ? bits : 0);
++	val = o5 && READ_ONCE(gpon_o5_ploam_filter) ? bits :
++						      priv->ploamd_filter_boot;
++	if ((cur & bits) != val)
++		gpon_write(priv, GPON_DBG_PLOAMD_FILTER, (cur & ~bits) | val);
+ }
+ 
+ /*
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index c3bf32a..4a299fd 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -583,6 +583,9 @@ struct xpon_priv {
+ 	const char		*restart_reason;
+ 	/* In O1 because of LOS/LOF in O2-O4; O2 again when the link is back */
+ 	bool			los_in_o1;
++	/* PLOAMD_FILTER_IN_O5 bits 0/8 as found before the first write */
++	u32			ploamd_filter_boot;
++	bool			ploamd_filter_saved;
+ 
+ };
+ 

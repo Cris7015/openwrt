@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:23:56 -0300
+Subject: [PATCH 30/48] net: xpon: omci: fix the PPTP expected type and the Ext
+ VLAN table attribute
+
+PPTP Ethernet UNI attribute 1, expected type, is readable and writable
+in G.988 (the OLT may pin the UNI type instead of autosensing). The
+descriptor had it read-only, so such a Set failed.
+
+Extended VLAN tagging operation configuration data attribute 6, the
+received frame VLAN tagging operation table, is a table attribute: a Get
+of it returns the table size and the OLT reads the rules with Get next.
+The agent returned the 16 bytes of the last rule written instead, did
+not allow Get next on the ME, and the Attribute ME reported attribute 8
+(DSCP to P-bit mapping, BIT(8)) as the table instead of attribute 6
+(BIT(10)).
+
+Make expected type writable, answer a Get of the table alone with its
+size and a snapshot for Get next, fail it when combined with other
+attributes, and mark the right attribute as the table.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 50 ++++++++++++++++++++++++++++++++++++++++++-
+ net/xpon/omci/me.c    |  5 +++--
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 695faac..6ac98a2 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -2360,7 +2360,7 @@ static bool omci_agent_attr_is_table(u16 class_id, u16 mask)
+ 	if (class_id == OMCI_CLASS_ATTRIBUTE)
+ 		return mask & OMCI_ATTRIBUTE_CODE_POINTS_MASK;
+ 	if (class_id == OMCI_CLASS_EXTENDED_VLAN)
+-		return mask == BIT(8);
++		return mask == OMCI_EXT_VLAN_TABLE_MASK;
+ 
+ 	return false;
+ }
+@@ -4266,6 +4266,41 @@ omci_agent_refresh_nokia_optical(struct omci_device *odev,
+ 	return 0;
+ }
+ 
++static u8
++omci_agent_get_ext_vlan_table_locked(struct omci_agent *agent,
++				     const struct omci_mib_object *object,
++				     u8 *response_content,
++				     size_t response_capacity,
++				     size_t *response_len)
++{
++	const struct omci_extended_vlan *vlan = &object->extended_vlan;
++	size_t table_len = 0;
++	unsigned int i;
++	u8 *table;
++
++	if (response_capacity < 7)
++		return OMCI_RESULT_PARAMETER_ERROR;
++	if (vlan->valid)
++		table_len = vlan->rule_count * OMCI_EXT_VLAN_RULE_LEN;
++	table = kmalloc(max_t(size_t, table_len, 1), GFP_KERNEL);
++	if (!table)
++		return OMCI_RESULT_PROCESSING_ERROR;
++	for (i = 0; i < table_len / OMCI_EXT_VLAN_RULE_LEN; i++)
++		memcpy(table + i * OMCI_EXT_VLAN_RULE_LEN, vlan->rules[i].raw,
++		       OMCI_EXT_VLAN_RULE_LEN);
++	omci_set_table_snapshot_locked(agent, OMCI_CLASS_EXTENDED_VLAN,
++				       object->entity_id,
++				       OMCI_EXT_VLAN_TABLE_MASK, table,
++				       table_len);
++
++	memset(response_content, 0, response_capacity);
++	response_content[0] = OMCI_RESULT_SUCCESS;
++	put_unaligned_be16(OMCI_EXT_VLAN_TABLE_MASK, response_content + 1);
++	put_unaligned_be32(table_len, response_content + 3);
++	*response_len = 7;
++	return OMCI_RESULT_SUCCESS;
++}
++
+ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 				u16 entity_id, bool extended,
+ 				const u8 *content, size_t content_len,
+@@ -4321,6 +4356,19 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 	if (class_id == OMCI_CLASS_ANI_G &&
+ 	    (mask & OMCI_ANI_G_OPTICAL_LEVEL_MASK))
+ 		failed = omci_agent_refresh_ani_g_levels(odev, object, mask);
++	/*
++	 * The received frame VLAN tagging operation table is a table
++	 * attribute: asked for alone, a Get returns its size and Get next
++	 * the rules. Combined with other attributes it fails.
++	 */
++	if (class_id == OMCI_CLASS_EXTENDED_VLAN &&
++	    (mask & OMCI_EXT_VLAN_TABLE_MASK)) {
++		if (mask == OMCI_EXT_VLAN_TABLE_MASK)
++			return omci_agent_get_ext_vlan_table_locked(agent, object,
++					response_content, response_capacity,
++					response_len);
++		failed |= OMCI_EXT_VLAN_TABLE_MASK;
++	}
+ 
+ 	desc = omci_me_lookup(agent, class_id);
+ 	if (desc && (desc->flags & OMCI_ME_F_PM)) {
+diff --git a/net/xpon/omci/me.c b/net/xpon/omci/me.c
+index 017a960..bb87daa 100644
+--- a/net/xpon/omci/me.c
++++ b/net/xpon/omci/me.c
+@@ -371,7 +371,7 @@ static const struct omci_attr_desc omci_circuit_pack_attrs[] = {
+ };
+ 
+ static const struct omci_attr_desc omci_pptp_ethernet_uni_attrs[] = {
+-	OMCI_ATTR(15, 0, 1, OMCI_R),
++	OMCI_ATTR(15, 0, 1, OMCI_RW),		/* Expected type, R/W in G.988 */
+ 	OMCI_ATTR(14, 1, 1, OMCI_R),
+ 	OMCI_ATTR(13, 2, 1, OMCI_RW),
+ 	OMCI_ATTR(12, 3, 1, OMCI_RW),
+@@ -805,7 +805,8 @@ static const struct omci_me_desc omci_me_descs[] = {
+ 		      omci_8021p_mapper_attrs),
+ 	STANDARD_DESC(OMCI_CLASS_EXTENDED_VLAN,
+ 		      "Extended VLAN tagging operation configuration data",
+-		      OLT_CREATED_ACTIONS | OMCI_ME_ACTION_SET_TABLE,
++		      OLT_CREATED_ACTIONS | OMCI_ME_ACTION_SET_TABLE |
++		      OMCI_ME_ACTION_GET_NEXT,
+ 		      OMCI_ME_F_DATAPATH, GENMASK(15, 8), GENMASK(15, 8), 50,
+ 		      OMCI_CLASS_CATEGORY_LAYER2, OMCI_CLASS_SUPPORT_PROVISIONED,
+ 		      omci_extended_vlan_attrs),

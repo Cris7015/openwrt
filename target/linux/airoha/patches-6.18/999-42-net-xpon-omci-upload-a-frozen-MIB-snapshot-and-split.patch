@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:26:42 -0300
+Subject: [PATCH 33/48] net: xpon: omci: upload a frozen MIB snapshot and split
+ large MEs
+
+G.988 MIB upload: the ONU takes a snapshot of its MIB, answers with the
+number of MIB upload next commands needed to read it, and serves each of
+them from the snapshot. An ME whose attributes do not fit the 26 bytes
+of one MIB upload next response is sent in several, each with its own
+part of the attribute mask.
+
+The agent announced one command per ME and encoded each ME on the fly
+from the live MIB, stopping at the first attribute that did not fit, so
+those attributes never reached the OLT: the circuit pack vendor ID,
+equipment ID and T-CONT, priority queue and traffic scheduler counts,
+the cardholder actual equipment ID, the VEIP TCP/UDP pointer and IANA
+port, the 802.1p mapper DSCP to P-bit mapping, default P-bit and TP type,
+and so on. MEs without a descriptor went out as 26 raw bytes under an
+attribute mask of 0xffff, claiming attributes ONU-G and ONU2-G do not
+have.
+
+Build the snapshot when MIB upload arrives, splitting each ME into as
+many records as its attributes need, and answer MIB upload next from it.
+Drop it on MIB reset, when the OMCC channel changes and when the ONU
+identity changes. The first record of every ME is the one the agent sent
+before; checked in userspace for every ME class.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c    | 117 ++++++++++++++++++++++++++++-----------
+ net/xpon/omci/internal.h |   3 +
+ net/xpon/omci/me.c       |  65 +++++++++++++++-------
+ net/xpon/omci/me.h       |  17 ++++--
+ 4 files changed, 146 insertions(+), 56 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 6ac98a2..90bc151 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -61,6 +61,7 @@
+ 
+ static void omci_agent_reset_table_snapshot_locked(struct omci_agent *agent);
+ static void omci_pm_work(struct work_struct *work);
++static void omci_agent_reset_upload_locked(struct omci_agent *agent);
+ 
+ static bool omci_agent_result_can_be_faked(u8 result)
+ {
+@@ -1908,6 +1909,7 @@ void omci_agent_cleanup(struct omci_device *odev)
+ 	mutex_lock(&agent->lock);
+ 	omci_agent_reset_duplicate_locked(agent);
+ 	omci_agent_reset_table_snapshot_locked(agent);
++	omci_agent_reset_upload_locked(agent);
+ 	omci_agent_clear_services_locked(odev);
+ 	xa_for_each(&agent->mib, index, object) {
+ 		xa_erase(&agent->mib, index);
+@@ -2639,7 +2641,7 @@ static int omci_agent_mib_reset_locked(struct omci_device *odev, bool all,
+ 		ret = omci_agent_profile_refresh_locked(odev, NULL, profile_changed);
+ 
+ 	omci_agent_set_mib_sync_locked(agent, 0);
+-	agent->upload_index = 0;
++	omci_agent_reset_upload_locked(agent);
+ 	omci_agent_reset_alarm_sequence(agent);
+ 	omci_agent_reset_duplicate_locked(agent);
+ 
+@@ -4573,46 +4575,93 @@ omci_agent_send_ani_g_test_result(struct omci_device *odev,
+ 	return ret;
+ }
+ 
+-static int omci_agent_upload_next_locked(struct omci_agent *agent,
+-					 u16 sequence, u8 *content)
++static void omci_agent_reset_upload_locked(struct omci_agent *agent)
++{
++	kvfree(agent->upload_records);
++	agent->upload_records = NULL;
++	agent->upload_count = 0;
++	agent->upload_index = 0;
++}
++
++static unsigned int
++omci_agent_object_upload_records(struct omci_agent *agent,
++				 const struct omci_mib_object *object,
++				 struct omci_upload_record *records)
+ {
+ 	const struct omci_me_desc *desc;
++	size_t len;
++
++	desc = omci_me_lookup(agent, object->class_id);
++	if (desc)
++		return omci_me_upload_records(desc, object, records);
++
++	/* No attribute layout: one record with the stored bytes, as before */
++	if (records) {
++		records->class_id = object->class_id;
++		records->entity_id = object->entity_id;
++		records->mask = object->attr_mask;
++		len = min_t(size_t, object->data_len ?: OMCI_UPLOAD_ATTR_LEN,
++			    OMCI_UPLOAD_ATTR_LEN);
++		memcpy(records->data, object->data, len);
++	}
++	return 1;
++}
++
++/*
++ * G.988 MIB upload: the ONU takes a snapshot of its MIB and the OLT reads
++ * it back with as many MIB upload next commands as the response announces,
++ * whatever happens to the MIB meanwhile. An ME whose attributes do not fit
++ * one response takes several.
++ */
++static int omci_agent_upload_snapshot_locked(struct omci_agent *agent)
++{
++	struct omci_upload_record *records = NULL;
+ 	struct omci_mib_object *object;
++	unsigned int count = 0, used = 0;
+ 	unsigned long index;
+-	size_t encoded_len = 0;
+-	u16 encoded_mask = 0;
+-	u16 upload_pos = 0;
+-	int ret;
+ 
++	xa_for_each(&agent->mib, index, object)
++		if (omci_mib_object_uploadable(agent, object))
++			count += omci_agent_object_upload_records(agent, object,
++								  NULL);
++	if (count > U16_MAX)
++		return -E2BIG;
++	if (count) {
++		records = kvcalloc(count, sizeof(*records), GFP_KERNEL);
++		if (!records)
++			return -ENOMEM;
++	}
+ 	xa_for_each(&agent->mib, index, object) {
+ 		if (!omci_mib_object_uploadable(agent, object))
+ 			continue;
+-		if (upload_pos++ == sequence)
+-			goto found;
++		if (WARN_ON_ONCE(used +
++				 omci_agent_object_upload_records(agent, object,
++								  NULL) >
++				 count))
++			break;
++		used += omci_agent_object_upload_records(agent, object,
++							 records + used);
+ 	}
+ 
+-	return -ENOENT;
++	omci_agent_reset_upload_locked(agent);
++	agent->upload_records = records;
++	agent->upload_count = used;
++	return 0;
++}
+ 
+-found:
+-	put_unaligned_be16(object->class_id, content);
+-	put_unaligned_be16(object->entity_id, content + 2);
+-	desc = omci_me_lookup(agent, object->class_id);
+-	if (desc) {
+-		u16 mask = object->attr_mask & desc->mib_upload_mask;
++static int omci_agent_upload_next_locked(struct omci_agent *agent,
++					 u16 sequence, u8 *content)
++{
++	const struct omci_upload_record *record;
+ 
+-		ret = omci_me_encode_attributes(desc, object, mask,
+-						content + 6, 26,
+-						&encoded_mask, &encoded_len);
+-		if (ret && mask)
+-			return ret;
+-	} else {
+-		encoded_mask = object->attr_mask;
+-		encoded_len = min_t(size_t, object->data_len ?: 26, 26);
+-		memcpy(content + 6, object->data, encoded_len);
+-	}
+-	put_unaligned_be16(encoded_mask, content + 4);
+-	if (encoded_len < 26)
+-		memset(content + 6 + encoded_len, 0, 26 - encoded_len);
++	if (sequence >= agent->upload_count)
++		return -ENOENT;
++
++	record = &agent->upload_records[sequence];
++	put_unaligned_be16(record->class_id, content);
++	put_unaligned_be16(record->entity_id, content + 2);
++	put_unaligned_be16(record->mask, content + 4);
++	memcpy(content + 6, record->data, OMCI_UPLOAD_ATTR_LEN);
+ 	agent->upload_index = sequence + 1;
+ 	return 0;
+ }
+@@ -4809,8 +4858,10 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 	case OMCI_MSG_TYPE_MIB_UPLOAD:
+ 		if (capacity < 2)
+ 			return -EMSGSIZE;
+-		agent->upload_index = 0;
+-		put_unaligned_be16(omci_mib_count_locked(agent), content);
++		ret = omci_agent_upload_snapshot_locked(agent);
++		if (ret)
++			return ret;
++		put_unaligned_be16(agent->upload_count, content);
+ 		*content_len = 2;
+ 		break;
+ 	case OMCI_MSG_TYPE_MIB_UPLOAD_NEXT:
+@@ -5108,7 +5159,7 @@ void omci_agent_channel_changed(struct omci_device *odev, bool valid)
+ 	agent->operational = false;
+ 	omci_agent_reset_duplicate_locked(agent);
+ 	omci_agent_reset_table_snapshot_locked(agent);
+-	agent->upload_index = 0;
++	omci_agent_reset_upload_locked(agent);
+ 	if (!valid) {
+ 		omci_agent_reset_alarm_sequence(agent);
+ 		omci_agent_clear_services_locked(odev);
+@@ -5551,7 +5602,7 @@ __omci_agent_config_set_source(struct omci_device *odev, u16 key,
+ 		omci_agent_refresh_identity_locked(agent);
+ 		omci_agent_reset_duplicate_locked(agent);
+ 		omci_agent_reset_table_snapshot_locked(agent);
+-		agent->upload_index = 0;
++		omci_agent_reset_upload_locked(agent);
+ 	}
+ 	if (!ret && notify && changed)
+ 		omci_agent_identity_state_locked(agent, &identity);
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index e2b3010..af16e8d 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -134,6 +134,9 @@ struct omci_agent {
+ 	struct xarray services;
+ 	struct omci_agent_config config;
+ 	u32 upload_index;
++	/* MIB snapshot taken by MIB upload, served by MIB upload next */
++	struct omci_upload_record *upload_records;
++	unsigned int upload_count;
+ 	u16 mib_sync;
+ 	bool enabled;
+ 	bool permissive;
+diff --git a/net/xpon/omci/me.c b/net/xpon/omci/me.c
+index bb87daa..9bdc237 100644
+--- a/net/xpon/omci/me.c
++++ b/net/xpon/omci/me.c
+@@ -1358,18 +1358,38 @@ u8 omci_me_get_encode(const struct omci_attr_desc *attrs,
+ 	return result;
+ }
+ 
+-int omci_me_encode_attributes(const struct omci_me_desc *desc,
+-			      const struct omci_mib_object *object,
+-			      u16 mask, u8 *data, size_t len,
+-			      u16 *encoded_mask, size_t *encoded_len)
++static void omci_me_upload_close(struct omci_upload_record *record,
++				 const struct omci_mib_object *object,
++				 u16 mask)
+ {
++	record->class_id = object->class_id;
++	record->entity_id = object->entity_id;
++	record->mask = mask;
++}
++
++/*
++ * Split the uploadable attributes of @object into MIB upload next records
++ * (G.988 MIB upload next: class, instance, attribute mask and up to 26
++ * bytes of values). Attributes that do not fit in the current record
++ * start the next one, so an ME whose attributes exceed 26 bytes is sent in
++ * several records with disjoint masks. An ME with nothing to upload still
++ * gets one record, with an empty mask.
++ *
++ * @records may be NULL to count; it must otherwise be zeroed.
++ * Returns the number of records.
++ */
++unsigned int omci_me_upload_records(const struct omci_me_desc *desc,
++				    const struct omci_mib_object *object,
++				    struct omci_upload_record *records)
++{
++	u16 mask = object->attr_mask & desc->mib_upload_mask &
++		   desc->valid_attr_mask;
++	struct omci_upload_record *record = records;
++	unsigned int count = 0;
++	u16 record_mask = 0;
+ 	size_t used = 0;
+ 	unsigned int bit;
+-	u16 encoded = 0;
+ 
+-	if (!desc)
+-		return -ENOENT;
+-	mask &= desc->valid_attr_mask;
+ 	for (bit = 0; bit < 16; bit++) {
+ 		const struct omci_attr_desc *attr;
+ 		u16 attr_mask = BIT(15 - bit);
+@@ -1377,23 +1397,30 @@ int omci_me_encode_attributes(const struct omci_me_desc *desc,
+ 		if (!(mask & attr_mask))
+ 			continue;
+ 		attr = omci_me_find_attr(desc, attr_mask);
+-		if (!attr || !(attr->access & OMCI_ATTR_ACCESS_READ))
++		if (!attr || !(attr->access & OMCI_ATTR_ACCESS_READ) ||
++		    attr->len > OMCI_UPLOAD_ATTR_LEN)
+ 			continue;
+ 		if (attr->offset != OMCI_ATTR_OFFSET_ZERO &&
+ 		    attr->offset + attr->len > sizeof(object->data))
+-			return -EINVAL;
+-		if (len - used < attr->len)
+-			break;
+-		omci_me_put_value(data + used, attr, object->data);
++			continue;
++		if (record_mask && used + attr->len > OMCI_UPLOAD_ATTR_LEN) {
++			if (records)
++				omci_me_upload_close(record++, object,
++						     record_mask);
++			count++;
++			record_mask = 0;
++			used = 0;
++		}
++		if (records)
++			omci_me_put_value(record->data + used, attr,
++					  object->data);
+ 		used += attr->len;
+-		encoded |= attr_mask;
++		record_mask |= attr_mask;
+ 	}
+-	if (encoded_mask)
+-		*encoded_mask = encoded;
+-	if (encoded_len)
+-		*encoded_len = used;
++	if (records)
++		omci_me_upload_close(record, object, record_mask);
+ 
+-	return encoded ? 0 : -ENOSPC;
++	return count + 1;
+ }
+ 
+ unsigned int omci_me_attr_count(const struct omci_agent *agent)
+diff --git a/net/xpon/omci/me.h b/net/xpon/omci/me.h
+index d5f569e..1757ee9 100644
+--- a/net/xpon/omci/me.h
++++ b/net/xpon/omci/me.h
+@@ -199,10 +199,19 @@ u8 omci_me_get_encode(const struct omci_attr_desc *attrs,
+ 		      unsigned int num_attrs, const u8 *data, u16 mask,
+ 		      u16 failed, bool extended, u8 *content,
+ 		      size_t capacity, size_t *content_len);
+-int omci_me_encode_attributes(const struct omci_me_desc *desc,
+-			      const struct omci_mib_object *object,
+-			      u16 mask, u8 *data, size_t len,
+-			      u16 *encoded_mask, size_t *encoded_len);
++/* Attribute bytes of one MIB upload next response */
++#define OMCI_UPLOAD_ATTR_LEN		26
++
++struct omci_upload_record {
++	u16 class_id;
++	u16 entity_id;
++	u16 mask;
++	u8 data[OMCI_UPLOAD_ATTR_LEN];
++};
++
++unsigned int omci_me_upload_records(const struct omci_me_desc *desc,
++				    const struct omci_mib_object *object,
++				    struct omci_upload_record *records);
+ 
+ const char *omci_me_class_name(u16 class_id);
+ int omci_me_class_get(struct omci_device *odev, u16 class_id,

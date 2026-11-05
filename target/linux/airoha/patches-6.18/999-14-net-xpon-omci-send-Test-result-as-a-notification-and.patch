@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:02:54 -0300
+Subject: [PATCH 05/48] net: xpon: omci: send Test result as a notification and
+ refuse other tests
+
+G.988 lists Test result (message type 27) among the notifications: it
+reuses the TCI of the Test that started it but carries neither the AR
+nor the AK bit. The ANI-G result was built with the response encoder and
+went out as 0x3b, with AK set.
+
+The agent also answered every Test with success, while only the ANI-G
+self test ever produces a Test result. A Test of any other managed
+entity (a POTS line test, a circuit pack self test) therefore left the
+OLT waiting for a result until its timeout. Answer those with "command
+not supported" (result 2), like the other unimplemented actions.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 9f025d3..c5b3262 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -49,6 +49,8 @@
+ #define OMCI_MSG_TYPE_TEST_RESULT	27
+ #define OMCI_MSG_TYPE_GET_CURRENT_DATA	28
+ #define OMCI_MSG_TYPE_SET_TABLE	29
++/* Message type bit 6, acknowledgement */
++#define OMCI_MSG_TYPE_AK		0x20
+ 
+ #define OMCI_RESULT_SUCCESS		0
+ #define OMCI_RESULT_PROCESSING_ERROR	1
+@@ -4522,6 +4524,11 @@ omci_agent_send_ani_g_test_result(struct omci_device *odev,
+ 					sizeof(pdu), &pdu_len);
+ 	if (ret)
+ 		return ret;
++	/*
++	 * Test result is a notification (G.988 message type table): it
++	 * keeps the TCI of the Test but carries neither AR nor AK.
++	 */
++	pdu[2] &= ~OMCI_MSG_TYPE_AK;
+ 
+ 	omci_agent_log_wire(odev, "TX", pdu, pdu_len);
+ 	ret = omci_device_xmit(odev, pdu, pdu_len);
+@@ -4780,8 +4787,17 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 		content[0] = OMCI_RESULT_SUCCESS;
+ 		break;
+ 	case OMCI_MSG_TYPE_TEST:
+-		content[0] = OMCI_RESULT_SUCCESS;
+-		break;
++		/*
++		 * Only the ANI-G self test produces a Test result; accepting
++		 * any other Test left the OLT waiting for a result that never
++		 * came.
++		 */
++		if (omci_agent_is_ani_g_test(request) &&
++		    odev->ops->get_telemetry) {
++			content[0] = OMCI_RESULT_SUCCESS;
++			break;
++		}
++		fallthrough;
+ 	case OMCI_MSG_TYPE_START_SW_DOWNLOAD:
+ 	case OMCI_MSG_TYPE_DOWNLOAD_SECTION:
+ 	case OMCI_MSG_TYPE_END_SW_DOWNLOAD:

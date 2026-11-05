@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:05:50 -0300
+Subject: [PATCH 13/48] net: airoha: xpon: Encrypted_Port-ID must not create
+ GEM ports
+
+G.984.3 Encrypted_Port-ID only changes the encryption attribute of a
+Port-ID; the port itself is created by OMCI through the GEM port
+network CTP. gpon_cb_set_gem_encryption() always called
+gpon_set_gem_port_hw(port, valid=true, ...), so the message enabled any
+Port-ID in the hardware GEM table and in hw_gems/MIB, including ports
+OMCI never created or had already deleted.
+
+Record the attribute in encrypted_gems and only reprogram the port when
+it already exists in the GEM table. A port that OMCI creates later
+inherits the attribute, as before.
+
+encrypted_gems was also updated with non-atomic bit ops from the PLOAM
+worker while the OMCI path test_bit()ed it before taking gem_mib_lock.
+An OMCI write that sampled the bitmap just before an Encrypted_Port-ID
+could then rewrite the port in the clear. Update and test the bitmap
+under gem_mib_lock, which already serialises the GEM table writes, and
+clear it under the same lock on session stop.
+
+Octet 3 is "000000ba": a = encrypted, b = Port-ID (1) or ATM VPI (0).
+The field confirms this layout: the Huawei OLT sends 2 for clear Port-IDs
+1/257/385/513 and the Nokia OLT 3 for encrypted ones, so the existing
+"encrypted only for 3" decision is right and is kept as a = 1 with
+b = 1. A message with b = 0 names a VPI, not a GEM Port-ID; it used to
+rewrite GEM port <VPI> in the clear and is now ignored and logged.
+
+set_gem_encryption() now returns an error and the PLOAM layer does not
+acknowledge a message the hardware rejected. The GEM 0 exemption needed
+by the Nokia OLT is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 19 ++++--
+ drivers/net/ethernet/airoha/airoha_ploam.h | 10 ++-
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 71 ++++++++++++++++------
+ 3 files changed, 76 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 6fc564b..a6649ef 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -383,8 +383,8 @@ static void handle_encrypted_port_id(struct ploam_priv *pp,
+ 				      u8 onu_id, u8 type,
+ 				      const u8 c[PLOAM_CONTENT_LEN])
+ {
++	bool encrypted;
+ 	u16 port_id;
+-	u8 encrypt;
+ 	u8 dm_bytes[9];
+ 
+ 	if (onu_id != pp->onu_id)
+@@ -393,12 +393,23 @@ static void handle_encrypted_port_id(struct ploam_priv *pp,
+ 	if (pp->state != GPON_O5_OPERATION)
+ 		return;
+ 
+-	/* c[0] BE: bits[7:2]=resv, bits[1:0]=encrypt */
+-	encrypt = c[0] & 3;
++	/*
++	 * c[0] = octet 3 "000000ba": a (bit 0) = encrypted, b (bit 1) =
++	 * Port-ID (1) or ATM VPI (0). Both OLTs seen in the field set b:
++	 * Huawei sends 2 for a clear port, Nokia 3 for an encrypted one.
++	 * A VPI is not a GEM Port-ID; do not apply it to the GEM table.
++	 */
++	if (!(c[0] & PLOAM_ENC_PORT_ID)) {
++		pr_warn_ratelimited("airoha-ploam: ignoring Encrypted_Port-ID for an ATM VPI (octet 3 = %#04x)\n",
++				    c[0]);
++		return;
++	}
++	encrypted = c[0] & PLOAM_ENC_ENCRYPTED;
+ 	/* c[1]=port_id_m (8 bits), c[2] BE: bits[7:4]=port_id_l, bits[3:0]=resv */
+ 	port_id = ((u16)c[1] << 4) | ((c[2] >> 4) & 0xF);
+ 
+-	pp->ops->set_gem_encryption(pp->hw_priv, port_id, encrypt);
++	if (pp->ops->set_gem_encryption(pp->hw_priv, port_id, encrypted))
++		return;
+ 
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 1a905f0..8902f3c 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -48,6 +48,10 @@
+ #define PLOAM_DOWN_SLEEP_ALLOW		0x18
+ #define PLOAM_DOWN_MAX_TYPE		0x19
+ 
++/* Encrypted_Port-ID octet 3 "000000ba" */
++#define PLOAM_ENC_ENCRYPTED		0x01	/* a: 1 = encrypted */
++#define PLOAM_ENC_PORT_ID		0x02	/* b: 1 = Port-ID, 0 = ATM VPI */
++
+ /* Assign_Alloc-ID payload type (octet 5) */
+ #define PLOAM_ALLOC_ID_TYPE_GEM		0x01
+ #define PLOAM_ALLOC_ID_TYPE_DEALLOCATE	0xFF
+@@ -113,7 +117,9 @@ struct ploam_msg {
+  * @set_ber_interval: update BER reporting timer to @interval_ms.
+  * @set_omci_gem: configure or clear the OMCI GEM port in G_OMCI_ID;
+  *   return zero only when the hardware channel is ready.
+- * @set_gem_encryption: program per-GEM-port encryption mode in GEM port table.
++ * @set_gem_encryption: record the Encrypted_Port-ID attribute of a Port-ID
++ *   and apply it if the GEM port exists; return zero on success (the PLOAM
++ *   layer acknowledges the message only then).
+  * @set_alloc_id: allocate or deallocate a T-CONT for the given alloc-ID;
+  *   return zero only when the hardware applied it (the PLOAM layer
+  *   acknowledges the message only then).
+@@ -137,7 +143,7 @@ struct ploam_ops {
+ 	void (*request_new_key)(void *priv);
+ 	void (*set_ber_interval)(void *priv, u32 interval_ms);
+ 	int (*set_omci_gem)(void *priv, u16 gem_port_id, bool valid);
+-	void (*set_gem_encryption)(void *priv, u16 port_id, u8 encrypt_mode);
++	int (*set_gem_encryption)(void *priv, u16 port_id, bool encrypted);
+ 	int (*set_alloc_id)(void *priv, u16 alloc_id, bool allocate);
+ 	void (*state_changed)(void *priv, enum gpon_state state);
+ 	void (*deactivate)(void *priv);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 3dd2958..4e4b829 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1250,8 +1250,15 @@ static void gpon_mib_start(struct xpon_priv *priv)
+ 				      msecs_to_jiffies(GPON_MIB_POLL_MS));
+ }
+ 
+-static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+-				bool valid, bool encrypted)
++/*
++ * @ploam_encryption: also encrypt the port when Encrypted_Port-ID announced
++ * it. The test runs under gem_mib_lock, which also serialises the PLOAM
++ * update of encrypted_gems, so a concurrent Encrypted_Port-ID cannot be
++ * overwritten by an OMCI write that sampled the bitmap before it.
++ */
++static int __gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
++				  bool valid, bool encrypted,
++				  bool ploam_encryption)
+ {
+ 	bool was;
+ 	int ret;
+@@ -1260,6 +1267,9 @@ static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&priv->gem_mib_lock);
++	if (valid && ploam_encryption &&
++	    test_bit(gem_port_id, priv->encrypted_gems))
++		encrypted = true;
+ 	was = test_bit(gem_port_id, priv->hw_gems);
+ 	/* Fold the counts in while the rows still match the old GEM set. */
+ 	if (was != valid && priv->gem_mib_enabled)
+@@ -1276,6 +1286,13 @@ static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+ 	return ret;
+ }
+ 
++static int gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
++				bool valid, bool encrypted)
++{
++	return __gpon_set_gem_port_hw(priv, gem_port_id, valid, encrypted,
++				      false);
++}
++
+ static int gpon_set_alloc_id_hw(struct xpon_priv *priv, u16 alloc_id,
+ 				bool allocate)
+ {
+@@ -2120,11 +2137,23 @@ static int gpon_cb_set_omci_gem(void *hw_priv, u16 gem_port_id, bool valid)
+ 	return 0;
+ }
+ 
+-static void gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+-					u8 encrypt_mode)
++/*
++ * Encrypted_Port-ID only changes the encryption attribute of a Port-ID; the
++ * port itself is created by OMCI (GEM port network CTP). Record the
++ * attribute and apply it to a port that already exists in the GEM table;
++ * a port OMCI has not created yet picks it up when OMCI writes it
++ * (airoha_gpon_omci_hw_set_gem_port()). Returns 0 when the attribute was
++ * recorded and, for an existing port, programmed.
++ */
++static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
++				      bool encrypted)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+-	int ret;
++	bool configured;
++	int ret = 0;
++
++	if (port_id >= GPON_MAX_GEM_ID)
++		return -EINVAL;
+ 
+ 	/*
+ 	 * The OMCC is never encrypted in GPON (G.984.3 12.2), but this
+@@ -2136,20 +2165,26 @@ static void gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 	 * high-entropy frames with random MACs and nonsense ethertypes, which
+ 	 * is ciphertext handed up undecrypted.
+ 	 */
+-	if (port_id && encrypt_mode == 3)
+-		__set_bit(port_id, priv->encrypted_gems);
+-	else
+-		__clear_bit(port_id, priv->encrypted_gems);
+-	ret = gpon_set_gem_port_hw(priv, port_id, true,
+-				   test_bit(port_id, priv->encrypted_gems));
++	if (!port_id)
++		encrypted = false;
++
++	mutex_lock(&priv->gem_mib_lock);
++	__assign_bit(port_id, priv->encrypted_gems, encrypted);
++	configured = test_bit(port_id, priv->hw_gems);
++	if (configured)
++		ret = gpon_write_gem_port_hw(priv, port_id, true, encrypted);
++	mutex_unlock(&priv->gem_mib_lock);
++
+ 	if (ret)
+ 		dev_err(priv->dev,
+ 			"failed to update GEM port %u encryption: %d\n",
+ 			port_id, ret);
+ 	else
+ 		dev_info(priv->dev,
+-			 "GPON GEM encryption update: port=%u mode=%u\n",
+-			 port_id, encrypt_mode);
++			 "GPON GEM encryption update: port=%u %s%s\n",
++			 port_id, encrypted ? "encrypted" : "clear",
++			 configured ? "" : " (recorded, port not created yet)");
++	return ret;
+ }
+ 
+ /* Returns 0 only when applied: the PLOAM layer acknowledges only then. */
+@@ -2341,10 +2376,8 @@ int airoha_gpon_omci_hw_set_gem_port(void *hw_priv, u16 entity_id,
+ 	 * writes the port, as the vendor stack does, or the port is left
+ 	 * passing ciphertext.
+ 	 */
+-	if (gem_port_id < GPON_MAX_GEM_ID &&
+-	    test_bit(gem_port_id, priv->encrypted_gems))
+-		encrypted = true;
+-	ret = gpon_set_gem_port_hw(priv, gem_port_id, valid, encrypted);
++	ret = __gpon_set_gem_port_hw(priv, gem_port_id, valid, encrypted,
++				     true);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -3166,8 +3199,10 @@ reset_session:
+ 	priv->gpon_o5 = false;
+ 	priv->omci_operational = false;
+ 	bitmap_zero(priv->service_gems, GPON_MAX_GEM_ID);
+-	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
+ 	mutex_unlock(&priv->link_state_lock);
++	mutex_lock(&priv->gem_mib_lock);
++	bitmap_zero(priv->encrypted_gems, GPON_MAX_GEM_ID);
++	mutex_unlock(&priv->gem_mib_lock);
+ 	gpon_refresh_netdev_link(priv, true);
+ 	dev_info(priv->dev, "GPON MAC stopped, state reset to %s\n",
+ 		 gpon_state_name(ploam_get_state(priv->ploam)));

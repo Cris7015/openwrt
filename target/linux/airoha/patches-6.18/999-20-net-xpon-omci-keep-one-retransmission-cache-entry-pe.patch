@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:05:09 -0300
+Subject: [PATCH 11/48] net: xpon: omci: keep one retransmission cache entry
+ per priority
+
+The most significant bit of the OMCI transaction correlation identifier
+is the priority of the request (G.988 message format), and the OLT may
+keep one request outstanding on each priority. The OLT retransmits a
+request with the same TCI when its answer is lost, and the ONU must not
+execute it twice.
+
+The agent remembered only the last exchange. If a high priority request
+arrived between a lost low priority answer and its retransmission, the
+retransmission was executed again: a Create came back as "instance
+exists" and a Set was counted twice in MIB data sync.
+
+Remember the last exchange of each priority.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c    | 60 ++++++++++++++++++++++++++++------------
+ net/xpon/omci/internal.h | 20 +++++++++++---
+ 2 files changed, 58 insertions(+), 22 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 45f1066..98ac03f 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -4837,14 +4837,34 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 	return 0;
+ }
+ 
++static void omci_agent_reset_exchange(struct omci_agent_exchange *exchange)
++{
++	dev_kfree_skb(exchange->request);
++	dev_kfree_skb(exchange->response);
++	exchange->request = NULL;
++	exchange->response = NULL;
++	exchange->hash = 0;
++	exchange->fake = false;
++}
++
+ static void omci_agent_reset_duplicate_locked(struct omci_agent *agent)
+ {
+-	dev_kfree_skb(agent->last_request);
+-	dev_kfree_skb(agent->last_response);
+-	agent->last_request = NULL;
+-	agent->last_response = NULL;
+-	agent->last_request_hash = 0;
+-	agent->last_response_fake = false;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(agent->exchange); i++)
++		omci_agent_reset_exchange(&agent->exchange[i]);
++}
++
++/*
++ * The MSB of the TCI is the priority of the request (G.988 message
++ * format). The OLT may have one request outstanding on each priority, so
++ * a retransmission can follow a request of the other priority: keep the
++ * last exchange of each.
++ */
++static struct omci_agent_exchange *
++omci_agent_exchange_slot(struct omci_agent *agent, const struct sk_buff *skb)
++{
++	return &agent->exchange[skb->data[0] >> 7];
+ }
+ 
+ static int
+@@ -4853,6 +4873,7 @@ omci_agent_cache_exchange_locked(struct omci_agent *agent,
+ 				 const void *response, size_t response_len,
+ 				 bool fake)
+ {
++	struct omci_agent_exchange *exchange;
+ 	struct sk_buff *cached_request;
+ 	struct sk_buff *cached_response;
+ 
+@@ -4867,11 +4888,12 @@ omci_agent_cache_exchange_locked(struct omci_agent *agent,
+ 	}
+ 	skb_put_data(cached_response, response, response_len);
+ 
+-	omci_agent_reset_duplicate_locked(agent);
+-	agent->last_request = cached_request;
+-	agent->last_response = cached_response;
+-	agent->last_request_hash = jhash(request->data, request->len, 0);
+-	agent->last_response_fake = fake;
++	exchange = omci_agent_exchange_slot(agent, request);
++	omci_agent_reset_exchange(exchange);
++	exchange->request = cached_request;
++	exchange->response = cached_response;
++	exchange->hash = jhash(request->data, request->len, 0);
++	exchange->fake = fake;
+ 	return 0;
+ }
+ 
+@@ -4886,6 +4908,7 @@ omci_agent_report_operational(struct omci_device *odev, bool operational)
+ void omci_agent_receive(struct omci_device *odev, const struct sk_buff *skb)
+ {
+ 	struct omci_agent *agent = &odev->agent;
++	struct omci_agent_exchange *exchange;
+ 	struct omci_wire_request request;
+ 	u8 *response = NULL;
+ 	u8 *content = NULL;
+@@ -4935,13 +4958,14 @@ void omci_agent_receive(struct omci_device *odev, const struct sk_buff *skb)
+ 		goto out;
+ 	}
+ 
+-	if (agent->last_request && agent->last_response &&
+-	    agent->last_request_hash == request_hash &&
+-	    agent->last_request->len == skb->len &&
+-	    !memcmp(agent->last_request->data, skb->data, skb->len)) {
+-		response_len = agent->last_response->len;
+-		memcpy(response, agent->last_response->data, response_len);
+-		fake = agent->last_response_fake;
++	exchange = omci_agent_exchange_slot(agent, skb);
++	if (exchange->request && exchange->response &&
++	    exchange->hash == request_hash &&
++	    exchange->request->len == skb->len &&
++	    !memcmp(exchange->request->data, skb->data, skb->len)) {
++		response_len = exchange->response->len;
++		memcpy(response, exchange->response->data, response_len);
++		fake = exchange->fake;
+ 		duplicate = true;
+ 	} else {
+ 		ret = omci_agent_build_response_locked(
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index 306ce00..974c95e 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -86,6 +86,20 @@ struct omci_service_state {
+ 	struct omci_service_config config;
+ };
+ 
++/**
++ * struct omci_agent_exchange - last request of one priority and its answer
++ * @request: the request as received
++ * @response: the response sent for it
++ * @hash: jhash of @request
++ * @fake: @response was a compatibility fake
++ */
++struct omci_agent_exchange {
++	struct sk_buff *request;
++	struct sk_buff *response;
++	u32 hash;
++	bool fake;
++};
++
+ struct omci_agent_config {
+ 	u8 serial_number[8];
+ 	u8 vendor_id[4];
+@@ -147,10 +161,8 @@ struct omci_agent {
+ 	u8 profile_effective;
+ 	u32 profile_quirks;
+ 
+-	struct sk_buff *last_request;
+-	struct sk_buff *last_response;
+-	u32 last_request_hash;
+-	bool last_response_fake;
++	/* Last request and response, one per TCI priority (low, high) */
++	struct omci_agent_exchange exchange[2];
+ 	u8 *table_snapshot;
+ 	size_t table_snapshot_len;
+ 	unsigned long table_snapshot_jiffies;

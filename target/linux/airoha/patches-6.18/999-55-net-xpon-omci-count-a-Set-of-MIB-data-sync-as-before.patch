@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:20:29 -0300
+Subject: [PATCH 46/48] net: xpon: omci: count a Set of MIB data sync as
+ before, and log it
+
+"wrap the MIB data sync counter from 255 to 1" also made a Set of the
+ONU data MIB data sync attribute keep the value the OLT wrote instead of
+counting the Set. G.988 makes the attribute writable but does not say
+clearly which of the two the OLT then expects, and the agent has always
+counted it with an OLT that works and does not re-provision after a
+Deactivate_ONU-ID. With that OLT the change could only be neutral or
+harmful.
+
+Go back to counting the Set on top of the agent's own sequence, as
+before that commit, and log the written and resulting values, rate
+limited, so that a trace shows whether the OLT uses the attribute. The
+255 to 1 wrap stays.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 344a2dd..b98ce26 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -3982,14 +3982,22 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 			goto rollback_processing;
+ 	}
+ 	/*
+-	 * MIB data sync is writable: the OLT aligns its copy by setting it,
+-	 * so keep the value it wrote instead of counting the Set on top.
++	 * MIB data sync is writable. Whether the ONU should then hold the
++	 * written value or count the Set on top of its own sequence is not
++	 * settled, and the agent has always done the latter with an OLT that
++	 * works: keep that, and log what the OLT wrote so a trace can tell.
+ 	 */
+ 	if (class_id == OMCI_CLASS_ONU_DATA && !entity_id &&
+-	    (apply & OMCI_ONU_DATA_MIB_SYNC_MASK))
+-		omci_agent_set_mib_sync_locked(agent, object->data[0]);
+-	else
++	    (apply & OMCI_ONU_DATA_MIB_SYNC_MASK)) {
++		u8 written = object->data[0];
++
+ 		omci_agent_increment_mib_sync_locked(agent);
++		dev_info_ratelimited(odev->parent,
++				     "OMCI: OLT set MIB data sync to %u, now %u\n",
++				     written, agent->mib_sync);
++	} else {
++		omci_agent_increment_mib_sync_locked(agent);
++	}
+ 	ret = OMCI_RESULT_SUCCESS;
+ 	goto out_free_previous;
+ 

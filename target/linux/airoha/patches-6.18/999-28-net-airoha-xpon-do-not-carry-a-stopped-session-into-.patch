@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:08:52 -0300
+Subject: [PATCH 19/48] net: airoha: xpon: do not carry a stopped session into
+ the next activation
+
+G.984.3 binds the Alloc-IDs and Port-IDs to the ONU-ID: an ONU that
+leaves operation through O7 or back to O2 has to be provisioned again
+from scratch, and an ONU in O7 does not respond to the OLT. Two soft
+paths broke that:
+
+ - Disable_Serial_Number (disable) moved the PLOAM layer to O7 but kept
+   pp->onu_id, so directed messages to the old ONU-ID were still parsed
+   (Encrypted_Port-ID even rewrote the GEM table) and their ACKs were
+   queued while the laser was off. Disable_Serial_Number (enable) then
+   went O7 -> O2 with ploam_reset()/ploam_start() only, leaving the
+   T-CONTs, GEM ports, OMCC and OMCI session of the stopped session in
+   the hardware for the next activation.
+ - TO1 in an O4 entered from O6 by a broadcast POPUP returned to O2 the
+   same way, again with the old session's resources still programmed.
+
+Drop the ONU-ID on entering O7. Leaving O7 now asks the hardware layer,
+through a new optional reactivate() op, to restart the whole session
+the way a Deactivate_ONU-ID does (gpon_disable(), then gpon_enable(),
+whose ploam_start() goes to O2 now that emergency_state is clear).
+TO1 after this session reached O5 takes the same restart path. Both are
+behind airoha_xpon.gpon_clean_reactivation (0644, default on); with it
+off the old soft returns are kept. restart_work logs why it restarts.
+
+If the restart cannot re-enable the MAC, restart_work retries every
+second as it already does after a Deactivate_ONU-ID. O7 is still not
+persisted across a reboot, on purpose.
+
+Neither path has been seen with the Movistar/Huawei OLT (no
+Disable_Serial_Number, no broadcast POPUP), so the field link is not
+expected to change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 18 +++++--
+ drivers/net/ethernet/airoha/airoha_ploam.h |  4 ++
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 55 +++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_xpon.h  |  4 ++
+ 4 files changed, 76 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index a6649ef..1460e31 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -361,10 +361,16 @@ static void handle_disable_sn(struct ploam_priv *pp,
+ 		     memcmp(&c[1], pp->sn, 8) == 0)) {
+ 			pp->emergency_state = false;
+ 			/*
+-			 * Activation starts over from O2, without the ONU-ID,
+-			 * the equalization delay or the PLOAM history of the
+-			 * session the OLT stopped.
++			 * Activation starts over, without the ONU-ID, the
++			 * equalization delay or the PLOAM history of the
++			 * session the OLT stopped. The hardware layer may
++			 * restart the whole session (and with it release the
++			 * T-CONTs and GEM ports of the stopped one); its enable
++			 * path then calls ploam_start(). Otherwise go to O2 here.
+ 			 */
++			if (pp->ops->reactivate &&
++			    pp->ops->reactivate(pp->hw_priv))
++				return;
+ 			ploam_reset(pp);
+ 			ploam_start(pp);
+ 		}
+@@ -373,6 +379,12 @@ static void handle_disable_sn(struct ploam_priv *pp,
+ 		    (mode == PLOAM_DISABLE_DENIED &&
+ 		     memcmp(&c[1], pp->sn, 8) == 0)) {
+ 			pp->emergency_state = true;
++			/*
++			 * An ONU in O7 does not respond to the OLT. Drop the
++			 * ONU-ID so directed messages to it, possibly meant for
++			 * another ONU the OLT gives the ID to, are ignored.
++			 */
++			pp->onu_id = PLOAM_ONU_UNASSIGNED;
+ 			ploam_set_state(pp, GPON_O7_EMERGENCY_STOP);
+ 		}
+ 	}
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 8902f3c..448ed3a 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -126,6 +126,9 @@ struct ploam_msg {
+  * @state_changed: ONU activation state has changed; start/stop TO1/TO2 timers,
+  *   manage carrier, MBI interface, etc.
+  * @deactivate: OLT sent Deactivate_ONU; trigger a full hardware disable/reset.
++ * @reactivate: optional; Disable_Serial_Number re-enabled the ONU from O7.
++ *   Return true if the hardware layer restarts the whole session (its enable
++ *   path calls ploam_start()), false to let the PLOAM layer go to O2 itself.
+  */
+ struct ploam_ops {
+ 	/* Observer only: 0=other ONU, 1=duplicate, 2=dispatch; no payload. */
+@@ -147,6 +150,7 @@ struct ploam_ops {
+ 	int (*set_alloc_id)(void *priv, u16 alloc_id, bool allocate);
+ 	void (*state_changed)(void *priv, enum gpon_state state);
+ 	void (*deactivate)(void *priv);
++	bool (*reactivate)(void *priv);
+ };
+ 
+ struct ploam_priv;
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index ad531e2..b301316 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2921,6 +2921,7 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 				  jiffies +
+ 				  msecs_to_jiffies(priv->ber_interval_ms));
+ 		priv->to1_failures = 0;
++		priv->gpon_session_o5 = true;
+ 		dev_info(priv->dev,
+ 			 "GPON O5: operational, ONU-ID=%u, PLOAMd O5 filter=%#x\n",
+ 			 ploam_get_onu_id(priv->ploam),
+@@ -2965,11 +2966,24 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 	}
+ }
+ 
++/*
++ * A new activation must not inherit the Alloc-IDs, GEM ports and OMCC of a
++ * session the OLT stopped (G.984.3: they belong to the ONU-ID). The soft
++ * returns to O2 -- Disable_Serial_Number (enable) out of O7, and TO1 in an
++ * O4 entered from O6 by a broadcast POPUP -- kept all of them in hardware.
++ * With this set, both restart the whole session like a Deactivate_ONU-ID.
++ */
++static bool gpon_clean_reactivation = true;
++module_param(gpon_clean_reactivation, bool, 0644);
++MODULE_PARM_DESC(gpon_clean_reactivation,
++		 "Restart the whole session when leaving O7 or on TO1 after O5 (default: on)");
++
+ static void gpon_cb_deactivate(void *hw_priv)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+ 
+ 	gpon_bb_deactivate(priv);
++	priv->restart_reason = "Deactivate_ONU-ID from the OLT";
+ 
+ 	/*
+ 	 * The callback runs while the ordered IRQ worker is processing the
+@@ -2981,6 +2995,21 @@ static void gpon_cb_deactivate(void *hw_priv)
+ 		mod_delayed_work(priv->fsm_wq, &priv->restart_work, 0);
+ }
+ 
++static bool gpon_cb_reactivate(void *hw_priv)
++{
++	struct xpon_priv *priv = hw_priv;
++
++	if (!READ_ONCE(gpon_clean_reactivation) ||
++	    !READ_ONCE(priv->started) || !READ_ONCE(priv->optical_active))
++		return false;
++
++	dev_warn_ratelimited(priv->dev,
++			     "GPON Disable_Serial_Number re-enabled the ONU: restarting the session from O1\n");
++	priv->restart_reason = "Disable_Serial_Number (enable) from the OLT";
++	mod_delayed_work(priv->fsm_wq, &priv->restart_work, 0);
++	return true;
++}
++
+ static void gpon_cb_rx_trace(void *hw_priv, u8 type, u8 onu_id, u8 result)
+ {
+ 	gpon_bb_record(hw_priv, GPON_BB_RX, type, onu_id, result, 0);
+@@ -3003,6 +3032,7 @@ static const struct ploam_ops gpon_ploam_ops = {
+ 	.set_alloc_id        = gpon_cb_set_alloc_id,
+ 	.state_changed       = gpon_cb_state_changed,
+ 	.deactivate          = gpon_cb_deactivate,
++	.reactivate          = gpon_cb_reactivate,
+ };
+ 
+ /* -----------------------------------------------------------------------
+@@ -3287,6 +3317,7 @@ static void gpon_disable(struct xpon_priv *priv)
+ 				     &priv->phy_powered);
+ 
+ reset_session:
++	priv->gpon_session_o5 = false;
+ 	ploam_reset(priv->ploam);
+ 	if (!omci_reset)
+ 		airoha_gpon_omci_reset_session(&priv->omci);
+@@ -3456,6 +3487,25 @@ static void gpon_to1_work_fn(struct work_struct *work)
+ 	 */
+ 	if (st != GPON_O3_SERIAL_NUMBER && st != GPON_O4_RANGING)
+ 		return;
++
++	/*
++	 * Only O4 entered from O6 by a broadcast POPUP gets here after O5.
++	 * The T-CONTs, GEM ports and OMCC of that session are still in
++	 * hardware; a soft return to O2 would carry them into the next
++	 * activation, possibly with another ONU-ID.
++	 */
++	if (priv->gpon_session_o5 && READ_ONCE(gpon_clean_reactivation)) {
++		dev_warn_ratelimited(priv->dev,
++				     "GPON TO1 expired in O%d after this session reached O5: restarting the session to release its Alloc-IDs and GEM ports\n",
++				     (int)st);
++		priv->to1_failures = 0;
++		gpon_disable(priv);
++		if (READ_ONCE(priv->started) && READ_ONCE(priv->optical_active))
++			mod_delayed_work(priv->fsm_wq, &priv->restart_work,
++					 msecs_to_jiffies(GPON_DEACTIVATE_RESTART_MS));
++		return;
++	}
++
+ 	priv->to1_failures++;
+ 
+ 	/*
+@@ -3594,11 +3644,12 @@ static void gpon_restart_work_fn(struct work_struct *work)
+ 		}
+ 		gpon_apply_runtime_identity(priv, &identity);
+ 	} else if (ploam_get_state(priv->ploam) != GPON_O1_INITIAL) {
+-		dev_warn(priv->dev,
+-			 "restarting GPON after Deactivate_ONU-ID from the OLT\n");
++		dev_warn(priv->dev, "restarting GPON after %s\n",
++			 priv->restart_reason ?: "Deactivate_ONU-ID from the OLT");
+ 		gpon_disable(priv);
+ 		stopped = true;
+ 	}
++	priv->restart_reason = NULL;
+ 
+ 	if (stopped) {
+ 		msleep(GPON_DEACTIVATE_RESTART_MS);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 6533613..7a31419 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -566,6 +566,10 @@ struct xpon_priv {
+ 
+ 	/* Consecutive TO1 expiries; cleared on O5. */
+ 	unsigned int		to1_failures;
++	/* This session reached O5, so its Alloc-IDs and GEM ports exist */
++	bool			gpon_session_o5;
++	/* Why restart_work restarts the session (logged), or NULL */
++	const char		*restart_reason;
+ 
+ };
+ 

@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:06:19 -0300
+Subject: [PATCH 15/48] net: airoha: xpon: re-arm the BER interval timer after
+ a PHY down sample
+
+G.984.3 has the ONU send one REI per BER interval while in O5. When
+gpon_ber_timer_fn() found the PHY not ready or in LOS it queued
+phy_link_work and returned without re-arming itself. The timer is only
+re-armed by BER_interval (sent once per activation by the Huawei OLT),
+by the O5 entry, or by itself; so if the link was back by the time
+phy_link_work sampled it, there was no O6/O5 transition and REI stopped
+for the rest of the session.
+
+Re-arm the timer before skipping the report. A real loss still goes
+O5 -> O6, which deletes the timer, and the timer function itself bails
+out outside O5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 260b674..0335521 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3250,6 +3250,14 @@ static void gpon_ber_timer_fn(struct timer_list *t)
+ 
+ 	ret = airoha_xpon_phy_get_link_state(priv->phy, &ready, &los);
+ 	if (!ret && (!ready || los)) {
++		/*
++		 * Skip this report but keep the interval running: if the link
++		 * is back before phy_link_work samples it there is no O6/O5
++		 * transition to re-arm the timer, and REI would stop for the
++		 * rest of the session. On a real loss O6 deletes it again.
++		 */
++		mod_timer(&priv->ber_timer,
++			  jiffies + msecs_to_jiffies(priv->ber_interval_ms));
+ 		mod_delayed_work(priv->fsm_wq, &priv->phy_link_work, 0);
+ 		return;
+ 	}

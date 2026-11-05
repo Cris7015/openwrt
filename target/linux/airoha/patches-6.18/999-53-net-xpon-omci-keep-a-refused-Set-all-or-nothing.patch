@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:19:34 -0300
+Subject: [PATCH 44/48] net: xpon: omci: keep a refused Set all or nothing
+
+Since "report failed and unsupported attributes with result 9", a Set
+naming an unknown or read-only attribute of a managed entity outside the
+datapath applied the writable attributes in front of it, counted the Set
+in MIB data sync and answered result 9. Whether an OLT counts a result 9
+Set in its own copy of MIB data sync is not settled by G.988, and the
+agent used to answer such a Set with "parameter error" and apply
+nothing. If the OLT does not count it, the next MIB audit sees a
+mismatch and re-provisions the ONU, every time the OLT repeats the Set.
+
+Refuse the whole Set in every ME, as the datapath MEs already did: apply
+nothing, leave MIB data sync alone, and answer result 9 with the
+unsupported attributes in the optional-attribute mask and every other
+attribute of the request in the attribute execution mask. The MIB ends
+up exactly as before that series; only the result code and the masks
+differ.
+
+Also check that the instance exists before looking at the attributes, so
+that a Set of a missing instance keeps answering result 5.
+
+Note on the series: for ONU-G, ONU2-G, ONU data, ANI-G and OLT-G, which
+had no descriptor before, a Set that mixes writable and read-only
+attributes used to be applied (at the wrong offsets) with result 0; it
+is now refused with result 9.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 42 +++++++++++++++++-------------------------
+ 1 file changed, 17 insertions(+), 25 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 4658e81..344a2dd 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -3844,21 +3844,20 @@ out:
+ }
+ 
+ /*
+- * Work out which attributes of a Set can be executed (G.988 Set response).
+- * An attribute without a descriptor is unsupported and goes to the
+- * optional-attribute mask; a read-only one fails and goes to the
+- * attribute execution mask. The values of a Set are packed in attribute
+- * order, so the attributes that precede the first unsupported one can
+- * still be parsed. A datapath ME is all or nothing, as before, so that a
+- * partly applied Set never reshapes the services.
++ * Work out whether a Set can be executed (G.988 Set response). An
++ * attribute without a descriptor is unsupported and goes to the
++ * optional-attribute mask; when any attribute is unsupported or read-only
++ * nothing is applied, MIB data sync does not move, and every supported
++ * attribute is reported in the attribute execution mask as not executed.
++ * That keeps the MIB exactly as a refused Set always left it; only the
++ * result (9 instead of 3) and the masks are new.
+  *
+  * Returns the attributes to apply; 0 with *@opt or *@exec set means none.
+  */
+ static u16 omci_agent_set_attrs(const struct omci_me_desc *desc, u16 class_id,
+ 				u16 mask, u16 *opt, u16 *exec)
+ {
+-	u16 unsupported = 0, readonly = 0, supported, apply;
+-	unsigned int lowest;
++	u16 unsupported = 0, readonly = 0;
+ 
+ 	*opt = 0;
+ 	*exec = 0;
+@@ -3879,17 +3878,9 @@ static u16 omci_agent_set_attrs(const struct omci_me_desc *desc, u16 class_id,
+ 	if (!unsupported && !readonly)
+ 		return mask;
+ 
+-	supported = mask & ~unsupported;
+-	apply = supported & ~readonly;
+-	lowest = apply & -(unsigned int)apply;
+ 	*opt = unsupported;
+-	if (!desc || (desc->flags & OMCI_ME_F_DATAPATH) || !apply ||
+-	    (unsupported & ~(lowest - 1))) {
+-		*exec = supported;
+-		return 0;
+-	}
+-	*exec = readonly;
+-	return apply;
++	*exec = mask & ~unsupported;
++	return 0;
+ }
+ 
+ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+@@ -3920,14 +3911,17 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 
+ 	mask = get_unaligned_be16(content);
+ 	desc = omci_me_lookup(agent, class_id);
+-	apply = omci_agent_set_attrs(desc, class_id, mask, opt_mask, exec_mask);
+-	if (!apply && (*opt_mask || *exec_mask))
+-		return OMCI_RESULT_ATTRIBUTE_FAILED;
+ 	allow_create = agent->permissive || agent->fake_omci ||
+ 		omci_agent_profile_has_quirk(agent,
+ 					     OMCI_OLT_QUIRK_ALLOW_SET_CREATE);
+ 	existing = omci_mib_lookup(agent, class_id, entity_id);
+ 	existed = !!existing;
++	/* An unknown instance is result 5 whatever the attributes are. */
++	if (!existing && !allow_create)
++		return OMCI_RESULT_UNKNOWN_INSTANCE;
++	apply = omci_agent_set_attrs(desc, class_id, mask, opt_mask, exec_mask);
++	if (!apply && (*opt_mask || *exec_mask))
++		return OMCI_RESULT_ATTRIBUTE_FAILED;
+ 	if (existing) {
+ 		previous = kmemdup(existing, sizeof(*previous), GFP_KERNEL);
+ 		if (!previous)
+@@ -3996,9 +3990,7 @@ static u8 omci_agent_set_locked(struct omci_device *odev, u16 class_id,
+ 		omci_agent_set_mib_sync_locked(agent, object->data[0]);
+ 	else
+ 		omci_agent_increment_mib_sync_locked(agent);
+-	/* Part of the Set was refused: the masks say which attributes. */
+-	ret = *opt_mask || *exec_mask ? OMCI_RESULT_ATTRIBUTE_FAILED :
+-					OMCI_RESULT_SUCCESS;
++	ret = OMCI_RESULT_SUCCESS;
+ 	goto out_free_previous;
+ 
+ rollback_parameter:

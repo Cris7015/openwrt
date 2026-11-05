@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:06:30 -0300
+Subject: [PATCH 16/48] net: airoha: xpon: do not arm TO1 in O2
+
+G.984.3 uses TO1 to bound the serial-number and ranging states; in O2
+the ONU waits for Upstream_Overhead with no timeout. gpon_cb_state_changed()
+fell through from O2 into the O3/O4 case and armed TO1 there as well.
+The expiry handler ignores O2, so this was harmless, but it queued a
+pointless work every 10 s while the ONU sat in O2.
+
+The stock driver (gpon_act_change_gpon_state) arms the TO1 timer on
+entering O3 and on entering O4, and not in O2. Do the same: cancel TO1
+in O2 and keep the restart on O3 and O4 entry.
+
+No change to when activation times out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 0335521..a9ed3da 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2836,10 +2836,16 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		priv->bit_delay = 0;
+ 		gpon_set_bit_delay(priv, 0);
+ 		priv->psync_sof_o5 = U32_MAX;
+-		fallthrough;
++		/*
++		 * TO1 limits the serial-number and ranging states; O2 waits
++		 * for Upstream_Overhead without a timeout. The stock driver
++		 * arms TO1 only on entering O3 and O4.
++		 */
++		cancel_delayed_work(&priv->to1_work);
++		break;
+ 	case GPON_O3_SERIAL_NUMBER:
+ 	case GPON_O4_RANGING:
+-		/* Start / restart TO1 timer */
++		/* Start / restart TO1, as the stock driver does in O3 and O4. */
+ 		mod_delayed_work(priv->fsm_wq, &priv->to1_work,
+ 				 msecs_to_jiffies(GPON_TO1_MS));
+ 		break;

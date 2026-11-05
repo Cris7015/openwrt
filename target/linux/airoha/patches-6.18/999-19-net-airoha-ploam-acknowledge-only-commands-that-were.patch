@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:04:36 -0300
+Subject: [PATCH 10/48] net: airoha: ploam: acknowledge only commands that were
+ applied in O5
+
+G.984.3 uses the upstream Acknowledge to tell the OLT that a directed
+downstream command was received and executed. Several handlers sent it
+regardless of what happened:
+
+ - Assign_Alloc-ID and Configure_Port-ID jumped to the ACK outside O5,
+   so an ONU in O4, O6 or O7 acknowledged allocations it never made.
+ - BER_interval, Key_Switching_Time and Ranging_Adjustment acknowledged
+   in any state, even though they are only applied in O5.
+ - Encrypted_Port-ID had no state check at all.
+ - Assign_Alloc-ID acknowledged after a failed T-CONT allocation (for
+   example -ENOSPC), because set_alloc_id() returned void.
+ - Every Alloc-ID type other than 1 (GEM) was treated as "deallocate",
+   so an ATM/obsolete or reserved type could drop a live T-CONT.
+
+Only acknowledge in O5, make set_alloc_id() return an error and keep
+the ACK back when it fails (as Configure_Port-ID already does since the
+OMCC fix), and handle only type 1 (allocate) and 255 (deallocate);
+ignore and log anything else.
+
+With the Huawei OLT in the field every one of these messages arrives in
+O5 with type 1, so the activation sequence is unchanged; the change
+only matters for out-of-state or failed commands, which the OLT now
+sees as unacknowledged and retries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c | 112 +++++++++++++--------
+ drivers/net/ethernet/airoha/airoha_ploam.h |  10 +-
+ drivers/net/ethernet/airoha/airoha_xpon.c  |   8 +-
+ 3 files changed, 84 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 898fd30..6fc564b 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -389,6 +389,9 @@ static void handle_encrypted_port_id(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id)
+ 		return;
++	/* Port-IDs exist only in O5; do not acknowledge outside it. */
++	if (pp->state != GPON_O5_OPERATION)
++		return;
+ 
+ 	/* c[0] BE: bits[7:2]=resv, bits[1:0]=encrypt */
+ 	encrypt = c[0] & 3;
+@@ -421,18 +424,39 @@ static void handle_assign_alloc_id(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id)
+ 		return;
++	/*
++	 * An Acknowledge tells the OLT the command was executed. Alloc-IDs
++	 * are only assigned to an ONU in O5, so do not acknowledge one that
++	 * was not applied.
++	 */
+ 	if (pp->state != GPON_O5_OPERATION)
+-		goto send_ack;
++		return;
+ 
+ 	/* c[0]=alloc_id_m, c[1] BE: bits[7:4]=alloc_id_l, [3:0]=resv */
+ 	alloc_id = ((u16)c[0] << 4) | ((c[1] >> 4) & 0xF);
+-	/* c[2]=type: 0x01=allocate, 0xFF=deallocate */
+-	allocate = (c[2] == 0x01);
++	/*
++	 * c[2] = Alloc-ID type: 1 = GEM payload, 255 = deallocate. The other
++	 * values are ATM/obsolete or reserved; they used to be taken as
++	 * "deallocate", which could drop a live T-CONT. Ignore them.
++	 */
++	switch (c[2]) {
++	case PLOAM_ALLOC_ID_TYPE_GEM:
++		allocate = true;
++		break;
++	case PLOAM_ALLOC_ID_TYPE_DEALLOCATE:
++		allocate = false;
++		break;
++	default:
++		pr_warn_ratelimited("airoha-ploam: ignoring Assign_Alloc-ID %u with unsupported type %u\n",
++				    alloc_id, c[2]);
++		return;
++	}
+ 
+-	if (alloc_id != pp->onu_id)
+-		pp->ops->set_alloc_id(pp->hw_priv, alloc_id, allocate);
++	/* The default Alloc-ID (= ONU-ID) is bound to T-CONT 0 with the OMCC. */
++	if (alloc_id != pp->onu_id &&
++	    pp->ops->set_alloc_id(pp->hw_priv, alloc_id, allocate))
++		return;
+ 
+-send_ack:
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+ }
+@@ -484,8 +508,9 @@ static void handle_configure_port_id(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id)
+ 		return;
++	/* The OMCC is configured in O5; do not acknowledge it anywhere else. */
+ 	if (pp->state != GPON_O5_OPERATION)
+-		goto send_ack;
++		return;
+ 
+ 	/* c[0] BE: bits[7:1]=resv, bit[0]=activate */
+ 	activate = c[0] & 1;
+@@ -499,7 +524,6 @@ static void handle_configure_port_id(struct ploam_priv *pp,
+ 	if (pp->ops->set_omci_gem(pp->hw_priv, port_id, activate))
+ 		return;
+ 
+-send_ack:
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+ }
+@@ -515,13 +539,15 @@ static void handle_ber_interval(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id && onu_id != PLOAM_ONU_BCAST)
+ 		return;
+-	if (pp->state == GPON_O5_OPERATION) {
+-		/* c[0..3] = interval in frames; convert to ms (125 µs/frame) */
+-		interval_frames = get_unaligned_be32(&c[0]);
+-		/* frames × 125 µs = interval_frames >> 3 ms (≈) */
+-		interval_ms = interval_frames >> 3;
+-		pp->ops->set_ber_interval(pp->hw_priv, interval_ms);
+-	}
++	/* Only an ONU in O5 counts BIP errors; acknowledge only what it applies. */
++	if (pp->state != GPON_O5_OPERATION)
++		return;
++
++	/* c[0..3] = interval in frames; convert to ms (125 µs/frame) */
++	interval_frames = get_unaligned_be32(&c[0]);
++	/* frames × 125 µs = interval_frames >> 3 ms (≈) */
++	interval_ms = interval_frames >> 3;
++	pp->ops->set_ber_interval(pp->hw_priv, interval_ms);
+ 
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+@@ -537,10 +563,11 @@ static void handle_key_switching_time(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id)
+ 		return;
+-	if (pp->state == GPON_O5_OPERATION) {
+-		superframe = get_unaligned_be32(&c[0]);
+-		pp->ops->set_key_switch_time(pp->hw_priv, superframe);
+-	}
++	if (pp->state != GPON_O5_OPERATION)
++		return;
++
++	superframe = get_unaligned_be32(&c[0]);
++	pp->ops->set_key_switch_time(pp->hw_priv, superframe);
+ 
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+ 	ploam_send_ack(pp, type, dm_bytes);
+@@ -580,29 +607,30 @@ static void handle_ranging_adjustment(struct ploam_priv *pp,
+ 
+ 	if (onu_id != pp->onu_id && onu_id != PLOAM_ONU_BCAST)
+ 		return;
+-	if (pp->state == GPON_O5_OPERATION) {
+-		/* c[0] BE: bits[7:2]=resv, bit[1]=s_bit, bit[0]=resv */
+-		s_bit = (c[0] >> 1) & 1;
+-		eqd_offset = get_unaligned_be32(&c[1]);
+-		/*
+-		 * The EqD is an unsigned bit count. A decrease larger than the
+-		 * current EqD, or an increase that wraps it, cannot be a valid
+-		 * adjustment: applying it would move the bursts by ~2^32 bits.
+-		 * Keep the ranged EqD and do not acknowledge the message.
+-		 */
+-		if (s_bit ? eqd_offset > pp->eqd :
+-			    eqd_offset > U32_MAX - pp->eqd) {
+-			pr_warn_ratelimited("airoha-ploam: ignoring Ranging_Adjustment %c%u on EqD %u: out of range\n",
+-					    s_bit ? '-' : '+', eqd_offset,
+-					    pp->eqd);
+-			return;
+-		}
+-		if (eqd_offset != 0) {
+-			u32 new_eqd = s_bit ? pp->eqd - eqd_offset
+-					    : pp->eqd + eqd_offset;
+-			pp->ops->adjust_eqd_o5(pp->hw_priv, new_eqd);
+-			pp->eqd = new_eqd;
+-		}
++	if (pp->state != GPON_O5_OPERATION)
++		return;
++
++	/* c[0] BE: bits[7:2]=resv, bit[1]=s_bit, bit[0]=resv */
++	s_bit = (c[0] >> 1) & 1;
++	eqd_offset = get_unaligned_be32(&c[1]);
++	/*
++	 * The EqD is an unsigned bit count. A decrease larger than the
++	 * current EqD, or an increase that wraps it, cannot be a valid
++	 * adjustment: applying it would move the bursts by ~2^32 bits.
++	 * Keep the ranged EqD and do not acknowledge the message.
++	 */
++	if (s_bit ? eqd_offset > pp->eqd :
++		    eqd_offset > U32_MAX - pp->eqd) {
++		pr_warn_ratelimited("airoha-ploam: ignoring Ranging_Adjustment %c%u on EqD %u: out of range\n",
++				    s_bit ? '-' : '+', eqd_offset, pp->eqd);
++		return;
++	}
++	if (eqd_offset != 0) {
++		u32 new_eqd = s_bit ? pp->eqd - eqd_offset
++				    : pp->eqd + eqd_offset;
++
++		pp->ops->adjust_eqd_o5(pp->hw_priv, new_eqd);
++		pp->eqd = new_eqd;
+ 	}
+ 
+ 	ploam_make_dm_bytes(dm_bytes, onu_id, type, c);
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index da618f3..1a905f0 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -48,6 +48,10 @@
+ #define PLOAM_DOWN_SLEEP_ALLOW		0x18
+ #define PLOAM_DOWN_MAX_TYPE		0x19
+ 
++/* Assign_Alloc-ID payload type (octet 5) */
++#define PLOAM_ALLOC_ID_TYPE_GEM		0x01
++#define PLOAM_ALLOC_ID_TYPE_DEALLOCATE	0xFF
++
+ /* Disable_SN mode byte values */
+ #define PLOAM_DISABLE_DENIED		0xFF	/* unicast SN → go to O7  */
+ #define PLOAM_DISABLE_DENIED_ALL	0xF0	/* all ONUs → O7          */
+@@ -110,7 +114,9 @@ struct ploam_msg {
+  * @set_omci_gem: configure or clear the OMCI GEM port in G_OMCI_ID;
+  *   return zero only when the hardware channel is ready.
+  * @set_gem_encryption: program per-GEM-port encryption mode in GEM port table.
+- * @set_alloc_id: allocate or deallocate a T-CONT for the given alloc-ID.
++ * @set_alloc_id: allocate or deallocate a T-CONT for the given alloc-ID;
++ *   return zero only when the hardware applied it (the PLOAM layer
++ *   acknowledges the message only then).
+  * @state_changed: ONU activation state has changed; start/stop TO1/TO2 timers,
+  *   manage carrier, MBI interface, etc.
+  * @deactivate: OLT sent Deactivate_ONU; trigger a full hardware disable/reset.
+@@ -132,7 +138,7 @@ struct ploam_ops {
+ 	void (*set_ber_interval)(void *priv, u32 interval_ms);
+ 	int (*set_omci_gem)(void *priv, u16 gem_port_id, bool valid);
+ 	void (*set_gem_encryption)(void *priv, u16 port_id, u8 encrypt_mode);
+-	void (*set_alloc_id)(void *priv, u16 alloc_id, bool allocate);
++	int (*set_alloc_id)(void *priv, u16 alloc_id, bool allocate);
+ 	void (*state_changed)(void *priv, enum gpon_state state);
+ 	void (*deactivate)(void *priv);
+ };
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 260ab52..3dd2958 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2152,7 +2152,8 @@ static void gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 			 port_id, encrypt_mode);
+ }
+ 
+-static void gpon_cb_set_alloc_id(void *hw_priv, u16 alloc_id, bool allocate)
++/* Returns 0 only when applied: the PLOAM layer acknowledges only then. */
++static int gpon_cb_set_alloc_id(void *hw_priv, u16 alloc_id, bool allocate)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+ 	int ret;
+@@ -2161,10 +2162,13 @@ static void gpon_cb_set_alloc_id(void *hw_priv, u16 alloc_id, bool allocate)
+ 		 allocate ? "assign" : "remove", alloc_id);
+ 	ret = gpon_set_alloc_id_hw(priv, alloc_id, allocate);
+ 	if (ret)
+-		dev_err(priv->dev, "failed to %s Alloc-ID %u: %d\n",
++		dev_err(priv->dev,
++			"failed to %s Alloc-ID %u: %d, not acknowledging it\n",
+ 			allocate ? "assign" : "remove", alloc_id, ret);
+ 	else
+ 		airoha_gpon_omci_reconcile_services(&priv->omci);
++
++	return ret;
+ }
+ 
+ int airoha_gpon_omci_hw_set_olt_profile(void *hw_priv,

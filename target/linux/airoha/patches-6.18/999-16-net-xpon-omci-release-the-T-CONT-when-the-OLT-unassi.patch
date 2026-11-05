@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:03:20 -0300
+Subject: [PATCH 07/48] net: xpon: omci: release the T-CONT when the OLT
+ unassigns its Alloc-ID
+
+G.988 (T-CONT, Alloc-ID) gives the attribute an unusable value until the
+OLT assigns an Alloc-ID: 0x00FF or 0xFFFF in G-PON. Writing one of those
+back is how the OLT takes the T-CONT away.
+
+The agent passed any written value to the provider as a valid binding.
+With 0xFFFF the Airoha backend refused it (Alloc-IDs are 12 bits) and
+the Set failed with "processing error"; with 0x00FF it bound a hardware
+channel to Alloc-ID 255. Unbind the T-CONT for both values, and do not
+stage services on a T-CONT that holds either of them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index c5b3262..025dc95 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -2696,6 +2696,15 @@ static int omci_agent_mib_reset_locked(struct omci_device *odev, bool all,
+ 	return ret ?: reset_ret;
+ }
+ 
++/*
++ * G.988 T-CONT Alloc-ID: before the OLT assigns one, and when it takes it
++ * back, the attribute holds an unusable value, 0x00FF or 0xFFFF in G-PON.
++ */
++static bool omci_tcont_alloc_unassigned(u16 alloc_id)
++{
++	return alloc_id == 0x00ff || alloc_id == 0xffff;
++}
++
+ static int omci_agent_hw_update(struct omci_device *odev,
+ 				struct omci_mib_object *object,
+ 				u8 action, const u8 *content)
+@@ -2718,10 +2727,11 @@ static int omci_agent_hw_update(struct omci_device *odev,
+ 	case OMCI_CLASS_TCONT:
+ 		if (!ops->set_tcont)
+ 			return 0;
+-		if (action == OMCI_MSG_TYPE_DELETE)
++		value = get_unaligned_be16(object->data);
++		if (action == OMCI_MSG_TYPE_DELETE ||
++		    omci_tcont_alloc_unassigned(value))
+ 			return ops->set_tcont(odev, object->entity_id, 0xffff,
+ 					      false);
+-		value = get_unaligned_be16(object->data);
+ 		return ops->set_tcont(odev, object->entity_id, value, true);
+ 	case OMCI_CLASS_GEM_PORT_CTP:
+ 		if (!ops->set_gem_port)
+@@ -3003,7 +3013,8 @@ omci_agent_stage_service_rule_locked(struct omci_device *odev,
+ 	service.tcont_entity_id = get_unaligned_be16(gem->data + 2);
+ 	tcont = omci_mib_lookup(agent, OMCI_CLASS_TCONT,
+ 				 service.tcont_entity_id);
+-	if (!tcont || get_unaligned_be16(tcont->data) == 0xffff)
++	if (!tcont ||
++	    omci_tcont_alloc_unassigned(get_unaligned_be16(tcont->data)))
+ 		return -ENOENT;
+ 	/* Carry the Alloc-ID: the backend may need it to rebuild the channel. */
+ 	service.alloc_id = get_unaligned_be16(tcont->data);

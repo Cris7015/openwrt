@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:22:01 -0300
+Subject: [PATCH 28/48] net: airoha: xpon: count G_INT_STATUS bits that are not
+ enabled
+
+The stock gpon_isr() acknowledges only status & mask. Ours writes the
+whole snapshot back to the W1C G_INT_STATUS, so status bits that are not
+enabled as interrupts (SFIFO_FULL, BFIFO_FULL, BST_SGL_DIFF, RX_ERR,
+BWM_STOP_TIME_ERR, BWM_US_FEC_ERR...) are cleared whenever any PLOAM
+arrives. The 1 ms tracer of patch 979 samples G_INT_STATUS and loses
+every one that came and went between two samples. That is enough to
+doubt conclusions such as "BST_SGL_DIFF never fires".
+
+Count, at interrupt time and before acknowledging, each status bit that
+is set without being enabled, and expose the counts in the new sysfs
+attribute gpon_irq_status. A bit still latched from the previous pass is
+not counted twice.
+
+airoha_xpon.gpon_isr_ack_enabled_only (0644, default off) acknowledges
+only the enabled bits, as the stock driver does, and leaves the others
+latched for the tracer; gpon_isr() then returns IRQ_NONE when only such
+latched bits are set. It only affects diagnostics, so the old
+acknowledgement stays the default.
+
+Also rate limit the "upstream burst started late" warning, which could
+flood the log from the PLOAM worker.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 77 +++++++++++++++++++++--
+ drivers/net/ethernet/airoha/airoha_xpon.h |  3 +
+ 2 files changed, 74 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 3d42f09..c372bc3 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2051,6 +2051,44 @@ static ssize_t gpon_gem_delin_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(gpon_gem_delin);
+ 
++/*
++ * The stock gpon_isr() acknowledges only status & mask. This driver clears
++ * the whole snapshot, so status bits that are not enabled as interrupts
++ * (SFIFO_FULL, BFIFO_FULL, BST_SGL_DIFF, RX_ERR, BWM_*) vanish whenever any
++ * PLOAM arrives, before the 1 ms tracer can sample them. They are counted
++ * here (gpon_irq_status in sysfs) either way; with this set they are left
++ * latched for the tracer as on the stock driver. Diagnostics only, so the
++ * old behaviour stays the default.
++ */
++static bool gpon_isr_ack_enabled_only;
++module_param(gpon_isr_ack_enabled_only, bool, 0644);
++MODULE_PARM_DESC(gpon_isr_ack_enabled_only,
++		 "Acknowledge only enabled G_INT_STATUS bits, as the stock driver (default: off)");
++
++/* G_INT_STATUS bits seen set while not enabled as interrupts. */
++static ssize_t gpon_irq_status_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++	unsigned int bit;
++	int len = 0;
++
++	if (!priv)
++		return -ENODEV;
++
++	for (bit = 0; bit < 32; bit++) {
++		u32 n = READ_ONCE(priv->irq_status_seen[bit]);
++
++		if (n)
++			len += sysfs_emit_at(buf, len, "bit%u=%u ", bit, n);
++	}
++	len += sysfs_emit_at(buf, len, "ack=%s\n",
++			     READ_ONCE(gpon_isr_ack_enabled_only) ?
++			     "enabled-only" : "all");
++	return len;
++}
++static DEVICE_ATTR_RO(gpon_irq_status);
++
+ static ssize_t gpon_gem_mib_show(struct device *dev,
+ 				 struct device_attribute *attr, char *buf)
+ {
+@@ -2141,6 +2179,7 @@ static DEVICE_ATTR_RW(gpon_gem_mib_enable);
+ static struct attribute *gpon_bip_attrs[] = {
+ 	&dev_attr_gpon_bip.attr,
+ 	&dev_attr_gpon_gem_delin.attr,
++	&dev_attr_gpon_irq_status.attr,
+ 	&dev_attr_gpon_gem_mib.attr,
+ 	&dev_attr_gpon_gem_mib_enable.attr,
+ 	NULL
+@@ -3672,15 +3711,36 @@ static void gpon_ber_timer_fn(struct timer_list *t)
+ 			  msecs_to_jiffies(priv->ber_interval_ms));
+ }
+ 
++static void gpon_count_irq_status(struct xpon_priv *priv, u32 disabled,
++				  bool keep)
++{
++	u32 fresh = disabled & ~priv->irq_status_latched;
++	unsigned int bit;
++
++	for_each_set_bit(bit, (unsigned long *)&fresh, 32)
++		WRITE_ONCE(priv->irq_status_seen[bit],
++			   priv->irq_status_seen[bit] + 1);
++	/* A bit still latched from the previous pass is not a new event. */
++	priv->irq_status_latched = keep ? disabled : 0;
++}
++
+ static void gpon_handle_irq_status(struct xpon_priv *priv, u32 raw, u32 enabled)
+ {
+ 	u32 active = raw & enabled;
++	bool enabled_only = READ_ONCE(gpon_isr_ack_enabled_only);
+ 
+ 	if (!raw)
+ 		return;
+ 
+-	/* G_INT_STATUS is W1C; acknowledge the complete hardware snapshot. */
+-	gpon_write(priv, GPON_INT_STATUS, raw);
++	gpon_count_irq_status(priv, raw & ~enabled, enabled_only);
++	/* G_INT_STATUS is W1C. */
++	if (enabled_only) {
++		if (active)
++			gpon_write(priv, GPON_INT_STATUS, active);
++	} else {
++		/* Acknowledge the complete hardware snapshot. */
++		gpon_write(priv, GPON_INT_STATUS, raw);
++	}
+ 	gpon_bb_record(priv, GPON_BB_IRQ, raw, enabled, 0, 0);
+ 
+ 	if (!active)
+@@ -4224,10 +4284,10 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 			airoha_eth_xpon_dump_oam_rx_state(priv->gdm_dev);
+ 
+ 		if (active & INT_TX_LATE_START)
+-			dev_warn(priv->dev,
+-				 "GPON upstream burst started late: rsp_time=%#06x state=%s\n",
+-				 gpon_read(priv, GPON_RSP_TIME),
+-				 gpon_state_name(ploam_get_state(priv->ploam)));
++			dev_warn_ratelimited(priv->dev,
++					     "GPON upstream burst started late: rsp_time=%#06x state=%s\n",
++					     gpon_read(priv, GPON_RSP_TIME),
++					     gpon_state_name(ploam_get_state(priv->ploam)));
+ 	}
+ 
+ 	if (READ_ONCE(priv->mac_enabled))
+@@ -4244,6 +4304,11 @@ static irqreturn_t gpon_isr(int irq, void *data)
+ 		return IRQ_NONE;
+ 
+ 	enabled = gpon_read(priv, GPON_INT_ENABLE);
++	/* Latched disabled bits alone are not an interrupt from this MAC. */
++	if (!(raw & enabled) && READ_ONCE(gpon_isr_ack_enabled_only)) {
++		gpon_count_irq_status(priv, raw & ~enabled, true);
++		return IRQ_NONE;
++	}
+ 	gpon_handle_irq_status(priv, raw, enabled);
+ 
+ 	return IRQ_HANDLED;
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index daed27d..c3bf32a 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -567,6 +567,9 @@ struct xpon_priv {
+ 	u32			bit_delay;
+ 	/* PHY psync-to-SOF delay when this session reached O5, or U32_MAX */
+ 	u32			psync_sof_o5;
++	/* G_INT_STATUS bits seen set while not enabled, per bit */
++	u32			irq_status_seen[32];
++	u32			irq_status_latched;
+ 	/* Last stable psync-to-SOF delay seen in O5 */
+ 	u32			psync_sof_last;
+ 	/* MAC fine delay (DBG_DLY[15:8]) currently programmed */

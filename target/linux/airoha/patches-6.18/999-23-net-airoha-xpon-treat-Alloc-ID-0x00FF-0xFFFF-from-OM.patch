@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:06:07 -0300
+Subject: [PATCH 14/48] net: airoha: xpon: treat Alloc-ID 0x00FF/0xFFFF from
+ OMCI as unassigned
+
+G.988 (T-CONT ME) uses 0x00FF as the "no Alloc-ID" value in G-PON and
+0xFFFF in XG-PON; the OMCI agent seeds T-CONTs with 0xFFFF and an OLT
+releases a T-CONT by writing 0x00FF. gpon_set_omci_tcont_hw() only
+rejected values above 0xFFF, so 0x00FF was programmed as a valid hardware
+T-CONT that answered grants for Alloc-ID 255 and took a channel, and an
+entity moved from a real Alloc-ID to 0x00FF kept its old entry valid.
+0xFFFF failed with -EINVAL instead of releasing the entity.
+
+Treat both values as valid=false, which releases the entity's T-CONT
+through the existing path, and skip them in replace_service() as 0xFFFF
+already was. Only the driver side; the agent default is handled
+separately in net/xpon.
+
+The field OLT uses Alloc-IDs 257/513/769, so nothing changes today.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 26 ++++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_xpon.h |  3 +++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 4e4b829..260b674 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1335,12 +1335,29 @@ out:
+ 	return ret;
+ }
+ 
++/*
++ * OMCI writes the T-CONT Alloc-ID attribute; "no Alloc-ID" is 0x00FF in
++ * G-PON (G.988, ME 262) and 0xFFFF in XG-PON, and agents use either.
++ */
++static bool gpon_alloc_id_unassigned(u16 alloc_id)
++{
++	return alloc_id == GPON_ALLOC_ID_UNASSIGNED ||
++	       alloc_id == GPON_ALLOC_ID_UNASSIGNED_XG;
++}
++
+ static int gpon_set_omci_tcont_hw(struct xpon_priv *priv, u16 entity_id,
+ 				  u16 alloc_id, bool valid,
+ 				  unsigned int *channel)
+ {
+ 	int old_index, index, ret = 0;
+ 
++	/*
++	 * An unassigned Alloc-ID releases the T-CONT: do not program a
++	 * valid hardware T-CONT that answers grants for Alloc-ID 255.
++	 */
++	if (valid && gpon_alloc_id_unassigned(alloc_id))
++		valid = false;
++
+ 	if (valid && alloc_id > TCONT_ID_MASK)
+ 		return -EINVAL;
+ 
+@@ -2346,6 +2363,13 @@ int airoha_gpon_omci_hw_set_tcont(void *hw_priv, u16 entity_id,
+ 	unsigned int channel = 0;
+ 	int ret;
+ 
++	if (valid && gpon_alloc_id_unassigned(alloc_id)) {
++		dev_info(priv->dev,
++			 "OMCI T-CONT %#x alloc-id %#x is \"unassigned\": releasing it\n",
++			 entity_id, alloc_id);
++		valid = false;
++	}
++
+ 	ret = gpon_set_omci_tcont_hw(priv, entity_id, alloc_id, valid,
+ 				     &channel);
+ 	if (ret) {
+@@ -2424,7 +2448,7 @@ int airoha_gpon_omci_hw_replace_service(void *hw_priv,
+ 	 * restart cleared the map) makes the channel deterministic regardless of the
+ 	 * order the seed and real services are applied in.
+ 	 */
+-	if (service->alloc_id && service->alloc_id != 0xffff) {
++	if (service->alloc_id && !gpon_alloc_id_unassigned(service->alloc_id)) {
+ 		unsigned int channel;
+ 		int idx;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 4448582..d1e20fa 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -358,6 +358,9 @@ struct airoha_xpon_match_data {
+ #define GPON_MAX_GEM_ID		4096
+ #define GPON_MAX_TCONT		32
+ #define GPON_TCONT_UNASSIGNED	0xffff
++/* OMCI T-CONT Alloc-ID "unassigned": G-PON 0x00FF, XG-PON 0xFFFF */
++#define GPON_ALLOC_ID_UNASSIGNED	0x00ff
++#define GPON_ALLOC_ID_UNASSIGNED_XG	0xffff
+ #define GPON_TCONT_ENTITY_UNASSIGNED	0xffff
+ #define GPON_SN_REQ_THRESHOLD	10
+ 

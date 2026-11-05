@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:05:38 -0300
+Subject: [PATCH 12/48] net: xpon: omci: disable the OLT GEM ports in hardware
+ on MIB reset
+
+A MIB reset deletes every managed entity the OLT created, GEM port
+network CTPs included, but the agent only freed them in the MIB: the
+provider was never told, so the GEM ports stayed enabled in the MAC and
+kept their per-GEM counter slots until the OLT happened to create the
+same GEM port IDs again.
+
+Disable each OLT-created GEM port network CTP through the provider, as a
+Delete does, before the MIB reset drops it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 98ac03f..eb4a48b 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -2638,6 +2638,35 @@ static unsigned int omci_mib_count_locked(struct omci_agent *agent)
+ 	return count;
+ }
+ 
++static int omci_agent_hw_update(struct omci_device *odev,
++				struct omci_mib_object *object,
++				u8 action, const u8 *content);
++
++/*
++ * The OLT created these GEM ports with OMCI and the provider enabled them
++ * in hardware; a MIB reset deletes them, so disable them there too.
++ */
++static void omci_agent_disable_olt_gem_ports_locked(struct omci_device *odev)
++{
++	struct omci_agent *agent = &odev->agent;
++	struct omci_mib_object *object;
++	unsigned long index;
++	int ret;
++
++	xa_for_each_range(&agent->mib, index, object,
++			  omci_mib_key(OMCI_CLASS_GEM_PORT_CTP, 0),
++			  omci_mib_key(OMCI_CLASS_GEM_PORT_CTP, U16_MAX)) {
++		if (object->origin != OMCI_MIB_ORIGIN_OLT)
++			continue;
++		ret = omci_agent_hw_update(odev, object, OMCI_MSG_TYPE_DELETE,
++					   object->data);
++		if (ret)
++			dev_dbg(odev->parent,
++				"OMCI MIB reset: GEM port %u not disabled: %d\n",
++				get_unaligned_be16(object->data), ret);
++	}
++}
++
+ static void omci_agent_reset_olt_objects_locked(struct omci_agent *agent)
+ {
+ 	struct omci_mib_object *object;
+@@ -2662,6 +2691,7 @@ static int omci_agent_mib_reset_locked(struct omci_device *odev, bool all,
+ 
+ 	omci_agent_reset_table_snapshot_locked(agent);
+ 	reset_ret = omci_agent_clear_services_locked(odev);
++	omci_agent_disable_olt_gem_ports_locked(odev);
+ 
+ 	if (all) {
+ 		xa_for_each(&agent->mib, index, object) {

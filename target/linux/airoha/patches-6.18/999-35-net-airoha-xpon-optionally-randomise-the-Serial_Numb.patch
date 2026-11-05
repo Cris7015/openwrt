@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:19:58 -0300
+Subject: [PATCH 26/48] net: airoha: xpon: optionally randomise the
+ Serial_Number_ONU delay
+
+G.984.3 has an ONU in O3 answer each serial-number request after a
+random delay (0 to 48 us), and report that delay in the 12-bit field of
+Serial_Number_ONU in units of 32 bytes, so ONUs that activate at the same
+time (for example when power comes back to an area) do not collide in
+the same serial-number window. The MAC takes the delay from
+G_SN_MSG_CFG[11:0]. gpon_reset_activation_context() sets it to 0 and
+nothing ever changes it, so this ONU always answers at delay 0. The
+stock xpon.ko never writes G_SN_MSG_CFG at all and runs with the
+hardware reset value.
+
+Add airoha_xpon.gpon_sn_random_delay (0644). When set, a new delay in
+0..233 units of 32 bytes is drawn on entering O3 and after every
+INT_SN_ONU_SEND_O3, and the O3 entry logs it (rate limited). It is a new
+mechanism, untested against the field OLT, so it is off by default and
+the activation is unchanged. The SN request threshold and the legacy
+tx_power_mode written by gpon_reset_activation_context() are kept.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 41 +++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 869cd7e..df42d0d 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -698,6 +698,34 @@ static void gpon_set_o5_ploam_filter(struct xpon_priv *priv, bool o5)
+ 		 o5 && READ_ONCE(gpon_o5_ploam_filter) ? bits : 0);
+ }
+ 
++/*
++ * G.984.3 has the ONU answer each serial-number request after a random
++ * delay (0 to 48 us), reported in the 12-bit field of Serial_Number_ONU in
++ * units of 32 bytes, so ONUs activating together do not collide. The MAC
++ * takes the delay from G_SN_MSG_CFG[11:0], which this driver sets to 0 in
++ * gpon_reset_activation_context() and never changes; the stock xpon.ko
++ * never writes the register at all. With this set a new random delay is
++ * drawn on entering O3 and after each Serial_Number_ONU the MAC sends.
++ * New here and untested in the field, so off by default.
++ */
++static bool gpon_sn_random_delay;
++module_param(gpon_sn_random_delay, bool, 0644);
++MODULE_PARM_DESC(gpon_sn_random_delay,
++		 "Randomise the Serial_Number_ONU delay (0..48 us) in O3 (default: off)");
++
++/* 48 us / (256 bits / 1.24416 Gbit/s) */
++#define GPON_SN_RANDOM_DELAY_MAX	233
++
++static void gpon_sn_new_random_delay(struct xpon_priv *priv)
++{
++	if (!READ_ONCE(gpon_sn_random_delay))
++		return;
++
++	gpon_rmw(priv, GPON_SN_MSG_CFG, SN_MSG_CFG_RANDOM_DELAY_MASK,
++		 FIELD_PREP(SN_MSG_CFG_RANDOM_DELAY_MASK,
++			    get_random_u32_below(GPON_SN_RANDOM_DELAY_MAX + 1)));
++}
++
+ static void gpon_reset_activation_context(struct xpon_priv *priv)
+ {
+ 	u32 sn_cfg;
+@@ -3034,6 +3062,14 @@ static void gpon_cb_state_changed(void *hw_priv, enum gpon_state state)
+ 		cancel_delayed_work(&priv->to1_work);
+ 		break;
+ 	case GPON_O3_SERIAL_NUMBER:
++		if (READ_ONCE(gpon_sn_random_delay)) {
++			gpon_sn_new_random_delay(priv);
++			dev_info_ratelimited(priv->dev,
++					     "GPON O3: Serial_Number_ONU random delay %lu x 32 bytes\n",
++					     FIELD_GET(SN_MSG_CFG_RANDOM_DELAY_MASK,
++						       gpon_read(priv, GPON_SN_MSG_CFG)));
++		}
++		fallthrough;
+ 	case GPON_O4_RANGING:
+ 		/* Start / restart TO1, as the stock driver does in O3 and O4. */
+ 		mod_delayed_work(priv->fsm_wq, &priv->to1_work,
+@@ -4094,6 +4130,11 @@ static void gpon_irq_work_fn(struct work_struct *work)
+ 		 * the MAC receives a serial grant, sends Serial_Number_ONU, or
+ 		 * crosses the serial-request threshold.
+ 		 */
++		/* Draw the delay for the next serial-number response. */
++		if ((active & INT_SN_ONU_SEND_O3) &&
++		    ploam_get_state(priv->ploam) == GPON_O3_SERIAL_NUMBER)
++			gpon_sn_new_random_delay(priv);
++
+ 		if (active & (INT_SN_REQ_RECV | INT_SN_ONU_SEND_O3 |
+ 			      INT_SN_REQ_CRS)) {
+ 			sn_cfg = gpon_read(priv, GPON_SN_MSG_CFG);

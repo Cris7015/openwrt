@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 14:03:21 -0300
+Subject: [PATCH 38/48] net: airoha: xpon: restore OMCI GEM ports under
+ gem_mib_lock
+
+"let Encrypted_Port-ID restore GEM ports OMCI created" decided to
+restore a port under gem_mib_lock, dropped the lock and then rewrote the
+port through __gpon_set_gem_port_hw(). An OMCI delete in that window
+would have been undone by the PLOAM message. Do the test and the write
+under one hold of the lock with a new __gpon_set_gem_port_hw_locked().
+
+That commit also presented the restore as something the field link
+needed. It only matters where the GEM table is lost between sessions
+(EN7523 resets its MAC at session start, or gpon_stop_clear_gems /
+gpon_stop_mac_reset are set); on the EN751221 with the defaults the
+ports are still in the table and nothing changed. The comment now says
+so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 42 ++++++++++++++++-------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 09c9977..7690dfd 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -1354,17 +1354,14 @@ static void gpon_mib_start(struct xpon_priv *priv)
+  * update of encrypted_gems, so a concurrent Encrypted_Port-ID cannot be
+  * overwritten by an OMCI write that sampled the bitmap before it.
+  */
+-static int __gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+-				  bool valid, bool encrypted,
+-				  bool ploam_encryption)
++static int __gpon_set_gem_port_hw_locked(struct xpon_priv *priv,
++					 u16 gem_port_id, bool valid,
++					 bool encrypted, bool ploam_encryption)
+ {
+ 	bool was;
+ 	int ret;
+ 
+-	if (gem_port_id >= GPON_MAX_GEM_ID)
+-		return -EINVAL;
+-
+-	mutex_lock(&priv->gem_mib_lock);
++	lockdep_assert_held(&priv->gem_mib_lock);
+ 	if (valid && ploam_encryption &&
+ 	    test_bit(gem_port_id, priv->encrypted_gems))
+ 		encrypted = true;
+@@ -1379,6 +1376,22 @@ static int __gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
+ 		if (priv->gem_mib_enabled)
+ 			gpon_mib_rebuild_locked(priv);
+ 	}
++
++	return ret;
++}
++
++static int __gpon_set_gem_port_hw(struct xpon_priv *priv, u16 gem_port_id,
++				  bool valid, bool encrypted,
++				  bool ploam_encryption)
++{
++	int ret;
++
++	if (gem_port_id >= GPON_MAX_GEM_ID)
++		return -EINVAL;
++
++	mutex_lock(&priv->gem_mib_lock);
++	ret = __gpon_set_gem_port_hw_locked(priv, gem_port_id, valid,
++					    encrypted, ploam_encryption);
+ 	mutex_unlock(&priv->gem_mib_lock);
+ 
+ 	return ret;
+@@ -2359,17 +2372,20 @@ static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 	configured = test_bit(port_id, priv->hw_gems);
+ 	/*
+ 	 * A port OMCI created and has not deleted, but which is missing from
+-	 * the GEM table (a MAC reset at session start on EN7523), is put back
+-	 * as before: when the OLT skips OMCI provisioning after a reactivation
+-	 * this message is what restores it.
++	 * the GEM table, is put back as before: when the OLT skips OMCI
++	 * provisioning after a reactivation this message is what restores
++	 * it. That only happens where the GEM table is lost between sessions
++	 * (EN7523 MAC reset at start, gpon_stop_clear_gems, gpon_stop_mac_reset);
++	 * on the EN751221 with the defaults the port is still "configured".
+ 	 */
+ 	restore = !configured && test_bit(port_id, priv->omci_gems);
+ 	if (configured)
+ 		ret = gpon_write_gem_port_hw(priv, port_id, true, encrypted);
++	else if (restore)
++		/* Under the same lock: OMCI cannot delete it in between. */
++		ret = __gpon_set_gem_port_hw_locked(priv, port_id, true,
++						    encrypted, true);
+ 	mutex_unlock(&priv->gem_mib_lock);
+-	if (restore)
+-		ret = __gpon_set_gem_port_hw(priv, port_id, true, encrypted,
+-					     true);
+ 
+ 	if (ret)
+ 		dev_err(priv->dev,

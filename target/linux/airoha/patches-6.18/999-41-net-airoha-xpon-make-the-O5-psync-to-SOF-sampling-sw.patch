@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:24:50 -0300
+Subject: [PATCH 32/48] net: airoha: xpon: make the O5 psync-to-SOF sampling
+ switchable
+
+The relock monitor reads PHY 0x2d4 once per link poll while in O5,
+where patch 995 read it only on O5/O6 entry. The register is safe to
+read, but the higher read rate is new, so give it its own switch:
+airoha_xpon.gpon_relock_monitor (0644, default on). With it off nothing
+is sampled in O5 and the relock compensation cannot trigger.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 29f69b6..8c275ff 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2856,6 +2856,12 @@ module_param(gpon_relock_comp, bool, 0644);
+ MODULE_PARM_DESC(gpon_relock_comp,
+ 		 "Correct the MAC fine delay after a PHY relock in O5, as the stock driver (default: off, log only)");
+ 
++/* One read of PHY 0x2d4 per link poll in O5; off stops the sampling. */
++static bool gpon_relock_monitor = true;
++module_param(gpon_relock_monitor, bool, 0644);
++MODULE_PARM_DESC(gpon_relock_monitor,
++		 "Sample the PHY psync-to-SOF delay in O5 to detect relocks (default: on)");
++
+ #define GPON_RELOCK_MAX_DIFF	15
+ 
+ static void gpon_set_fine_delay(struct xpon_priv *priv, u8 fine)
+@@ -2889,7 +2895,7 @@ static void gpon_psync_check(struct xpon_priv *priv)
+ 	u32 delay, prev;
+ 	int diff;
+ 
+-	if (priv->psync_sof_o5 == U32_MAX ||
++	if (!READ_ONCE(gpon_relock_monitor) || priv->psync_sof_o5 == U32_MAX ||
+ 	    airoha_xpon_phy_get_psync_sof_delay(priv->phy, &delay) ||
+ 	    delay == priv->psync_sof_last)
+ 		return;

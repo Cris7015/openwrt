@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Thu, 5 Nov 2026 13:13:19 -0300
+Subject: [PATCH 23/48] net: airoha: xpon: invalidate the T-CONT table on
+ session stop
+
+G.984.3 releases an ONU's Alloc-IDs and Port-IDs together with its
+ONU-ID when it is deactivated; the next activation provisions them
+again. On the EN751221 gpon_enable() does not reset the MAC
+(gpon_reset_on_start is unset) and gpon_disable() never touched the
+tables: the T-CONT pair registers 0x020..0x03C, the indirect T-CONTs
+16..31 and the GEM table kept the stopped session valid, while
+gpon_dev_init() only forgot them in software. If the OLT assigned the
+Alloc-IDs in another order the next session could end up with two valid
+hardware T-CONTs for one Alloc-ID, and old Alloc-IDs kept answering
+grants.
+
+The stock driver gets rid of them: gpon_disable_with_option() clears its
+software tables and schedules gpon_dev_reset_GPON_MAC(), which pulses the
+MAC reset (0xbfb00834 bit 31) and stops the MBI again, and
+gponDevDeactiveOnu() sweeps the GEM table. gponDevResetAllocId() gives
+the reset image of the pair registers, 0x00ff00ff.
+
+On session stop, before the MBI is stopped, write 0x00ff00ff to the
+eight pair registers, invalidate the indirect T-CONTs in use and forget
+the T-CONT maps: airoha_xpon.gpon_stop_clear_tconts (0644, default on).
+Every activation gets its Alloc-IDs again through Assign_Alloc-ID (the
+Huawei OLT re-sent 257/513/769 after every Deactivate in the logs) and
+OMCI services look T-CONTs up by Alloc-ID, so a failed reactivation is
+retried by restart_work exactly as before.
+
+The GEM table is NOT cleared by default. The Huawei OLT does not always
+provision OMCI again after a Deactivate_ONU-ID: the field log of 23-oct
+shows two restarts back to "netdev link ready ... service=1" without a
+single OMCI GEM port write, so the service survived only because the
+GEM entries did. The OMCI agent does not replay its GEM port CTPs to the
+hardware when the OMCC comes back, so clearing them would leave the
+house without service. airoha_xpon.gpon_stop_clear_gems (0644, default
+off) does it for an agent that replays them.
+
+A MAC reset at stop, as the stock driver does, is available as
+airoha_xpon.gpon_stop_mac_reset (0644, default off). It wipes the GEM
+table too, so it has the same prerequisite, and it has not been tried on
+this board.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 113 ++++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_xpon.h |   2 +
+ 2 files changed, 115 insertions(+)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index af1e6e5..dd10093 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3330,6 +3330,117 @@ err_disable_frontend:
+ 	return ret;
+ }
+ 
++/*
++ * Session stop and the hardware tables. The stock driver drops every
++ * T-CONT and GEM port of a stopped session: gpon_disable_with_option()
++ * clears its software tables and schedules gpon_dev_reset_GPON_MAC(),
++ * whose MAC reset (0xbfb00834 bit 31, then MBI stop) empties the hardware
++ * ones, and gponDevDeactiveOnu() sweeps the GEM table on its own. On the
++ * EN751221 this driver resets no MAC, so the T-CONT pair registers, the
++ * indirect T-CONTs and the GEM table kept the old session valid while
++ * gpon_dev_init() only forgot them in software.
++ *
++ * gpon_stop_clear_tconts (default on): before the MBI stops, write the
++ * register image of the stock gponDevResetAllocId() (0x00ff00ff) to the
++ * pair registers and invalidate the indirect T-CONTs in use. Every new
++ * activation gets its Alloc-IDs again through Assign_Alloc-ID PLOAMs (the
++ * Huawei OLT sends 257/513/769 after every Deactivate), and OMCI services
++ * find them by Alloc-ID, so nothing depends on the old entries.
++ *
++ * gpon_stop_clear_gems (default off): also invalidate every GEM port this
++ * driver made valid. The GEM ports come from OMCI, and the Huawei OLT does
++ * not always provision OMCI again after a Deactivate_ONU-ID (the field log
++ * of 23-oct shows two restarts back to "service=1" without a single OMCI
++ * GEM port write), while the OMCI agent does not replay its GEM port CTPs
++ * to the hardware when the OMCC comes back. Clearing them would leave the
++ * service ports invalid. Only enable it with an agent that replays them.
++ *
++ * gpon_stop_mac_reset (default off): pulse the MAC reset after the MBI
++ * stop, like the stock driver. It wipes the GEM table as well, so it has
++ * the same prerequisite, and it has not been tried on this board.
++ */
++static bool gpon_stop_clear_tconts = true;
++module_param(gpon_stop_clear_tconts, bool, 0644);
++MODULE_PARM_DESC(gpon_stop_clear_tconts,
++		 "Invalidate the hardware T-CONT table when a session stops (default: on)");
++
++static bool gpon_stop_clear_gems;
++module_param(gpon_stop_clear_gems, bool, 0644);
++MODULE_PARM_DESC(gpon_stop_clear_gems,
++		 "Invalidate the hardware GEM table when a session stops; needs OMCI to replay its GEM ports (default: off)");
++
++static bool gpon_stop_mac_reset;
++module_param(gpon_stop_mac_reset, bool, 0644);
++MODULE_PARM_DESC(gpon_stop_mac_reset,
++		 "Also reset the GPON MAC when a session stops, as the stock driver; wipes the GEM table (default: off)");
++
++static void gpon_clear_hw_tables(struct xpon_priv *priv)
++{
++	unsigned long gem = 0;
++	unsigned int gems = 0, failed = 0, index, reg;
++	bool clear_gems = READ_ONCE(gpon_stop_clear_gems);
++
++	if (!clear_gems && !READ_ONCE(gpon_stop_clear_tconts))
++		return;
++
++	/* Every GEM port this driver made valid is in hw_gems. */
++	while (clear_gems) {
++		mutex_lock(&priv->gem_mib_lock);
++		gem = find_next_bit(priv->hw_gems, GPON_MAX_GEM_ID, gem);
++		mutex_unlock(&priv->gem_mib_lock);
++		if (gem >= GPON_MAX_GEM_ID)
++			break;
++		if (gpon_set_gem_port_hw(priv, gem, false, false))
++			failed++;
++		else
++			gems++;
++		gem++;
++	}
++
++	if (READ_ONCE(gpon_stop_clear_tconts)) {
++		mutex_lock(&priv->tcont_lock);
++		for (reg = GPON_TCONT_ID_0_1; reg <= GPON_TCONT_ID_14_15;
++		     reg += 4)
++			gpon_write(priv, reg, GPON_TCONT_PAIR_RESET);
++		for (index = 16; index < GPON_MAX_TCONT; index++)
++			if (priv->tcont_alloc_id[index] !=
++			    GPON_TCONT_UNASSIGNED &&
++			    __gpon_set_tcont_hw(priv, index, 0, false))
++				failed++;
++		memset(priv->tcont_alloc_id, 0xff,
++		       sizeof(priv->tcont_alloc_id));
++		memset(priv->tcont_entity_id, 0xff,
++		       sizeof(priv->tcont_entity_id));
++		mutex_unlock(&priv->tcont_lock);
++	}
++
++	dev_info(priv->dev,
++		 "GPON session stop: invalidated the T-CONT table%s, %u GEM ports%s\n",
++		 READ_ONCE(gpon_stop_clear_tconts) ? "" : " (off)", gems,
++		 failed ? " (some entries did not confirm)" : "");
++}
++
++static void gpon_stop_reset_mac(struct xpon_priv *priv)
++{
++	int ret;
++
++	if (!READ_ONCE(gpon_stop_mac_reset) || !priv->mac_reset ||
++	    priv->match_data->gpon_reset_on_start)
++		return;
++
++	dev_info_ratelimited(priv->dev, "GPON session stop: resetting the MAC\n");
++	/* The reset clears the GEM table and the MIB behind it. */
++	gpon_mib_invalidate(priv);
++	ret = reset_control_reset(priv->mac_reset);
++	if (ret)
++		dev_warn(priv->dev, "GPON MAC reset failed: %d\n", ret);
++	usleep_range(1000, 2000);
++	/* gpon_dev_reset_GPON_MAC() stops the MBI again after the pulse. */
++	gpon_set_bits(priv, GPON_MBI_MPI_STOP, MBI_RX_STOP | MBI_TX_STOP);
++	if (priv->match_data->gpon_has_mpi && gpon_set_mpi_stop(priv, true))
++		dev_warn(priv->dev, "GPON MPI stop timeout after reset\n");
++}
++
+ static void gpon_disable(struct xpon_priv *priv)
+ {
+ 	bool mac_enabled = READ_ONCE(priv->mac_enabled);
+@@ -3400,6 +3511,7 @@ static void gpon_disable(struct xpon_priv *priv)
+ 		 */
+ 		gpon_reset_activation_context(priv);
+ 		gpon_write(priv, GPON_OMCI_ID, 0);
++		gpon_clear_hw_tables(priv);
+ 
+ 		ret = gpon_set_fe_datapath(priv, false);
+ 		if (ret)
+@@ -3422,6 +3534,7 @@ static void gpon_disable(struct xpon_priv *priv)
+ 			gpon_read(priv, GPON_MBI_MPI_STOP));
+ 
+ 		airoha_eth_xpon_retire_all(priv->gdm_dev);
++		gpon_stop_reset_mac(priv);
+ 	}
+ 
+ 	if (phy_active)
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index 291787c..f720931 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -253,6 +253,8 @@ struct airoha_xpon_match_data {
+ #define TCONT1_ID_SHIFT		16
+ #define TCONT1_VALID		BIT(31)
+ #define TCONT_PAIR_INVALID	0x00000000	/* validity bits cleared */
++/* stock gponDevResetAllocId(): Alloc-ID 0xff, invalid, in both halves */
++#define GPON_TCONT_PAIR_RESET	0x00ff00ff
+ 
+ /* G_TCONT_ID_16_31_CFG */
+ #define TCONT16_CMD_EXEC	BIT(31)
