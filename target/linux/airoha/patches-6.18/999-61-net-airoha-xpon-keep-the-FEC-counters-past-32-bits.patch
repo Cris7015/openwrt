@@ -1,0 +1,212 @@
+From 4e3c0dd486d2579d9e714918d6e92254f1a635c7 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Fri, 6 Nov 2026 18:59:42 -0300
+Subject: [PATCH] net: airoha: xpon: keep the FEC counters past 32 bits
+
+The total code words register does not wrap: on the line it reached
+0xffffffff after 58 minutes of session and stayed there, so ME 312 read
+no more code words for the rest of the session.
+
+Fold the FEC registers into 64-bit totals and clear them on every read,
+with the same latch, read and clear sequence as the BIP counter. The OMCI
+agent reads them every minute, well inside the limit, and gpon_counters
+now shows the real totals.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c |  8 ++---
+ drivers/phy/airoha/phy-airoha-xpon.c      | 36 +++++++++++++++--------
+ include/linux/phy/phy-airoha-xpon.h       | 10 +++----
+ include/net/xpon/omci.h                   | 15 +++++-----
+ net/xpon/omci/agent.c                     |  7 ++---
+ net/xpon/omci/internal.h                  |  2 +-
+ 6 files changed, 45 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 1579a82..b700abc 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2154,10 +2154,10 @@ static ssize_t gpon_counters_show(struct device *dev,
+ 
+ 	if (!airoha_xpon_phy_get_gpon_rx_counters(priv->phy, &c))
+ 		len += sysfs_emit_at(buf, len,
+-				     "fec_corrected_bytes=%u\n"
+-				     "fec_corrected_codewords=%u\n"
+-				     "fec_uncorrectable_codewords=%u\n"
+-				     "fec_codewords=%u\nfec_seconds=%u\n"
++				     "fec_corrected_bytes=%llu\n"
++				     "fec_corrected_codewords=%llu\n"
++				     "fec_uncorrectable_codewords=%llu\n"
++				     "fec_codewords=%llu\nfec_seconds=%llu\n"
+ 				     "rx_frames=%llu\nlof=%u\n",
+ 				     c.fec_corrected_bytes,
+ 				     c.fec_corrected_codewords,
+diff --git a/drivers/phy/airoha/phy-airoha-xpon.c b/drivers/phy/airoha/phy-airoha-xpon.c
+index 8cf106b..53a2125 100644
+--- a/drivers/phy/airoha/phy-airoha-xpon.c
++++ b/drivers/phy/airoha/phy-airoha-xpon.c
+@@ -54,6 +54,7 @@
+ #define XPON_RX_COUNTER_ENABLE		0x0230
+ #define XPON_RX_COUNTER_CTRL		0x0234
+ #define XPON_RX_FEC_LATCH		BIT(0)
++#define XPON_RX_FEC_CLEAR		BIT(1)
+ #define XPON_RX_FRAME_LATCH		BIT(4)
+ #define XPON_RX_FEC_CORRECTED_BYTES	0x0238
+ #define XPON_RX_FEC_CORRECTED_CW	0x023c
+@@ -195,6 +196,8 @@ struct airoha_xpon_phy {
+ 	spinlock_t counter_lock;
+ 	/* Bumped when the RX counters are cleared. */
+ 	u32 counter_generation;
++	/* The FEC registers stick at 32 bits; these are the real totals. */
++	u64 fec_totals[5];
+ 	u32 cached_rx_status;
+ 	unsigned long cached_rx_jiffies;
+ 	bool cached_rx_valid;
+@@ -405,14 +408,22 @@ static u32 airoha_xpon_phy_read_latched(struct airoha_xpon_phy *priv, u32 reg)
+ /*
+  * Latch and read the cumulative FEC and frame/LOF counters, as the vendor
+  * phy_rx_fec_counter() and phy_rx_frame_counter() do.  The latch is a command
+- * register write and nothing is cleared here: the counters run from the last
+- * PHY configure.  Safe in atomic context.
++ * register write.  The total code words reach the 32-bit limit in under an
++ * hour and stick there, so fold the FEC registers into 64-bit totals and clear
++ * them on every read; a caller only has to read within that time.  The totals
++ * run from the last PHY configure.  Safe in atomic context.
+  */
+ int airoha_xpon_phy_get_gpon_rx_counters(
+ 	struct phy *phy, struct airoha_xpon_phy_gpon_rx_counters *c)
+ {
++	static const u32 fec_regs[] = {
++		XPON_RX_FEC_CORRECTED_BYTES, XPON_RX_FEC_CORRECTED_CW,
++		XPON_RX_FEC_UNCORRECTABLE_CW, XPON_RX_FEC_TOTAL_CW,
++		XPON_RX_FEC_SECONDS,
++	};
+ 	struct airoha_xpon_phy *priv;
+ 	unsigned long flags;
++	unsigned int i;
+ 	u32 high;
+ 	int ret;
+ 
+@@ -429,16 +440,15 @@ int airoha_xpon_phy_get_gpon_rx_counters(
+ 	spin_lock_irqsave(&priv->counter_lock, flags);
+ 	c->generation = priv->counter_generation;
+ 	airoha_xpon_phy_write(priv, XPON_RX_COUNTER_CTRL, XPON_RX_FEC_LATCH);
+-	c->fec_corrected_bytes =
+-		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_CORRECTED_BYTES);
+-	c->fec_corrected_codewords =
+-		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_CORRECTED_CW);
+-	c->fec_uncorrectable_codewords =
+-		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_UNCORRECTABLE_CW);
+-	c->fec_codewords =
+-		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_TOTAL_CW);
+-	c->fec_seconds =
+-		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_SECONDS);
++	for (i = 0; i < ARRAY_SIZE(fec_regs); i++)
++		priv->fec_totals[i] +=
++			airoha_xpon_phy_read_latched(priv, fec_regs[i]);
++	airoha_xpon_phy_write(priv, XPON_RX_COUNTER_CTRL, XPON_RX_FEC_CLEAR);
++	c->fec_corrected_bytes = priv->fec_totals[0];
++	c->fec_corrected_codewords = priv->fec_totals[1];
++	c->fec_uncorrectable_codewords = priv->fec_totals[2];
++	c->fec_codewords = priv->fec_totals[3];
++	c->fec_seconds = priv->fec_totals[4];
+ 
+ 	airoha_xpon_phy_write(priv, XPON_RX_COUNTER_CTRL, XPON_RX_FRAME_LATCH);
+ 	high = airoha_xpon_phy_read_latched(priv, XPON_RX_FRAME_COUNT_HIGH);
+@@ -940,6 +950,8 @@ econet_xpon_phy_counter_clear(struct airoha_xpon_phy *priv, u32 mask)
+ 
+ 	spin_lock_irqsave(&priv->counter_lock, flags);
+ 	priv->counter_generation++;
++	if (mask & ECONET_XPON_COUNTER_CLEAR_RX0)
++		memset(priv->fec_totals, 0, sizeof(priv->fec_totals));
+ 	/*
+ 	 * EcoNet 1G phy_counter_clear().  The RX counter clear register is a
+ 	 * command register: the vendor writes one command at a time rather than
+diff --git a/include/linux/phy/phy-airoha-xpon.h b/include/linux/phy/phy-airoha-xpon.h
+index 3ceb627..91f5633 100644
+--- a/include/linux/phy/phy-airoha-xpon.h
++++ b/include/linux/phy/phy-airoha-xpon.h
+@@ -40,11 +40,11 @@ int airoha_xpon_phy_get_gpon_fec_status(struct phy *phy,
+ /* Cumulative downstream counters, from the last PHY configure. */
+ struct airoha_xpon_phy_gpon_rx_counters {
+ 	u32 generation;		/* changes when the counters restart from 0 */
+-	u32 fec_corrected_bytes;
+-	u32 fec_corrected_codewords;
+-	u32 fec_uncorrectable_codewords;
+-	u32 fec_codewords;
+-	u32 fec_seconds;
++	u64 fec_corrected_bytes;
++	u64 fec_corrected_codewords;
++	u64 fec_uncorrectable_codewords;
++	u64 fec_codewords;
++	u64 fec_seconds;
+ 	u64 frames;
+ 	u32 lof;
+ };
+diff --git a/include/net/xpon/omci.h b/include/net/xpon/omci.h
+index f3a275a..2a64014 100644
+--- a/include/net/xpon/omci.h
++++ b/include/net/xpon/omci.h
+@@ -311,16 +311,17 @@ struct omci_gem_counters {
+  * @total_codewords: code words received
+  * @seconds: seconds with a FEC anomaly
+  *
+- * The totals are 32 bits wide. The OMCI agent builds the 15-min performance
+- * monitoring intervals from their differences.
++ * The totals only grow within one @generation. The OMCI agent builds the
++ * 15-min performance monitoring intervals from their differences, and its
++ * reads every minute are what keeps a 32-bit hardware counter from sticking.
+  */
+ struct omci_fec_counters {
+ 	u32 generation;
+-	u32 corrected_bytes;
+-	u32 corrected_codewords;
+-	u32 uncorrectable_codewords;
+-	u32 total_codewords;
+-	u32 seconds;
++	u64 corrected_bytes;
++	u64 corrected_codewords;
++	u64 uncorrectable_codewords;
++	u64 total_codewords;
++	u64 seconds;
+ };
+ 
+ struct omci_ani_topology {
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 8e751b5..cb302ce 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -3554,14 +3554,13 @@ static void omci_gem_pm_close_locked(struct omci_agent *agent,
+ }
+ 
+ /*
+- * Fold the hardware FEC totals into the running interval. They are 32 bits
+- * wide and sampled every minute, so an unsigned difference survives a wrap.
+- * A new generation means they restarted from zero.
++ * Fold the hardware FEC totals into the running interval. A new generation
++ * means they restarted from zero.
+  */
+ static void omci_fec_pm_sample_locked(struct omci_device *odev)
+ {
+ 	struct omci_fec_pm *pm = &odev->agent.fec_pm;
+-	u32 now[OMCI_FEC_PM_COUNTERS];
++	u64 now[OMCI_FEC_PM_COUNTERS];
+ 	struct omci_fec_counters c;
+ 	unsigned int i;
+ 
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index f236638..ec8a4ab 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -61,7 +61,7 @@ enum omci_fec_pm_counter {
+  */
+ struct omci_fec_pm {
+ 	u64 count[OMCI_FEC_PM_COUNTERS];
+-	u32 last[OMCI_FEC_PM_COUNTERS];
++	u64 last[OMCI_FEC_PM_COUNTERS];
+ 	u32 generation;
+ 	bool sampled;
+ };
+-- 
+2.47.3
+
