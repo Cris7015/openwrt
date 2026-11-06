@@ -26,6 +26,11 @@ start_service() {
 	procd_set_param command /bin/sh -c 'exec logread -f -e "1fb60000.xmac" >> /tmp/xr500v-gpon/klog.log'
 	procd_set_param respawn 3600 5 5
 	procd_close_instance
+
+	procd_open_instance pppdlog
+	procd_set_param command /bin/sh -c 'exec logread -f -e "pppd" >> /tmp/xr500v-gpon/klog.log'
+	procd_set_param respawn 3600 5 5
+	procd_close_instance
 }
 
 stop_service() {

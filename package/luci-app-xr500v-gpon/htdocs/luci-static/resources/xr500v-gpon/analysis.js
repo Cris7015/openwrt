@@ -165,6 +165,12 @@ return baseclass.extend({
 				? _('The OLT adjusted the equalization delay by %d bits').replace('%d', ev.delta)
 				: _('The OLT adjusted the equalization delay');
 		case 'to2':        return _('No Popup within 100 ms (TO2); the GPON link restarted');
+		case 'wan_auth':   return _('The ISP rejected the PPPoE login: the credentials may have changed');
+		case 'wan_no_pado': return _('No PPPoE server answered: the VLAN or the service may have changed');
+		case 'sn_stuck':   return _('Stuck before O5 with light on the fiber: the OLT may have dropped this serial');
+		case 'sip_fail':
+			return (ev.n) ? _('SIP registration keeps failing (%d): the account may have changed').replace('%d', ev.n)
+				: _('SIP registration keeps failing: the account may have changed');
 		case 'bip_burst':
 			return (ev.n != null) ? _('%d BIP errors in one minute').replace('%d', ev.n) : _('BIP error burst');
 		case 'bosa_alarm':

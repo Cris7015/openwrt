@@ -359,6 +359,44 @@ eq('load_snapshot_tolerates_corrupt_file_m1', r.out?.m1_len, 3);
 
 // snapshot_roundtrip: a saved snapshot is restored before new samples.
 fs.unlink(`${BASE}/good.json.gz`);
+// recorder_migration_*: what an ISP migration breaks, told apart. One retry
+// is not an event; a good login clears the count; the event repeats hourly.
+const PPP = 'daemon.notice pppd[100]: ';
+function wan_case(name, lines) {
+	let s = [], k = [];
+	for (let i = 0; i < 8; i++)
+		push(s, sample(T0 + 60 * i));
+	for (let i = 0; i < length(lines); i++)
+		push(k, { t: T0 + 60 * i + 30, line: PPP + lines[i] });
+	return types(replay(name, { boot: T0, samples: s, klog: k }).out?.events);
+}
+function count(list, type) {
+	return length(filter(list, (t) => t == type));
+}
+const AUTH = 'CHAP authentication failed', PADO = 'Timeout waiting for PADO packets';
+eq('recorder_migration_auth_once', count(wan_case('m1', [ AUTH ]), 'wan_auth'), 0);
+eq('recorder_migration_auth_repeats', count(wan_case('m2', [ AUTH, AUTH, AUTH, AUTH ]), 'wan_auth'), 1);
+eq('recorder_migration_pado', count(wan_case('m3', [ PADO, PADO, PADO ]), 'wan_no_pado'), 1);
+eq('recorder_migration_login_clears', count(wan_case('m4',
+	[ AUTH, AUTH, 'local  IP address 1.2.3.4', AUTH, AUTH ]), 'wan_auth'), 0);
+
+function state_case(name, state, n, over) {
+	let s = [];
+	for (let i = 0; i < n; i++)
+		push(s, sample(T0 + 60 * i, { status: status({ state }), ...over }));
+	return types(replay(name, { boot: T0, samples: s }).out?.events);
+}
+eq('recorder_migration_stuck', count(state_case('s1', 3, 6, {}), 'sn_stuck'), 1);
+eq('recorder_migration_stuck_short', count(state_case('s2', 3, 3, {}), 'sn_stuck'), 0);
+eq('recorder_migration_no_light', count(state_case('s3', 1, 6, {}), 'sn_stuck'), 0);
+
+const REG = (state) => ({ voip: { wan_up: true, lines: [ { registrations: [ { state, code: 403 } ] } ] } });
+eq('recorder_migration_sip', count(state_case('v1', 5, 13, REG('failed')), 'sip_fail'), 1);
+eq('recorder_migration_sip_short', count(state_case('v2', 5, 5, REG('failed')), 'sip_fail'), 0);
+eq('recorder_migration_sip_ok', count(state_case('v3', 5, 13, REG('registered')), 'sip_fail'), 0);
+eq('recorder_migration_sip_wan_down', count(state_case('v4', 5, 13,
+	{ voip: { wan_up: false, lines: [ { registrations: [ { state: 'failed' } ] } ] } }), 'sip_fail'), 0);
+
 r = replay('save', { save: `${BASE}/good.json.gz`, samples: [ sample(T0), sample(T0 + 60) ] });
 ok('snapshot_roundtrip_saved', fs.stat(`${BASE}/good.json.gz`) != null);
 r = replay('load', { snapshot: `${BASE}/good.json.gz`, samples: [ sample(T0 + 120) ] });

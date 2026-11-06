@@ -18,7 +18,7 @@ import * as uloop from 'uloop';
 import * as ubus from 'ubus';
 import { cursor } from 'uci';
 import {
-	normalize_status, parse_bip, parse_counters, thresholds, evaluate, detect, aggregate, ring_push
+	normalize_status, parse_bip, parse_counters, sip_failed, thresholds, evaluate, detect, aggregate, ring_push
 } from 'lib';
 import { eye_scan, eye_metrics } from 'eye';
 
@@ -45,6 +45,10 @@ let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_da
 const EYE_CAP = 1080;	// eye margin history: 45 days at one scan an hour
 let th = thresholds(null);
 let sink = null;	// daemon only: event -> overlay
+
+// What an ISP migration breaks: failures that repeat, not one retry.
+const WAN_FAILS = 3, WAN_WINDOW = 600, WAN_REPEAT = 3600;
+const STUCK_SECS = 180, SIP_SECS = 600;
 
 let st = {
 	m1: [], m5: [], m30: [], p5: [], p30: [], events: [],
@@ -216,6 +220,21 @@ function add_event(t, ev) {
 		open_window(t);
 }
 
+// pppd retries on its own while the line comes back, so only a few failures
+// in a row make an event, and then at most one an hour.
+function wan_failed(t, type, severity, msg) {
+	if (!st.wan_fail)
+		st.wan_fail = {};
+	let w = st.wan_fail[type];
+	if (!w || t - w.t0 > WAN_WINDOW)
+		w = st.wan_fail[type] = { t0: t, n: 0, told: w?.told };
+	w.n++;
+	if (w.n < WAN_FAILS || (w.told && t - w.told < WAN_REPEAT))
+		return;
+	w.told = t;
+	add_event(t, { type, severity, msg });
+}
+
 // Closes the 5/30-min buckets the sample leaves behind, then queues it.
 function bucket(sample) {
 	for (let ring, spec in RINGS) {
@@ -264,6 +283,30 @@ function ingest(raw) {
 	if (st.ever_o5)
 		for (let ev in detect(st.known, sample, sample.bip, th))
 			add_event(sample.t, ev);
+	// O2-O4 with light on the fiber: the OLT does not take this serial.
+	if (sample.state >= 2 && sample.state <= 4) {
+		if (st.stuck_t == null)
+			st.stuck_t = sample.t;
+		else if (sample.t - st.stuck_t >= STUCK_SECS && !st.stuck_told) {
+			st.stuck_told = true;
+			add_event(sample.t, { type: 'sn_stuck', severity: 'crit',
+				msg: 'Stuck before O5 with light on the fiber: the OLT may have dropped this serial' });
+		}
+	} else if (sample.state != null) {
+		st.stuck_t = null;
+		st.stuck_told = false;
+	}
+	let sip = sip_failed(raw.voip);
+	if (sip == null) {
+		st.sip_t = null;
+		st.sip_told = false;
+	} else if (st.sip_t == null) {
+		st.sip_t = sample.t;
+	} else if (sample.t - st.sip_t >= SIP_SECS && !st.sip_told) {
+		st.sip_told = true;
+		add_event(sample.t, { type: 'sip_fail', severity: 'warn', n: sip,
+			msg: `SIP registration keeps failing (${sip}): the account may have changed` });
+	}
 	if (sample.state != null)
 		st.known = sample;
 	ring_push(st.m1, sample, M1_CAP);
@@ -311,6 +354,15 @@ function on_klog(line, t) {
 	} else if (index(line, 'GPON TO2 expired in O6') >= 0) {
 		add_event(wall(up, t), { type: 'to2', severity: 'warn',
 			msg: 'No Popup within 100 ms (TO2); GPON restarting' });
+	} else if (index(line, 'pppd') >= 0) {
+		if (index(line, 'authentication failed') >= 0)
+			wan_failed(t, 'wan_auth', 'crit',
+				'The ISP rejected the PPPoE login: the credentials may have changed');
+		else if (index(line, 'Timeout waiting for PADO') >= 0)
+			wan_failed(t, 'wan_no_pado', 'warn',
+				'No PPPoE server answered: the VLAN or the service may have changed');
+		else if (index(line, 'local  IP address') >= 0)
+			st.wan_fail = {};
 	}
 }
 
@@ -600,8 +652,14 @@ function collect(bus) {
 	} catch (e) {
 		status = null;
 	}
+	let voip = null;
+	try {
+		voip = bus.call('xr500v.voip', 'status', {});
+	} catch (e) {
+		voip = null;
+	}
 	return {
-		t: time(), up: uptime(), status,
+		t: time(), up: uptime(), status, voip,
 		bip: fs.readfile(XMAC + '/gpon_bip'),
 		counters: fs.readfile(XMAC + '/gpon_counters'),
 		gem_delin: fs.readfile(XMAC + '/gpon_gem_delin'),

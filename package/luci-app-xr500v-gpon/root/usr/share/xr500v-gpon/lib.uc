@@ -126,6 +126,18 @@ export function parse_counters(text) {
 	return length(r) ? r : null;
 };
 
+// The code of a failed SIP registration (0 if it has none), or null. With the
+// WAN down every registration fails, and the WAN is what is wrong then.
+export function sip_failed(voip) {
+	if (!voip?.wan_up)
+		return null;
+	for (let line in voip.lines || [])
+		for (let reg in line.registrations || [])
+			if (reg.state == 'failed')
+				return reg.code || 0;
+	return null;
+};
+
 export function normalize_status(st) {
 	let s = {
 		state: null, onu_id: null, olt_vendor: null, olt_version: null,

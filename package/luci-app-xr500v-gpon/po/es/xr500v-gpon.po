@@ -722,3 +722,18 @@ msgstr "Segundos con anomalías de FEC"
 
 msgid "Uncorrectable GEM headers"
 msgstr "Cabeceras GEM sin corregir"
+
+msgid "No PPPoE server answered: the VLAN or the service may have changed"
+msgstr "Ningún servidor PPPoE responde: pudo cambiar la VLAN o el servicio"
+
+msgid "SIP registration keeps failing (%d): the account may have changed"
+msgstr "El registro SIP sigue fallando (%d): pudo cambiar la cuenta"
+
+msgid "SIP registration keeps failing: the account may have changed"
+msgstr "El registro SIP sigue fallando: pudo cambiar la cuenta"
+
+msgid "Stuck before O5 with light on the fiber: the OLT may have dropped this serial"
+msgstr "Trabado antes de O5 con luz en la fibra: la OLT pudo dar de baja este número de serie"
+
+msgid "The ISP rejected the PPPoE login: the credentials may have changed"
+msgstr "La operadora rechazó el usuario PPPoE: pudieron cambiar las credenciales"
