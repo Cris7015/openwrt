@@ -1,0 +1,575 @@
+From 51a4c4f11dbd08042f28e02d6fddc6484e766018 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Fri, 6 Nov 2026 17:34:58 -0300
+Subject: [PATCH 2/2] net: xpon: omci: serve real FEC counters in ME 312
+
+The OLT creates a FEC PM history data ME and reads it with every PM
+collection, but it had no counters behind it and read as zeros. Build its
+15-min intervals on the same clock as ME 341, from the PHY FEC totals of
+gpon_counters, through a new get_fec_counters op.
+
+The totals are 32 bits wide and the agent samples them every minute, so an
+unsigned difference survives a wrap; a generation bumped when the PHY
+clears them marks a restart from zero. There is one PON line, so all
+instances share the running counts.
+
+Give the ME real attribute offsets: the closed interval lives in the
+object, as in ME 341. Get on any other PM ME is unchanged, and so is the
+MIB upload, which only carries the threshold data pointer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../net/ethernet/airoha/airoha_gpon_omci.c    |  10 +
+ .../net/ethernet/airoha/airoha_gpon_omci.h    |   2 +
+ drivers/net/ethernet/airoha/airoha_xpon.c     |  22 +++
+ drivers/phy/airoha/phy-airoha-xpon.c          |   4 +
+ include/linux/phy/phy-airoha-xpon.h           |   1 +
+ include/net/xpon/omci.h                       |  25 +++
+ net/xpon/omci/agent.c                         | 176 ++++++++++++++++--
+ net/xpon/omci/internal.h                      |  26 +++
+ net/xpon/omci/me.c                            |  12 +-
+ 9 files changed, 259 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_gpon_omci.c b/drivers/net/ethernet/airoha/airoha_gpon_omci.c
+index fd5d5ef..5c5d796 100644
+--- a/drivers/net/ethernet/airoha/airoha_gpon_omci.c
++++ b/drivers/net/ethernet/airoha/airoha_gpon_omci.c
+@@ -122,6 +122,15 @@ airoha_gpon_omci_get_gem_counters(struct omci_device *odev,
+ 						    count);
+ }
+ 
++static int
++airoha_gpon_omci_get_fec_counters(struct omci_device *odev,
++				  struct omci_fec_counters *counters)
++{
++	struct airoha_gpon_omci *omci = omci_device_priv(odev);
++
++	return airoha_gpon_omci_hw_get_fec_counters(omci->hw_priv, counters);
++}
++
+ static int
+ airoha_gpon_omci_set_olt_profile(struct omci_device *odev,
+ 				 const struct omci_olt_profile_state *state)
+@@ -160,6 +169,7 @@ static const struct omci_device_ops airoha_gpon_omci_ops = {
+ 	.delete_service = airoha_gpon_omci_delete_service,
+ 	.get_telemetry = airoha_gpon_omci_get_telemetry,
+ 	.get_gem_counters = airoha_gpon_omci_get_gem_counters,
++	.get_fec_counters = airoha_gpon_omci_get_fec_counters,
+ 	.set_olt_profile = airoha_gpon_omci_set_olt_profile,
+ 	.set_operational = airoha_gpon_omci_set_operational,
+ 	.config_changed = airoha_gpon_omci_config_changed,
+diff --git a/drivers/net/ethernet/airoha/airoha_gpon_omci.h b/drivers/net/ethernet/airoha/airoha_gpon_omci.h
+index e9d3395..6843ed3 100644
+--- a/drivers/net/ethernet/airoha/airoha_gpon_omci.h
++++ b/drivers/net/ethernet/airoha/airoha_gpon_omci.h
+@@ -58,6 +58,8 @@ int airoha_gpon_omci_hw_get_telemetry(void *hw_priv,
+ int airoha_gpon_omci_hw_get_gem_counters(void *hw_priv,
+ 					 struct omci_gem_counters *counters,
+ 					 unsigned int count);
++int airoha_gpon_omci_hw_get_fec_counters(void *hw_priv,
++					 struct omci_fec_counters *counters);
+ int airoha_gpon_omci_hw_set_olt_profile(void *hw_priv,
+ 					const struct omci_olt_profile_state *state);
+ void airoha_gpon_omci_hw_set_operational(void *hw_priv, bool operational);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 55cd1d6..1579a82 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2941,6 +2941,28 @@ int airoha_gpon_omci_hw_get_telemetry(void *hw_priv,
+ 	return 0;
+ }
+ 
++int airoha_gpon_omci_hw_get_fec_counters(void *hw_priv,
++					 struct omci_fec_counters *counters)
++{
++	struct airoha_xpon_phy_gpon_rx_counters c;
++	struct xpon_priv *priv = hw_priv;
++	int ret;
++
++	ret = airoha_xpon_phy_get_gpon_rx_counters(priv->phy, &c);
++	if (ret)
++		return ret;
++
++	*counters = (struct omci_fec_counters) {
++		.generation = c.generation,
++		.corrected_bytes = c.fec_corrected_bytes,
++		.corrected_codewords = c.fec_corrected_codewords,
++		.uncorrectable_codewords = c.fec_uncorrectable_codewords,
++		.total_codewords = c.fec_codewords,
++		.seconds = c.fec_seconds,
++	};
++	return 0;
++}
++
+ /* Forward declaration needed by gpon_disable */
+ static void gpon_disable(struct xpon_priv *priv);
+ 
+diff --git a/drivers/phy/airoha/phy-airoha-xpon.c b/drivers/phy/airoha/phy-airoha-xpon.c
+index d4dd30b..8cf106b 100644
+--- a/drivers/phy/airoha/phy-airoha-xpon.c
++++ b/drivers/phy/airoha/phy-airoha-xpon.c
+@@ -193,6 +193,8 @@ struct airoha_xpon_phy {
+ 	bool ready_reported;
+ 	/* Serializes the RX counter command register (latch/clear). */
+ 	spinlock_t counter_lock;
++	/* Bumped when the RX counters are cleared. */
++	u32 counter_generation;
+ 	u32 cached_rx_status;
+ 	unsigned long cached_rx_jiffies;
+ 	bool cached_rx_valid;
+@@ -425,6 +427,7 @@ int airoha_xpon_phy_get_gpon_rx_counters(
+ 		return -EOPNOTSUPP;
+ 
+ 	spin_lock_irqsave(&priv->counter_lock, flags);
++	c->generation = priv->counter_generation;
+ 	airoha_xpon_phy_write(priv, XPON_RX_COUNTER_CTRL, XPON_RX_FEC_LATCH);
+ 	c->fec_corrected_bytes =
+ 		airoha_xpon_phy_read_latched(priv, XPON_RX_FEC_CORRECTED_BYTES);
+@@ -936,6 +939,7 @@ econet_xpon_phy_counter_clear(struct airoha_xpon_phy *priv, u32 mask)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&priv->counter_lock, flags);
++	priv->counter_generation++;
+ 	/*
+ 	 * EcoNet 1G phy_counter_clear().  The RX counter clear register is a
+ 	 * command register: the vendor writes one command at a time rather than
+diff --git a/include/linux/phy/phy-airoha-xpon.h b/include/linux/phy/phy-airoha-xpon.h
+index edf7f65..3ceb627 100644
+--- a/include/linux/phy/phy-airoha-xpon.h
++++ b/include/linux/phy/phy-airoha-xpon.h
+@@ -39,6 +39,7 @@ int airoha_xpon_phy_get_gpon_fec_status(struct phy *phy,
+ 
+ /* Cumulative downstream counters, from the last PHY configure. */
+ struct airoha_xpon_phy_gpon_rx_counters {
++	u32 generation;		/* changes when the counters restart from 0 */
+ 	u32 fec_corrected_bytes;
+ 	u32 fec_corrected_codewords;
+ 	u32 fec_uncorrectable_codewords;
+diff --git a/include/net/xpon/omci.h b/include/net/xpon/omci.h
+index 3291fde..f3a275a 100644
+--- a/include/net/xpon/omci.h
++++ b/include/net/xpon/omci.h
+@@ -302,6 +302,27 @@ struct omci_gem_counters {
+ 	u64 tx_bytes;
+ };
+ 
++/**
++ * struct omci_fec_counters - downstream FEC totals of the PON line
++ * @generation: changes when the totals restart from zero
++ * @corrected_bytes: bytes corrected by FEC
++ * @corrected_codewords: code words corrected by FEC
++ * @uncorrectable_codewords: code words FEC could not correct
++ * @total_codewords: code words received
++ * @seconds: seconds with a FEC anomaly
++ *
++ * The totals are 32 bits wide. The OMCI agent builds the 15-min performance
++ * monitoring intervals from their differences.
++ */
++struct omci_fec_counters {
++	u32 generation;
++	u32 corrected_bytes;
++	u32 corrected_codewords;
++	u32 uncorrectable_codewords;
++	u32 total_codewords;
++	u32 seconds;
++};
++
+ struct omci_ani_topology {
+ 	u16 tcont_base;
+ 	u16 scheduler_base;
+@@ -328,6 +349,8 @@ struct omci_ani_topology {
+  * @get_telemetry: refresh PON FEC and optical telemetry
+  * @get_gem_counters: fill @count GEM port totals, matched by gem_port_id;
+  *	may sleep, called with the agent lock held, never from atomic context
++ * @get_fec_counters: fill the downstream FEC totals; same context as
++ *	@get_gem_counters
+  * @set_olt_profile: apply a resolved OLT interoperability profile
+  * @set_operational: report whether the in-kernel OMCI agent is operational
+  * @config_changed: report a normalized runtime OMCI configuration change
+@@ -353,6 +376,8 @@ struct omci_device_ops {
+ 	int (*get_gem_counters)(struct omci_device *odev,
+ 				struct omci_gem_counters *counters,
+ 				unsigned int count);
++	int (*get_fec_counters)(struct omci_device *odev,
++				struct omci_fec_counters *counters);
+ 	int (*set_olt_profile)(struct omci_device *odev,
+ 			       const struct omci_olt_profile_state *state);
+ 	void (*set_operational)(struct omci_device *odev, bool operational);
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index 0c2ff80..8e751b5 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -3323,6 +3323,8 @@ omci_get_or_create_locked(struct omci_agent *agent, u16 class_id,
+ #define OMCI_GEM_PM_COUNTERS_OFFSET	3
+ #define OMCI_GEM_PM_DATA_LEN		31
+ #define OMCI_GEM_PM_NO_PORT		U16_MAX
++/* ME 312: same header as ME 341, four 4-byte counters and FEC seconds. */
++#define OMCI_FEC_PM_DATA_LEN		21
+ 
+ /* Baseline Get response: 25 attribute bytes, then the two failure masks */
+ #define OMCI_BASELINE_CONTENT_LEN	32
+@@ -3339,6 +3341,30 @@ omci_get_or_create_locked(struct omci_agent *agent, u16 class_id,
+ 			  omci_mib_key(OMCI_CLASS_GEM_PORT_CTP_PM, U16_MAX)) \
+ 		if ((_object)->pending_delete) {} else
+ 
++#define omci_for_each_fec_pm(_agent, _index, _object) \
++	xa_for_each_range(&(_agent)->mib, _index, _object, \
++			  omci_mib_key(OMCI_CLASS_FEC_PM, 0), \
++			  omci_mib_key(OMCI_CLASS_FEC_PM, U16_MAX)) \
++		if ((_object)->pending_delete) {} else
++
++static int omci_fec_pm_counter(u16 mask)
++{
++	switch (mask) {
++	case BIT(13):
++		return OMCI_FEC_PM_CORRECTED_BYTES;
++	case BIT(12):
++		return OMCI_FEC_PM_CORRECTED_CODEWORDS;
++	case BIT(11):
++		return OMCI_FEC_PM_UNCORRECTABLE_CODEWORDS;
++	case BIT(10):
++		return OMCI_FEC_PM_TOTAL_CODEWORDS;
++	case BIT(9):
++		return OMCI_FEC_PM_SECONDS;
++	default:
++		return -1;
++	}
++}
++
+ static int omci_gem_pm_counter(u16 mask)
+ {
+ 	switch (mask) {
+@@ -3370,7 +3396,9 @@ omci_gem_pm_attr(const struct omci_me_desc *desc, u16 mask)
+ /* PM counters saturate at their maximum instead of wrapping (G.988 I.4). */
+ static void omci_gem_pm_put_counter(u8 *dest, u8 len, u64 value)
+ {
+-	if (len == sizeof(u32))
++	if (len == sizeof(u16))
++		put_unaligned_be16(min_t(u64, value, U16_MAX), dest);
++	else if (len == sizeof(u32))
+ 		put_unaligned_be32(min_t(u64, value, U32_MAX), dest);
+ 	else if (len == sizeof(u64))
+ 		put_unaligned_be64(value, dest);
+@@ -3525,6 +3553,81 @@ static void omci_gem_pm_close_locked(struct omci_agent *agent,
+ 		memcpy(pm->base, pm->last, sizeof(pm->base));
+ }
+ 
++/*
++ * Fold the hardware FEC totals into the running interval. They are 32 bits
++ * wide and sampled every minute, so an unsigned difference survives a wrap.
++ * A new generation means they restarted from zero.
++ */
++static void omci_fec_pm_sample_locked(struct omci_device *odev)
++{
++	struct omci_fec_pm *pm = &odev->agent.fec_pm;
++	u32 now[OMCI_FEC_PM_COUNTERS];
++	struct omci_fec_counters c;
++	unsigned int i;
++
++	lockdep_assert_held(&odev->agent.lock);
++	if (!odev->ops->get_fec_counters ||
++	    odev->ops->get_fec_counters(odev, &c))
++		return;
++
++	now[OMCI_FEC_PM_CORRECTED_BYTES] = c.corrected_bytes;
++	now[OMCI_FEC_PM_CORRECTED_CODEWORDS] = c.corrected_codewords;
++	now[OMCI_FEC_PM_UNCORRECTABLE_CODEWORDS] = c.uncorrectable_codewords;
++	now[OMCI_FEC_PM_TOTAL_CODEWORDS] = c.total_codewords;
++	now[OMCI_FEC_PM_SECONDS] = c.seconds;
++
++	for (i = 0; pm->sampled && i < OMCI_FEC_PM_COUNTERS; i++)
++		pm->count[i] += pm->generation == c.generation ?
++				now[i] - pm->last[i] : now[i];
++
++	memcpy(pm->last, now, sizeof(pm->last));
++	pm->generation = c.generation;
++	pm->sampled = true;
++}
++
++/* A PM history instance counts from its creation (G.988 I.4). */
++static void omci_fec_pm_start_locked(struct omci_device *odev, u16 entity_id)
++{
++	struct omci_agent *agent = &odev->agent;
++	struct omci_mib_object *object;
++
++	omci_fec_pm_sample_locked(odev);
++	memset(agent->fec_pm.count, 0, sizeof(agent->fec_pm.count));
++	object = omci_mib_lookup(agent, OMCI_CLASS_FEC_PM, entity_id);
++	if (!object)
++		return;
++	object->data[OMCI_GEM_PM_END_TIME_OFFSET] = agent->pm_interval;
++	if (object->data_len < OMCI_FEC_PM_DATA_LEN)
++		object->data_len = OMCI_FEC_PM_DATA_LEN;
++}
++
++/* The interval just closed: its counts become the history attributes. */
++static void omci_fec_pm_close_locked(struct omci_agent *agent)
++{
++	const struct omci_me_desc *desc;
++	struct omci_mib_object *object;
++	unsigned long index;
++	unsigned int i;
++
++	desc = omci_me_lookup(agent, OMCI_CLASS_FEC_PM);
++	omci_for_each_fec_pm(agent, index, object) {
++		for (i = 0; desc && i < desc->num_attrs; i++) {
++			const struct omci_attr_desc *attr = &desc->attrs[i];
++			int counter = omci_fec_pm_counter(attr->mask);
++
++			if (counter < 0)
++				continue;
++			omci_gem_pm_put_counter(object->data + attr->offset,
++						attr->len,
++						agent->fec_pm.count[counter]);
++		}
++		object->data[OMCI_GEM_PM_END_TIME_OFFSET] = agent->pm_interval;
++		if (object->data_len < OMCI_FEC_PM_DATA_LEN)
++			object->data_len = OMCI_FEC_PM_DATA_LEN;
++	}
++	memset(agent->fec_pm.count, 0, sizeof(agent->fec_pm.count));
++}
++
+ /* Close the current interval if its end has passed. */
+ static void omci_pm_tick_locked(struct omci_device *odev)
+ {
+@@ -3538,12 +3641,14 @@ static void omci_pm_tick_locked(struct omci_device *odev)
+ 		return;
+ 
+ 	omci_gem_pm_sample_locked(odev);
++	omci_fec_pm_sample_locked(odev);
+ 	agent->pm_interval++;
+ 	desc = omci_me_lookup(agent, OMCI_CLASS_GEM_PORT_CTP_PM);
+ 	omci_for_each_gem_pm(agent, index, object) {
+ 		if (desc && object->gem_pm.started)
+ 			omci_gem_pm_close_locked(agent, desc, object);
+ 	}
++	omci_fec_pm_close_locked(agent);
+ 
+ 	agent->pm_interval_end += OMCI_PM_INTERVAL;
+ 	/* More than a whole interval late: start the next one now. */
+@@ -3571,10 +3676,12 @@ static void omci_pm_work(struct work_struct *work)
+ 	unsigned long delay;
+ 
+ 	mutex_lock(&agent->lock);
+-	if (time_before(jiffies, agent->pm_interval_end))
++	if (time_before(jiffies, agent->pm_interval_end)) {
+ 		omci_gem_pm_sample_locked(odev);
+-	else
++		omci_fec_pm_sample_locked(odev);
++	} else {
+ 		omci_pm_tick_locked(odev);
++	}
+ 	delay = omci_pm_delay_locked(agent);
+ 	mutex_unlock(&agent->lock);
+ 
+@@ -3592,6 +3699,7 @@ static void omci_pm_synchronize_locked(struct omci_device *odev)
+ 	unsigned long index;
+ 
+ 	omci_gem_pm_sample_locked(odev);
++	omci_fec_pm_sample_locked(odev);
+ 	agent->pm_interval = 0;
+ 	agent->pm_interval_end = jiffies + OMCI_PM_INTERVAL;
+ 	agent->pm_synchronized = true;
+@@ -3608,23 +3716,31 @@ static void omci_pm_synchronize_locked(struct omci_device *odev)
+ 			memcpy(pm->base, pm->last, sizeof(pm->base));
+ 	}
+ 
++	omci_for_each_fec_pm(agent, index, object) {
++		object->data[OMCI_GEM_PM_END_TIME_OFFSET] = 0;
++		memset(object->data + OMCI_GEM_PM_COUNTERS_OFFSET, 0,
++		       OMCI_FEC_PM_DATA_LEN - OMCI_GEM_PM_COUNTERS_OFFSET);
++	}
++	memset(agent->fec_pm.count, 0, sizeof(agent->fec_pm.count));
++
+ 	mod_delayed_work(system_power_efficient_wq, &agent->pm_work,
+ 			 omci_pm_delay_locked(agent));
+ }
+ 
+ /*
+- * Get and Get current data on ME 341. Get returns the history attributes
++ * Get and Get current data on ME 341 and 312. Get returns the history attributes
+  * of the last completed interval, Get current data the running counts of
+  * the current one. Attributes that do not fit the response come back in
+  * the attribute execution mask with result 9, so the OLT can ask for them
+  * again; a baseline response has room for 25 attribute bytes.
+  */
+-static u8 omci_gem_pm_get_locked(struct omci_device *odev,
+-				 const struct omci_wire_request *request,
+-				 u8 action, u8 *content, size_t capacity,
+-				 size_t *content_len)
++static u8 omci_pm_get_locked(struct omci_device *odev,
++			     const struct omci_wire_request *request,
++			     u8 action, u8 *content, size_t capacity,
++			     size_t *content_len)
+ {
+ 	bool extended = request->device_id == OMCI_EXTENDED_DEV_ID;
++	bool fec = request->class_id == OMCI_CLASS_FEC_PM;
+ 	bool current_data = action == OMCI_MSG_TYPE_GET_CURRENT_DATA;
+ 	struct omci_agent *agent = &odev->agent;
+ 	const struct omci_me_desc *desc;
+@@ -3642,14 +3758,14 @@ static u8 omci_gem_pm_get_locked(struct omci_device *odev,
+ 	if (capacity < (extended ? OMCI_EXTENDED_GET_ATTR_OFFSET :
+ 				   OMCI_BASELINE_CONTENT_LEN))
+ 		return OMCI_RESULT_PARAMETER_ERROR;
+-	desc = omci_me_lookup(agent, OMCI_CLASS_GEM_PORT_CTP_PM);
++	desc = omci_me_lookup(agent, request->class_id);
+ 	if (!desc || !(desc->actions & (current_data ?
+ 					OMCI_ME_ACTION_GET_CURRENT_DATA :
+ 					OMCI_ME_ACTION_GET)))
+ 		return OMCI_RESULT_NOT_SUPPORTED;
+ 
+ 	mask = get_unaligned_be16(request->payload);
+-	object = omci_get_or_create_locked(agent, OMCI_CLASS_GEM_PORT_CTP_PM,
++	object = omci_get_or_create_locked(agent, request->class_id,
+ 					   request->entity_id,
+ 					   agent->permissive ||
+ 					   agent->fake_omci);
+@@ -3658,7 +3774,9 @@ static u8 omci_gem_pm_get_locked(struct omci_device *odev,
+ 
+ 	/* Do not serve a closed interval the work has not got to yet. */
+ 	omci_pm_tick_locked(odev);
+-	if (current_data || !object->gem_pm.started)
++	if (fec)
++		omci_fec_pm_sample_locked(odev);
++	else if (current_data || !object->gem_pm.started)
+ 		omci_gem_pm_sample_locked(odev);
+ 
+ 	if (extended) {
+@@ -3686,9 +3804,11 @@ static u8 omci_gem_pm_get_locked(struct omci_device *odev,
+ 			failed |= attr_mask;
+ 			continue;
+ 		}
+-		counter = omci_gem_pm_counter(attr_mask);
++		counter = fec ? omci_fec_pm_counter(attr_mask) :
++				omci_gem_pm_counter(attr_mask);
+ 		if (current_data && counter >= 0)
+ 			omci_gem_pm_put_counter(values + used, attr->len,
++				fec ? agent->fec_pm.count[counter] :
+ 				omci_gem_pm_current(&object->gem_pm, counter));
+ 		else
+ 			memcpy(values + used, object->data + attr->offset,
+@@ -3756,6 +3876,27 @@ ssize_t omci_agent_gem_pm_show(struct omci_device *odev, char *buf)
+ 				     omci_gem_pm_current(pm, OMCI_GEM_PM_RX_BYTES),
+ 				     omci_gem_pm_current(pm, OMCI_GEM_PM_TX_BYTES));
+ 	}
++	omci_for_each_fec_pm(agent, index, object) {
++		const struct omci_fec_pm *pm = &agent->fec_pm;
++		const u8 *data = object->data;
++
++		len += sysfs_emit_at(buf, len,
++				     "fec_me=%#06x end=%u threshold=%#06x corrected_bytes=%u corrected_codewords=%u uncorrectable_codewords=%u codewords=%u seconds=%u cur_corrected_bytes=%llu cur_corrected_codewords=%llu cur_uncorrectable_codewords=%llu cur_codewords=%llu cur_seconds=%llu\n",
++				     object->entity_id,
++				     data[OMCI_GEM_PM_END_TIME_OFFSET],
++				     get_unaligned_be16(data +
++					OMCI_GEM_PM_THRESHOLD_OFFSET),
++				     get_unaligned_be32(data + 3),
++				     get_unaligned_be32(data + 7),
++				     get_unaligned_be32(data + 11),
++				     get_unaligned_be32(data + 15),
++				     get_unaligned_be16(data + 19),
++				     pm->count[OMCI_FEC_PM_CORRECTED_BYTES],
++				     pm->count[OMCI_FEC_PM_CORRECTED_CODEWORDS],
++				     pm->count[OMCI_FEC_PM_UNCORRECTABLE_CODEWORDS],
++				     pm->count[OMCI_FEC_PM_TOTAL_CODEWORDS],
++				     pm->count[OMCI_FEC_PM_SECONDS]);
++	}
+ 	mutex_unlock(&agent->lock);
+ 
+ 	return len;
+@@ -3832,6 +3973,8 @@ static u8 omci_agent_create_locked(struct omci_device *odev,
+ 	/* A PM history instance counts from its creation (G.988 I.4). */
+ 	if (class_id == OMCI_CLASS_GEM_PORT_CTP_PM)
+ 		omci_gem_pm_sample_locked(odev);
++	else if (class_id == OMCI_CLASS_FEC_PM)
++		omci_fec_pm_start_locked(odev, entity_id);
+ 	omci_agent_increment_mib_sync_locked(agent);
+ 	goto out;
+ 
+@@ -4801,10 +4944,11 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 		break;
+ 	case OMCI_MSG_TYPE_GET:
+ 	case OMCI_MSG_TYPE_GET_CURRENT_DATA:
+-		if (class_id == OMCI_CLASS_GEM_PORT_CTP_PM)
+-			result = omci_gem_pm_get_locked(odev, request, action,
+-							content, capacity,
+-							content_len);
++		if (class_id == OMCI_CLASS_GEM_PORT_CTP_PM ||
++		    class_id == OMCI_CLASS_FEC_PM)
++			result = omci_pm_get_locked(odev, request, action,
++						    content, capacity,
++						    content_len);
+ 		else
+ 			result = omci_agent_get_locked(odev, class_id, entity_id,
+ 						      request->device_id ==
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index f580296..f236638 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -41,6 +41,31 @@ enum omci_gem_pm_counter {
+ 	OMCI_GEM_PM_COUNTERS
+ };
+ 
++enum omci_fec_pm_counter {
++	OMCI_FEC_PM_CORRECTED_BYTES,
++	OMCI_FEC_PM_CORRECTED_CODEWORDS,
++	OMCI_FEC_PM_UNCORRECTABLE_CODEWORDS,
++	OMCI_FEC_PM_TOTAL_CODEWORDS,
++	OMCI_FEC_PM_SECONDS,
++	OMCI_FEC_PM_COUNTERS
++};
++
++/**
++ * struct omci_fec_pm - current interval of the PON FEC counters (ME 312)
++ * @count: counted so far in this interval
++ * @last: hardware totals at the last sample
++ * @generation: generation of @last
++ * @sampled: @last and @generation are valid
++ *
++ * There is one PON line, so all ME 312 instances share these counts.
++ */
++struct omci_fec_pm {
++	u64 count[OMCI_FEC_PM_COUNTERS];
++	u32 last[OMCI_FEC_PM_COUNTERS];
++	u32 generation;
++	bool sampled;
++};
++
+ /**
+  * struct omci_gem_pm - current interval of one ME 341 instance
+  * @count: counted in this interval before the MAC totals last restarted
+@@ -154,6 +179,7 @@ struct omci_agent {
+ 	 * start and Synchronize time restarts it at interval 0.
+ 	 */
+ 	struct delayed_work pm_work;
++	struct omci_fec_pm fec_pm;
+ 	unsigned long pm_interval_end;
+ 	unsigned long pm_sample_jiffies;
+ 	u32 pm_syncs;
+diff --git a/net/xpon/omci/me.c b/net/xpon/omci/me.c
+index 9bdc237..da1f40c 100644
+--- a/net/xpon/omci/me.c
++++ b/net/xpon/omci/me.c
+@@ -727,11 +727,17 @@ static const struct omci_attr_desc omci_mac_bridge_port_pm_attrs[] = {
+ 	OMCI_PM_COUNTER(10, 4), OMCI_PM_COUNTER(9, 4),
+ };
+ 
+-/* FEC PM history data: 4 counters, then FEC seconds (2 bytes) */
++/*
++ * FEC PM history data: 4 counters, then FEC seconds (2 bytes). Real offsets,
++ * unlike the other PM MEs: the agent stores the closed interval here.
++ */
+ static const struct omci_attr_desc omci_fec_pm_attrs[] = {
+ 	OMCI_PM_HEADER,
+-	OMCI_PM_COUNTER(13, 4), OMCI_PM_COUNTER(12, 4), OMCI_PM_COUNTER(11, 4),
+-	OMCI_PM_COUNTER(10, 4), OMCI_PM_COUNTER(9, 2),
++	OMCI_ATTR(13, 3, 4, OMCI_R),		/* Corrected bytes */
++	OMCI_ATTR(12, 7, 4, OMCI_R),		/* Corrected code words */
++	OMCI_ATTR(11, 11, 4, OMCI_R),		/* Uncorrectable code words */
++	OMCI_ATTR(10, 15, 4, OMCI_R),		/* Total code words */
++	OMCI_ATTR(9, 19, 2, OMCI_R),		/* FEC seconds */
+ };
+ 
+ /*
+-- 
+2.47.3
+

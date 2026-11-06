@@ -1,0 +1,119 @@
+From 2b74c8acfe545a15f2dda9a562a98965d68a88bb Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Fri, 6 Nov 2026 17:32:10 -0300
+Subject: [PATCH 1/2] net: airoha: xpon: restore the OMCI GEM ports when the
+ OMCC comes up
+
+A Huawei OLT does not always provision OMCI again after a Deactivate:
+the MIB data sync still matches, so it sends no MIB reset and no GEM port
+CTP. The service survived those restarts only because nothing removed the
+old entries from the GEM table, which is why gpon_stop_clear_gems and
+gpon_stop_mac_reset default to off.
+
+omci_gems already records the ports OMCI created across sessions, but they
+came back only with an Encrypted_Port-ID, which a seed or multicast port
+may never get. Put them all back before the channel comes up, and so
+before the services are reconciled on them.
+
+T-CONTs need nothing similar: reconcile binds the service ones by
+Alloc-ID, and the OLT assigns the rest again through Assign_Alloc-ID as
+G.984.3 requires. With the default parameters no port is missing and this
+does nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 50 +++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 8fa2b13..55cd1d6 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2341,6 +2341,36 @@ static void gpon_cb_set_ber_interval(void *hw_priv, u32 interval_ms)
+ 		timer_delete(&priv->ber_timer);
+ }
+ 
++/*
++ * Put back the GEM ports OMCI created and has not deleted but which are
++ * missing from the GEM table. The OLT may skip OMCI provisioning after a
++ * reactivation (no MIB reset, the MIB data sync still matches), so a table
++ * lost between sessions would otherwise stay empty. Nothing is missing unless
++ * gpon_stop_clear_gems or gpon_stop_mac_reset wiped it, or the MAC reset at
++ * start did.
++ */
++static void gpon_restore_omci_gems(struct xpon_priv *priv)
++{
++	unsigned int restored = 0, failed = 0;
++	unsigned long gem;
++
++	mutex_lock(&priv->gem_mib_lock);
++	for_each_set_bit(gem, priv->omci_gems, GPON_MAX_GEM_ID) {
++		if (test_bit(gem, priv->hw_gems))
++			continue;
++		if (__gpon_set_gem_port_hw_locked(priv, gem, true, false, true))
++			failed++;
++		else
++			restored++;
++	}
++	mutex_unlock(&priv->gem_mib_lock);
++
++	if (restored || failed)
++		dev_info(priv->dev,
++			 "GPON OMCC up: restored %u OMCI GEM ports%s\n",
++			 restored, failed ? " (some did not confirm)" : "");
++}
++
+ static int gpon_cb_set_omci_gem(void *hw_priv, u16 gem_port_id, bool valid)
+ {
+ 	struct xpon_priv *priv = hw_priv;
+@@ -2400,6 +2430,8 @@ static int gpon_cb_set_omci_gem(void *hw_priv, u16 gem_port_id, bool valid)
+ 		return -EIO;
+ 	}
+ 
++	/* Before the channel comes up: that reconciles the services on them. */
++	gpon_restore_omci_gems(priv);
+ 	airoha_gpon_omci_set_channel(&priv->omci, gem_port_id, true);
+ 	dev_dbg(priv->dev,
+ 		"GPON OMCC datapath enabled: onu-id=%u tcont=0 gem=%u reg=%#08x\n",
+@@ -2450,11 +2482,12 @@ static int gpon_cb_set_gem_encryption(void *hw_priv, u16 port_id,
+ 	configured = test_bit(port_id, priv->hw_gems);
+ 	/*
+ 	 * A port OMCI created and has not deleted, but which is missing from
+-	 * the GEM table, is put back as before: when the OLT skips OMCI
+-	 * provisioning after a reactivation this message is what restores
+-	 * it. That only happens where the GEM table is lost between sessions
+-	 * (EN7523 MAC reset at start, gpon_stop_clear_gems, gpon_stop_mac_reset);
+-	 * on the EN751221 with the defaults the port is still "configured".
++	 * the GEM table, is put back as before. gpon_restore_omci_gems() does
++	 * that when the OMCC comes up; this covers an Encrypted_Port-ID that
++	 * gets here first. It only happens where the GEM table is lost between
++	 * sessions (EN7523 MAC reset at start, gpon_stop_clear_gems,
++	 * gpon_stop_mac_reset); on the EN751221 with the defaults the port is
++	 * still "configured".
+ 	 */
+ 	restore = !configured && test_bit(port_id, priv->omci_gems);
+ 	if (configured)
+@@ -3607,9 +3640,8 @@ err_disable_frontend:
+  * driver made valid. The GEM ports come from OMCI, and the Huawei OLT does
+  * not always provision OMCI again after a Deactivate_ONU-ID (the field log
+  * of 23-oct shows two restarts back to "service=1" without a single OMCI
+- * GEM port write), while the OMCI agent does not replay its GEM port CTPs
+- * to the hardware when the OMCC comes back. Clearing them would leave the
+- * service ports invalid. Only enable it with an agent that replays them.
++ * GEM port write), so gpon_restore_omci_gems() puts the ports OMCI created
++ * back when the OMCC comes up.
+  *
+  * gpon_stop_mac_reset (default off): pulse the MAC reset after the MBI
+  * stop, like the stock driver. It wipes the GEM table as well, so it has
+@@ -3623,7 +3655,7 @@ MODULE_PARM_DESC(gpon_stop_clear_tconts,
+ static bool gpon_stop_clear_gems;
+ module_param(gpon_stop_clear_gems, bool, 0644);
+ MODULE_PARM_DESC(gpon_stop_clear_gems,
+-		 "Invalidate the hardware GEM table when a session stops; needs OMCI to replay its GEM ports (default: off)");
++		 "Invalidate the hardware GEM table when a session stops; the OMCI ports are restored when the OMCC comes up (default: off)");
+ 
+ static bool gpon_stop_mac_reset;
+ module_param(gpon_stop_mac_reset, bool, 0644);
+-- 
+2.47.3
+
