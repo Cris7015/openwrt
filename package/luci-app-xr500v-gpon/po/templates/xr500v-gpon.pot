@@ -702,3 +702,24 @@ msgstr ""
 #: htdocs/luci-static/resources/xr500v-gpon/analysis.js
 msgid "No Popup within 100 ms (TO2); the GPON link restarted"
 msgstr ""
+
+msgid "FEC code words received"
+msgstr ""
+
+msgid "FEC corrected code words"
+msgstr ""
+
+msgid "FEC uncorrectable code words"
+msgstr ""
+
+msgid "Frame CRC errors"
+msgstr ""
+
+msgid "Loss of frame events"
+msgstr ""
+
+msgid "Seconds with FEC anomalies"
+msgstr ""
+
+msgid "Uncorrectable GEM headers"
+msgstr ""

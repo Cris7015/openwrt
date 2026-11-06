@@ -18,7 +18,7 @@ import * as uloop from 'uloop';
 import * as ubus from 'ubus';
 import { cursor } from 'uci';
 import {
-	normalize_status, parse_bip, thresholds, evaluate, detect, aggregate, ring_push
+	normalize_status, parse_bip, parse_counters, thresholds, evaluate, detect, aggregate, ring_push
 } from 'lib';
 import { eye_scan, eye_metrics } from 'eye';
 
@@ -244,6 +244,7 @@ function ingest(raw) {
 		bip: 0
 	};
 	st.gem = parse_gem_mib(raw.gem_mib, raw.t, st.gem);
+	st.line = parse_counters(raw.counters);
 	// A counter that went backwards was reset (driver reload): count from 0.
 	if (sample.bip_total != null && prev?.bip_total != null)
 		sample.bip = sample.bip_total >= prev.bip_total
@@ -341,7 +342,13 @@ function summary(now) {
 			bias_ua: l?.bias_ua, volt_uv: l?.volt_uv, alarms: l?.alarms },
 		counters: { bip_total: l?.bip_total, bip_session: l?.bip_session,
 			gem_delin: l?.gem_delin, sfifo_resync: l?.sfifo_resync,
-			sfifo_glitch: l?.sfifo_glitch, deactivate: st.deact },
+			sfifo_glitch: l?.sfifo_glitch, deactivate: st.deact,
+			fec_corrected: st.line?.fec_corrected_codewords,
+			fec_uncorrectable: st.line?.fec_uncorrectable_codewords,
+			fec_total: st.line?.fec_codewords,
+			fec_seconds: st.line?.fec_seconds, lof: st.line?.lof,
+			hec_uncorrectable: st.line?.hec_uncorrectable,
+			rx_crc: st.line?.rx_crc_errors },
 		gem: st.gem ? { enabled: st.gem.enabled, ready: st.gem.ready,
 			type: st.gem.type, ports: st.gem.ports } : null,
 		serial_hint: st.serial ? substr(st.serial, 0, 4) + '…' : null
@@ -596,6 +603,7 @@ function collect(bus) {
 	return {
 		t: time(), up: uptime(), status,
 		bip: fs.readfile(XMAC + '/gpon_bip'),
+		counters: fs.readfile(XMAC + '/gpon_counters'),
 		gem_delin: fs.readfile(XMAC + '/gpon_gem_delin'),
 		gem_mib: fs.readfile(XMAC + '/gpon_gem_mib'),
 		sfifo_resync: fs.readfile(DBG + '/gpon_sfifo_resync_count'),

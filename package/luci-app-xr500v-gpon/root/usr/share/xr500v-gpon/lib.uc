@@ -113,6 +113,19 @@ export function parse_bip(text) {
 	return ('total' in r && 'session' in r) ? r : null;
 };
 
+// gpon_counters: one "name=value" per line; null without the file.
+export function parse_counters(text) {
+	if (type(text) != 'string')
+		return null;
+	let r = {};
+	for (let kv in split(trim(text), /[ \t\n]+/)) {
+		let m = match(kv, /^([a-z0-9_]+)=([0-9]+)$/);
+		if (m)
+			r[m[1]] = int(m[2]);
+	}
+	return length(r) ? r : null;
+};
+
 export function normalize_status(st) {
 	let s = {
 		state: null, onu_id: null, olt_vendor: null, olt_version: null,

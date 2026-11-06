@@ -701,3 +701,24 @@ msgstr "La OLT ajustó el retardo de ecualización"
 #: htdocs/luci-static/resources/xr500v-gpon/analysis.js
 msgid "No Popup within 100 ms (TO2); the GPON link restarted"
 msgstr "No llegó un Popup en 100 ms (TO2); el enlace GPON se reinició"
+
+msgid "FEC code words received"
+msgstr "Palabras de código FEC recibidas"
+
+msgid "FEC corrected code words"
+msgstr "Palabras de código corregidas por FEC"
+
+msgid "FEC uncorrectable code words"
+msgstr "Palabras de código FEC sin corregir"
+
+msgid "Frame CRC errors"
+msgstr "Errores de CRC de trama"
+
+msgid "Loss of frame events"
+msgstr "Pérdidas de trama"
+
+msgid "Seconds with FEC anomalies"
+msgstr "Segundos con anomalías de FEC"
+
+msgid "Uncorrectable GEM headers"
+msgstr "Cabeceras GEM sin corregir"

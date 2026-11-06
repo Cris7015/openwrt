@@ -3,7 +3,7 @@
 
 import { ok, eq, near, done } from 'assert';
 import {
-	nw_to_dbm, dbm_to_nw, parse_bip, normalize_status, thresholds,
+	nw_to_dbm, dbm_to_nw, parse_bip, parse_counters, normalize_status, thresholds,
 	evaluate, detect, aggregate, ring_push
 } from 'lib';
 
@@ -30,6 +30,13 @@ near('dbm_to_nw_warn', dbm_to_nw(-25), 3162, 2);
 let bip = parse_bip('active=1 session=1 total=0 session_total=0 last=0 pending_rei=0');
 eq('parse_bip_session', bip?.session, 1);
 eq('parse_bip_total', bip?.total, 0);
+
+let line = parse_counters('bip_errors=0\nhec_corrected_1bit=3\nrx_frames=8589934592\nlof=1\n');
+eq('parse_counters_digit_in_name', line?.hec_corrected_1bit, 3);
+eq('parse_counters_64bit', line?.rx_frames, 8589934592);
+eq('parse_counters_lof', line?.lof, 1);
+eq('parse_counters_no_file', parse_counters(null), null);
+eq('parse_counters_empty', parse_counters(''), null);
 eq('parse_bip_garbage', parse_bip('x'), null);
 
 // Thresholds defaults.
