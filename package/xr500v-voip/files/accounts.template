@@ -1,1 +1,1 @@
-<sip:xr500v@@LANIP@>;regint=0;answermode=manual;audio_codecs=PCMU,PCMA
+<sip:xr500v@@LANIP@>;regint=0;answermode=manual;call_transfer=no;audio_codecs=PCMU,PCMA

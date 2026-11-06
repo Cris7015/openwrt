@@ -63,7 +63,7 @@ export function account_validate(a, line) {
 export function account_render(a, line, ip) {
 	let uri = a.account_mode == 'local' ? sprintf('sip:phone%d@%s:%d', line, ip, 5058 + line * 2) :
 		'sip:' + a.username + '@' + a.domain + ';transport=' + a.transport;
-	let result = '<' + uri + '>;answermode=manual;audio_codecs=PCMU,PCMA;regint=' +
+	let result = '<' + uri + '>;answermode=manual;call_transfer=no;audio_codecs=PCMU,PCMA;regint=' +
 		(a.account_mode == 'local' || a.register == '0' ? '0' : a.reg_interval);
 	if (a.account_mode == 'provider') {
 		if (a.auth_user) result += ';auth_user=' + a.auth_user;

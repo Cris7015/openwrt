@@ -1,0 +1,29 @@
+call: answer 481 to a Replaces without a matching call
+
+An INVITE whose Replaces header matches no call reached
+call_stream_stop() and call_event_handler() with a NULL call, and
+baresip crashed. procd stops respawning it after 5 crashes an hour, so
+anyone who can reach the SIP port could silence the phone.
+
+--- a/src/call.c
++++ b/src/call.c
+@@ -2222,6 +2222,19 @@
+ 			return err;
+ 
+ 		rcall = call_find_id(ua_calls(call->ua), rid);
++		if (!rcall) {
++			mem_deref(rid);
++
++			/* RFC 3891 3: no match is 481, not a crash */
++			sip_treply(NULL, uag_sip(), msg,
++				   481, "Call/Transaction Does Not Exist");
++
++			call_event_handler(call, CALL_EVENT_CLOSED,
++					   "Replaces: no such call");
++
++			return 0;
++		}
++
+ 		call_stream_stop(rcall);
+ 		call_event_handler(rcall, CALL_EVENT_CLOSED,
+ 			"%s replaced", rid);

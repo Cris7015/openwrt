@@ -1,1 +1,1 @@
-<sip:phone2@@LANIP@:5062>;regint=0;answermode=manual;audio_codecs=PCMU,PCMA
+<sip:phone2@@LANIP@:5062>;regint=0;answermode=manual;call_transfer=no;audio_codecs=PCMU,PCMA
