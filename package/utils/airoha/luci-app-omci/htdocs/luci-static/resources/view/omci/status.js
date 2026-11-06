@@ -37,7 +37,7 @@ function temperature(value) {
 function row(label, value, id) {
 	return E('tr', {}, [
 		E('td', { 'class': 'td left', 'width': '42%' }, label),
-		E('td', { 'class': 'td left', 'id': 'omci-status-' + id }, text(value))
+		E('td', { 'class': 'td left', 'id': 'omci-status-' + id }, [ text(value) ])
 	]);
 }
 
@@ -124,7 +124,7 @@ function update(status) {
 	Object.keys(v).forEach(function(key) {
 		var node = document.getElementById('omci-status-' + key);
 		if (node)
-			dom.content(node, v[key]);
+			dom.content(node, [ v[key] ]);
 	});
 
 	var summaryNode = document.getElementById('omci-summary-root');
