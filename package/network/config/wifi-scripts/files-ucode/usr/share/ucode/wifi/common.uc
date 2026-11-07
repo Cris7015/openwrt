@@ -160,9 +160,39 @@ export function comment(comment) {
 	append_raw('\n# ' + comment);
 };
 
+/*
+ * The generated configurations and station key files hold the Wi-Fi keys.
+ * hostapd and wpa_supplicant run in the network group: open the file for
+ * writing readable by root and that group only, before any key is in it.
+ * Without that group the daemons run as root and the mode stays 0644.
+ */
+export function open_private(filename) {
+	let file = fs.open(filename, 'w', 0o600);
+
+	if (!file)
+		return null;
+	if (fs.chown(filename, null, 'network'))
+		fs.chmod(filename, 0o640);
+	else
+		fs.chmod(filename, 0o644);
+
+	return file;
+};
+
+function write_private(filename, data) {
+	let file = open_private(filename);
+
+	if (!file) {
+		log('Failed to write ' + filename);
+		return;
+	}
+	file.write(data);
+	file.close();
+}
+
 export function dump_config(file) {
 	if (file)
-		fs.writefile(file, config_data);
+		write_private(file, config_data);
 
 	return config_data;
 };
@@ -173,7 +203,7 @@ export function dump_network(file) {
 	config_data += '}\n';
 
 	if (file)
-		fs.writefile(file, config_data);
+		write_private(file, config_data);
 
 	return config_data;
 };

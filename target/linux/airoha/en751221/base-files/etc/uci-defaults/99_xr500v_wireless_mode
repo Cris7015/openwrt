@@ -1,0 +1,8 @@
+#!/bin/sh
+# /etc/config/wireless holds the Wi-Fi keys, and "wifi config" creates it
+# 0644. Only root reads it (netifd, rpcd, uci, the wifi scripts), and
+# "uci commit" keeps the mode of the file it replaces.
+
+[ -f /etc/config/wireless ] && chmod 600 /etc/config/wireless
+
+exit 0
