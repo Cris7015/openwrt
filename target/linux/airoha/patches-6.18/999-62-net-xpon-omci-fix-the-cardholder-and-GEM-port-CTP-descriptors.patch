@@ -1,0 +1,63 @@
+From 37c770263e13b711689a665c03e576db583cad11 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Fri, 6 Nov 2026 21:29:32 -0300
+Subject: [PATCH] net: xpon: omci: fix the cardholder and GEM port CTP
+ descriptors
+
+G.988 9.1.5: the actual equipment ID is read-only and the protection
+profile pointer is one byte. G.988 9.2.3: the encryption key ring of the
+GEM port network CTP is one byte and set by create.
+
+The cardholder attributes 7 to 9 stay out: they are optional, and adding
+them would move the Attribute ME IDs of every entry after it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/me.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/net/xpon/omci/me.c b/net/xpon/omci/me.c
+index da1f40c..1ad6d62 100644
+--- a/net/xpon/omci/me.c
++++ b/net/xpon/omci/me.c
+@@ -349,8 +349,8 @@ static const struct omci_attr_desc omci_cardholder_attrs[] = {
+ 	OMCI_ATTR(14, 1, 1, OMCI_RW),
+ 	OMCI_ATTR(13, 2, 1, OMCI_RW),
+ 	OMCI_ATTR(12, 3, 20, OMCI_RW),
+-	OMCI_ATTR(11, 23, 20, OMCI_RW),
+-	OMCI_ATTR(10, 43, 2, OMCI_R),
++	OMCI_ATTR(11, 23, 20, OMCI_R),		/* Actual equipment ID */
++	OMCI_ATTR(10, 43, 1, OMCI_R),		/* Protection profile pointer */
+ };
+ 
+ static const struct omci_attr_desc omci_circuit_pack_attrs[] = {
+@@ -471,7 +471,7 @@ static const struct omci_attr_desc omci_gem_port_ctp_attrs[] = {
+ 	OMCI_ATTR(9, 10, 2, OMCI_RW_SC),
+ 	OMCI_ATTR(8, 12, 1, OMCI_R),
+ 	OMCI_ATTR(7, 13, 2, OMCI_RW_SC),
+-	OMCI_ATTR(6, 15, 2, OMCI_RW),
++	OMCI_ATTR(6, 15, 1, OMCI_RW_SC),	/* Encryption key ring */
+ };
+ 
+ /*
+@@ -782,7 +782,7 @@ static const struct omci_me_desc omci_me_descs[] = {
+ 		      omci_software_image_attrs),
+ 	STANDARD_DESC(OMCI_CLASS_CARDHOLDER, "Cardholder", STANDARD_ACTIONS,
+ 		      OMCI_ME_F_ONU_CREATED, GENMASK(15, 10), GENMASK(15, 10),
+-		      45, OMCI_CLASS_CATEGORY_EQUIPMENT,
++		      44, OMCI_CLASS_CATEGORY_EQUIPMENT,
+ 		      OMCI_CLASS_SUPPORT_NATIVE, omci_cardholder_attrs),
+ 	STANDARD_DESC(OMCI_CLASS_CIRCUIT_PACK, "Circuit pack", STANDARD_ACTIONS,
+ 		      OMCI_ME_F_ONU_CREATED, GENMASK(15, 2), GENMASK(15, 2),
+@@ -832,7 +832,7 @@ static const struct omci_me_desc omci_me_descs[] = {
+ 		      omci_gem_iwtp_attrs),
+ 	STANDARD_DESC(OMCI_CLASS_GEM_PORT_CTP, "GEM port network CTP",
+ 		      OLT_CREATED_ACTIONS, OMCI_ME_F_DATAPATH,
+-		      GENMASK(15, 6), GENMASK(15, 6), 17,
++		      GENMASK(15, 6), GENMASK(15, 6), 16,
+ 		      OMCI_CLASS_CATEGORY_ANI, OMCI_CLASS_SUPPORT_PROVISIONED,
+ 		      omci_gem_port_ctp_attrs),
+ 	STANDARD_DESC(OMCI_CLASS_OMCI, "OMCI",
+-- 
+2.47.3
+
