@@ -1,0 +1,297 @@
+From 76c0603e2ed56577feb5530c0a86ee20ccfaec42 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 7 Nov 2026 18:35:04 -0300
+Subject: [PATCH] net: airoha: xpon: see the PHY events latched between two
+ link polls
+
+The xPON PHY interrupts stay masked and the link poll samples ready and
+LOS every 250 ms, so a downstream loss shorter than that goes unseen:
+no O6 in O5, no O1 in O2-O4, while the stock driver takes the same PHY
+events by IRQ to gpon_detect_los_lof().
+
+XPON_INT_STATUS latches the events with the interrupts masked (0 after
+configuration, 0x30 once the PHY is ready). Add
+airoha_xpon_phy_take_events() to read and clear it as the vendor
+phy_isr() does, with the bits that function decodes, and call it from
+the link poll. Each latched bit is counted in sysfs gpon_phy_events; LOS
+or ILLG latched while the samples on both sides have the link up is a
+missed loss, logged once per ratelimit.
+
+gpon_phy_events selects what to do: 0 off, 1 count and log (default),
+2 also treat a missed loss as LOS, as the stock driver would. Acting is
+not the default: O6 without a POPUP ends in a full restart, which a loss
+the PHY recovered from by itself might not need, and how often such
+losses happen on this line is what the counters are for.
+
+tests/phy_events_test.py checks the decision on a copy of the function.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 105 +++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_xpon.h |  10 +++
+ drivers/phy/airoha/phy-airoha-xpon.c      |  29 ++++++
+ include/linux/phy/phy-airoha-xpon.h       |  17 ++++
+ 4 files changed, 157 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index da52727..5d73c32 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2217,6 +2217,40 @@ static ssize_t gpon_pon_id_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(gpon_pon_id);
+ 
++/*
++ * Link polls in which each latched PHY event was seen, since boot; see
++ * gpon_phy_events_poll(). age_s is -1 before the first event.
++ */
++static ssize_t gpon_phy_events_show(struct device *dev,
++				    struct device_attribute *attr, char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++	unsigned long last_jiffies;
++	long age = -1;
++
++	if (!priv)
++		return -ENODEV;
++
++	last_jiffies = READ_ONCE(priv->phy_ev_last_jiffies);
++	if (last_jiffies)
++		age = (long)((jiffies - last_jiffies) / HZ);
++
++	return sysfs_emit(buf,
++			  "los=%u lof=%u trans_tf=%u trans=%u tx_sd_fail=%u ready=%u illg=%u i2c=%u missed_loss=%u acted=%u last=%#04x age_s=%ld\n",
++			  READ_ONCE(priv->phy_ev_count[0]),
++			  READ_ONCE(priv->phy_ev_count[1]),
++			  READ_ONCE(priv->phy_ev_count[2]),
++			  READ_ONCE(priv->phy_ev_count[3]),
++			  READ_ONCE(priv->phy_ev_count[4]),
++			  READ_ONCE(priv->phy_ev_count[5]),
++			  READ_ONCE(priv->phy_ev_count[6]),
++			  READ_ONCE(priv->phy_ev_count[7]),
++			  READ_ONCE(priv->phy_ev_missed_loss),
++			  READ_ONCE(priv->phy_ev_acted),
++			  READ_ONCE(priv->phy_ev_last), age);
++}
++static DEVICE_ATTR_RO(gpon_phy_events);
++
+ static ssize_t gpon_gem_delin_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
+@@ -2358,6 +2392,7 @@ static struct attribute *gpon_bip_attrs[] = {
+ 	&dev_attr_gpon_bip.attr,
+ 	&dev_attr_gpon_counters.attr,
+ 	&dev_attr_gpon_pon_id.attr,
++	&dev_attr_gpon_phy_events.attr,
+ 	&dev_attr_gpon_gem_delin.attr,
+ 	&dev_attr_gpon_irq_status.attr,
+ 	&dev_attr_gpon_gem_mib.attr,
+@@ -4077,6 +4112,66 @@ static unsigned long airoha_xpon_link_poll_jiffies(struct xpon_priv *priv)
+ 				      (unsigned int)GPON_LINK_POLL_MAX_MS));
+ }
+ 
++/*
++ * The PHY latches its events even with the interrupts masked, so each
++ * poll also reads and clears them: a downstream loss shorter than the
++ * period leaves LOS or ILLG latched while both samples show the link up.
++ * The stock driver takes those by IRQ to gpon_detect_los_lof(), which
++ * sends O5 to O6 and O2-O4 to O1. Acting on them is mode 2: O6 without a
++ * POPUP ends in a full restart, which a loss the PHY recovered from by
++ * itself might not need; mode 1 only counts and logs them.
++ */
++#define GPON_PHY_EVENTS_OFF	0
++#define GPON_PHY_EVENTS_COUNT	1
++#define GPON_PHY_EVENTS_ACT	2
++#define GPON_PHY_EV_LOSS	(AIROHA_XPON_PHY_EV_LOS | AIROHA_XPON_PHY_EV_ILLG)
++
++static unsigned int gpon_phy_events = GPON_PHY_EVENTS_COUNT;
++module_param(gpon_phy_events, uint, 0644);
++MODULE_PARM_DESC(gpon_phy_events,
++		 "Latched PHY events in the link poll: 0 off, 1 count and log a loss the samples missed, 2 also treat it as LOS like the stock driver (default: 1)");
++
++/*
++ * Returns true when this poll should treat the link as lost although its
++ * sample has it up.
++ */
++static bool gpon_phy_events_poll(struct xpon_priv *priv, bool link,
++				 bool was_up)
++{
++	unsigned int mode = READ_ONCE(gpon_phy_events);
++	u32 ev;
++	int bit;
++
++	BUILD_BUG_ON(ARRAY_SIZE(priv->phy_ev_count) != AIROHA_XPON_PHY_EV_COUNT);
++
++	if (mode == GPON_PHY_EVENTS_OFF || priv->mode != AIROHA_XPON_MODE_GPON ||
++	    airoha_xpon_phy_take_events(priv->phy, &ev) || !ev)
++		return false;
++
++	for (bit = 0; bit < AIROHA_XPON_PHY_EV_COUNT; bit++)
++		if (ev & BIT(bit))
++			WRITE_ONCE(priv->phy_ev_count[bit],
++				   priv->phy_ev_count[bit] + 1);
++	WRITE_ONCE(priv->phy_ev_last, ev);
++	WRITE_ONCE(priv->phy_ev_last_jiffies, jiffies);
++
++	if (!(ev & GPON_PHY_EV_LOSS) || !link || !was_up)
++		return false;
++
++	WRITE_ONCE(priv->phy_ev_missed_loss, priv->phy_ev_missed_loss + 1);
++	mode = min(mode, (unsigned int)GPON_PHY_EVENTS_ACT);
++	dev_warn_ratelimited(priv->dev,
++			     "GPON PHY latched a short downstream loss in %s: events=%#04x%s\n",
++			     gpon_state_name(ploam_get_state(priv->ploam)), ev,
++			     mode == GPON_PHY_EVENTS_ACT ?
++			     ", treating it as LOS" : "");
++	if (mode != GPON_PHY_EVENTS_ACT)
++		return false;
++
++	WRITE_ONCE(priv->phy_ev_acted, priv->phy_ev_acted + 1);
++	return true;
++}
++
+ /*
+  * @lost: the previous sample had the link up and this one does not. Only a
+  * real loss counts: the PHY is still locking when gpon_enable() enters O2,
+@@ -4132,7 +4227,7 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 		container_of(to_delayed_work(work), struct xpon_priv,
+ 			     phy_link_work);
+ 	u32 mac_active, mac_enable, mac_status;
+-	bool ready, los, link, changed, was_up;
++	bool ready, los, link, changed, was_up, fsm_link;
+ 	int ret;
+ 
+ 	if (!READ_ONCE(priv->phy_powered))
+@@ -4144,6 +4239,8 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 
+ 	link = ready && !los;
+ 	was_up = READ_ONCE(priv->phy_link_known) && READ_ONCE(priv->phy_link_up);
++	/* What the FSM acts on: the sample, or a loss latched since the last */
++	fsm_link = link && !gpon_phy_events_poll(priv, link, was_up);
+ 	changed = !READ_ONCE(priv->phy_link_known) ||
+ 		  READ_ONCE(priv->phy_link_up) != link;
+ 	WRITE_ONCE(priv->phy_link_known, true);
+@@ -4175,13 +4272,13 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 			gpon_handle_irq_status(priv, mac_status, mac_enable);
+ 	}
+ 
+-	if (link && priv->mode == AIROHA_XPON_MODE_GPON &&
++	if (fsm_link && priv->mode == AIROHA_XPON_MODE_GPON &&
+ 	    ploam_get_state(priv->ploam) == GPON_O5_OPERATION) {
+ 		gpon_bip_poll(priv);
+ 		gpon_psync_check(priv);
+ 	}
+ 
+-	if (!link && priv->mode == AIROHA_XPON_MODE_GPON &&
++	if (!fsm_link && priv->mode == AIROHA_XPON_MODE_GPON &&
+ 	    ploam_get_state(priv->ploam) == GPON_O5_OPERATION) {
+ 		dev_warn(priv->dev,
+ 			 "GPON synchronization lost in O5, stopping upstream PLOAM\n");
+@@ -4190,7 +4287,7 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 	}
+ 
+ 	if (priv->mode == AIROHA_XPON_MODE_GPON && READ_ONCE(priv->mac_enabled))
+-		gpon_link_sync_state(priv, link, was_up && !link);
++		gpon_link_sync_state(priv, fsm_link, was_up && !fsm_link);
+ 
+ rearm:
+ 	gpon_bb_sample(priv);
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index a58b846..eef38b9 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -576,6 +576,16 @@ struct xpon_priv {
+ 	u32			irq_status_latched;
+ 	/* Last stable psync-to-SOF delay seen in O5 */
+ 	u32			psync_sof_last;
++	/*
++	 * Latched PHY events, per AIROHA_XPON_PHY_EV_* bit, from the link
++	 * poll; a missed loss is LOS or ILLG latched while the samples on
++	 * both sides had the link up. Written by the poll only.
++	 */
++	u32			phy_ev_count[8];
++	u32			phy_ev_missed_loss;
++	u32			phy_ev_acted;
++	u32			phy_ev_last;
++	unsigned long		phy_ev_last_jiffies;
+ 	/* MAC fine delay (DBG_DLY[15:8]) currently programmed */
+ 	u8			fine_delay;
+ 
+diff --git a/drivers/phy/airoha/phy-airoha-xpon.c b/drivers/phy/airoha/phy-airoha-xpon.c
+index 53a2125..1d2df21 100644
+--- a/drivers/phy/airoha/phy-airoha-xpon.c
++++ b/drivers/phy/airoha/phy-airoha-xpon.c
+@@ -398,6 +398,35 @@ int airoha_xpon_phy_take_gpon_bip(struct phy *phy, u32 *count)
+ }
+ EXPORT_SYMBOL_GPL(airoha_xpon_phy_take_gpon_bip);
+ 
++/*
++ * The PHY interrupts stay masked, but XPON_INT_STATUS still latches the
++ * events: it reads 0 right after configuration and 0x30 (READY, TX_SD
++ * fail) once the PHY is ready. Read and clear it as the vendor phy_isr()
++ * does, so that a poller sees what happened between two of its samples.
++ * Writing back the value read clears only the bits that were seen.
++ */
++int airoha_xpon_phy_take_events(struct phy *phy, u32 *events)
++{
++	struct airoha_xpon_phy *priv;
++	u32 val;
++	int ret;
++
++	if (!events)
++		return -EINVAL;
++
++	ret = airoha_xpon_phy_get_active_gpon(phy, &priv);
++	if (ret)
++		return ret;
++
++	val = airoha_xpon_phy_read(priv, XPON_INT_STATUS);
++	if (val)
++		airoha_xpon_phy_write(priv, XPON_INT_STATUS_CLR, val);
++	*events = val & GENMASK(AIROHA_XPON_PHY_EV_COUNT - 1, 0);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(airoha_xpon_phy_take_events);
++
+ /* The vendor reads every latched counter twice and keeps the second value. */
+ static u32 airoha_xpon_phy_read_latched(struct airoha_xpon_phy *priv, u32 reg)
+ {
+diff --git a/include/linux/phy/phy-airoha-xpon.h b/include/linux/phy/phy-airoha-xpon.h
+index 91f5633..fedc57f 100644
+--- a/include/linux/phy/phy-airoha-xpon.h
++++ b/include/linux/phy/phy-airoha-xpon.h
+@@ -2,6 +2,7 @@
+ #ifndef __LINUX_PHY_AIROHA_XPON_H
+ #define __LINUX_PHY_AIROHA_XPON_H
+ 
++#include <linux/bits.h>
+ #include <linux/errno.h>
+ #include <linux/kconfig.h>
+ #include <linux/types.h>
+@@ -31,6 +32,22 @@ int airoha_xpon_phy_get_link_state(struct phy *phy, bool *ready, bool *los);
+ int airoha_xpon_phy_get_psync_sof_delay(struct phy *phy, u32 *delay);
+ /* EN751221: latch, read and clear the BIP error counter; atomic-safe. */
+ int airoha_xpon_phy_take_gpon_bip(struct phy *phy, u32 *count);
++
++/*
++ * PHY events latched in XPON_INT_STATUS, as the vendor phy_isr() decodes
++ * them. They latch with the interrupts masked.
++ */
++#define AIROHA_XPON_PHY_EV_LOS		BIT(0)	/* transceiver LOS */
++#define AIROHA_XPON_PHY_EV_LOF		BIT(1)
++#define AIROHA_XPON_PHY_EV_TRANS_TF	BIT(2)	/* transceiver TF */
++#define AIROHA_XPON_PHY_EV_TRANS	BIT(3)	/* transceiver */
++#define AIROHA_XPON_PHY_EV_TX_SD_FAIL	BIT(4)
++#define AIROHA_XPON_PHY_EV_READY	BIT(5)
++#define AIROHA_XPON_PHY_EV_ILLG		BIT(6)
++#define AIROHA_XPON_PHY_EV_I2C		BIT(7)	/* I2C master */
++#define AIROHA_XPON_PHY_EV_COUNT	8
++/* GPON: read and clear the latched PHY events; atomic-safe. */
++int airoha_xpon_phy_take_events(struct phy *phy, u32 *events);
+ int airoha_xpon_phy_get_gpon_tx_counters(struct phy *phy,
+ 					 u32 *frame_count,
+ 					 u32 *burst_count);
+-- 
+2.47.3
+
