@@ -1,0 +1,74 @@
+From 81da6c43f06517ecb9059cfac1687d1ee0cebaca Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 7 Nov 2026 19:45:35 -0300
+Subject: [PATCH] net: airoha: xpon: clear the GEM table and reset the MAC on
+ session stop
+
+Turn gpon_stop_clear_gems and gpon_stop_mac_reset on by default, as the
+stock driver does after a Deactivate_ONU-ID. They wait for
+gpon_restore_omci_gems(), which puts the OMCI GEM ports back when the
+OMCC comes up, since the Huawei OLT does not always provision them again.
+
+On the XR500v on that OLT, five forced session restarts (four with the
+MAC reset) came back with the four GEM ports restored, no Deactivate and
+the line at full speed, and both have been set on by hand since 6 Nov.
+No real Deactivate_ONU-ID has happened with them on yet; both remain
+parameters.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index ce21906..4e3de44 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3811,31 +3811,37 @@ err_disable_frontend:
+  * Huawei OLT sends 257/513/769 after every Deactivate), and OMCI services
+  * find them by Alloc-ID, so nothing depends on the old entries.
+  *
+- * gpon_stop_clear_gems (default off): also invalidate every GEM port this
++ * gpon_stop_clear_gems (default on): also invalidate every GEM port this
+  * driver made valid. The GEM ports come from OMCI, and the Huawei OLT does
+  * not always provision OMCI again after a Deactivate_ONU-ID (the field log
+  * of 23-oct shows two restarts back to "service=1" without a single OMCI
+  * GEM port write), so gpon_restore_omci_gems() puts the ports OMCI created
+  * back when the OMCC comes up.
+  *
+- * gpon_stop_mac_reset (default off): pulse the MAC reset after the MBI
++ * gpon_stop_mac_reset (default on): pulse the MAC reset after the MBI
+  * stop, like the stock driver. It wipes the GEM table as well, so it has
+- * the same prerequisite, and it has not been tried on this board.
++ * the same prerequisite.
++ *
++ * Both were tried on the XR500v on the Huawei OLT: five forced session
++ * restarts on 6 Nov 2026 (four of them with the MAC reset too) came back
++ * to service with the four OMCI GEM ports restored, no Deactivate and the
++ * line at full speed, and both have been set on by hand since. No
++ * Deactivate_ONU-ID from the OLT has happened with them on yet.
+  */
+ static bool gpon_stop_clear_tconts = true;
+ module_param(gpon_stop_clear_tconts, bool, 0644);
+ MODULE_PARM_DESC(gpon_stop_clear_tconts,
+ 		 "Invalidate the hardware T-CONT table when a session stops (default: on)");
+ 
+-static bool gpon_stop_clear_gems;
++static bool gpon_stop_clear_gems = true;
+ module_param(gpon_stop_clear_gems, bool, 0644);
+ MODULE_PARM_DESC(gpon_stop_clear_gems,
+-		 "Invalidate the hardware GEM table when a session stops; the OMCI ports are restored when the OMCC comes up (default: off)");
++		 "Invalidate the hardware GEM table when a session stops; the OMCI ports are restored when the OMCC comes up (default: on)");
+ 
+-static bool gpon_stop_mac_reset;
++static bool gpon_stop_mac_reset = true;
+ module_param(gpon_stop_mac_reset, bool, 0644);
+ MODULE_PARM_DESC(gpon_stop_mac_reset,
+-		 "Also reset the GPON MAC when a session stops, as the stock driver; wipes the GEM table (default: off)");
++		 "Also reset the GPON MAC when a session stops, as the stock driver; wipes the GEM table (default: on)");
+ 
+ static void gpon_clear_hw_tables(struct xpon_priv *priv)
+ {
+-- 
+2.47.3
+

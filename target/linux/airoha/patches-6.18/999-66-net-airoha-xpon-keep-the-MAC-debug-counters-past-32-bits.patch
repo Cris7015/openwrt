@@ -1,0 +1,174 @@
+From f28aed2d0a71e052b5b723f76de87ff83cbc374c Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 7 Nov 2026 19:44:52 -0300
+Subject: [PATCH] net: airoha: xpon: keep the MAC debug counters past 32 bits
+
+gpon_counters printed the GPON_DBG MAC counters raw. They are 32 bits
+wide and nothing known clears them (the stock driver only prints them);
+rx_gtc and tx_bursts run at about 7800/s and reach 2^32 in six days,
+rx_gem and tx_gem faster under load.
+
+Sample them from the 250 ms link poll and add the difference to 64-bit
+totals, which gpon_counters now prints. A value below the last one is a
+wrap when the last one was near 2^32 (no counter moves 2^28 in one poll)
+and a MAC reset otherwise. Whether they wrap or saturate is not known
+yet; one that stays at 0xffffffff is flagged in mac_saturated, a bit per
+counter in print order, so the totals are not taken for real then.
+
+tests/mac_counters_test.py checks the sampling on a copy of the code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_xpon.c | 83 +++++++++++++++++++----
+ drivers/net/ethernet/airoha/airoha_xpon.h |  9 +++
+ 2 files changed, 77 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index 5d73c32..ce21906 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2114,10 +2114,58 @@ static ssize_t gpon_bip_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RO(gpon_bip);
+ 
++/*
++ * The GPON_DBG MAC counters are 32 bits wide and nothing known clears them;
++ * rx_gtc and tx_bursts alone reach 2^32 in about six days. The link poll
++ * samples them four times a second and adds the difference to 64-bit
++ * totals. A value below the last one wrapped if the last one was near 2^32
++ * and was reset (MAC reset) otherwise: no counter moves 2^28 in one poll.
++ * A counter that stays at 0xffffffff saturates instead of wrapping; it is
++ * flagged in mac_saturated, a bit per counter in this order.
++ */
++static const u16 gpon_mac_cnt_regs[] = {
++	GPON_DBG_GEM_HEC_ONE_ERR_CNT, GPON_DBG_GEM_HEC_TWO_ERR_CNT,
++	GPON_DBG_GEM_HEC_UC_ERR_CNT, GPON_DBG_RX_CRC_ERR_CNT,
++	GPON_DBG_RX_GEM_CNT, GPON_DBG_RX_GTC_CNT, GPON_DBG_TX_GEM_CNT,
++	GPON_DBG_TX_BST_CNT,
++};
++
++#define GPON_MAC_CNT_WRAP_FLOOR	0xf0000000U
++
++static void gpon_mac_counters_sample(struct xpon_priv *priv)
++{
++	unsigned long flags;
++	unsigned int i;
++	u32 cur, prev;
++
++	BUILD_BUG_ON(ARRAY_SIZE(gpon_mac_cnt_regs) !=
++		     ARRAY_SIZE(priv->mac_cnt_total));
++
++	if (priv->mode != AIROHA_XPON_MODE_GPON ||
++	    !READ_ONCE(priv->mac_enabled))
++		return;
++
++	spin_lock_irqsave(&priv->mac_cnt_lock, flags);
++	for (i = 0; i < ARRAY_SIZE(gpon_mac_cnt_regs); i++) {
++		cur = gpon_read(priv, gpon_mac_cnt_regs[i]);
++		prev = priv->mac_cnt_prev[i];
++		if (cur >= prev || prev >= GPON_MAC_CNT_WRAP_FLOOR)
++			priv->mac_cnt_total[i] += (u32)(cur - prev);
++		else
++			priv->mac_cnt_total[i] += cur;
++		if (cur == U32_MAX && prev == U32_MAX)
++			priv->mac_cnt_saturated |= BIT(i);
++		else if (cur < prev)
++			priv->mac_cnt_saturated &= ~BIT(i);
++		priv->mac_cnt_prev[i] = cur;
++	}
++	spin_unlock_irqrestore(&priv->mac_cnt_lock, flags);
++}
++
+ /*
+  * Line-quality counters for diagnostics, one "name=value" per line.  The
+- * MAC values are the raw GPON_DBG registers and are left out while the MAC
+- * is stopped.  The PHY ones are the latched cumulative FEC/frame/LOF counters
++ * MAC values are the 64-bit totals above, refreshed here while the MAC
++ * runs.  The PHY ones are the latched cumulative FEC/frame/LOF counters
+  * and are left out when the PHY is not running GPON.
+  */
+ static ssize_t gpon_counters_show(struct device *dev,
+@@ -2125,7 +2173,9 @@ static ssize_t gpon_counters_show(struct device *dev,
+ {
+ 	struct xpon_priv *priv = dev_get_drvdata(dev);
+ 	struct airoha_xpon_phy_gpon_rx_counters c;
++	u64 mac[ARRAY_SIZE(gpon_mac_cnt_regs)];
+ 	unsigned long flags;
++	u8 saturated;
+ 	u64 bip;
+ 	int len;
+ 
+@@ -2138,20 +2188,20 @@ static ssize_t gpon_counters_show(struct device *dev,
+ 
+ 	len = sysfs_emit(buf, "bip_errors=%llu\n", bip);
+ 
+-	if (priv->mode == AIROHA_XPON_MODE_GPON &&
+-	    READ_ONCE(priv->mac_enabled))
++	if (priv->mode == AIROHA_XPON_MODE_GPON) {
++		gpon_mac_counters_sample(priv);
++		spin_lock_irqsave(&priv->mac_cnt_lock, flags);
++		memcpy(mac, priv->mac_cnt_total, sizeof(mac));
++		saturated = priv->mac_cnt_saturated;
++		spin_unlock_irqrestore(&priv->mac_cnt_lock, flags);
+ 		len += sysfs_emit_at(buf, len,
+-				     "hec_corrected_1bit=%u\nhec_corrected_2bit=%u\n"
+-				     "hec_uncorrectable=%u\nrx_crc_errors=%u\n"
+-				     "rx_gem=%u\nrx_gtc=%u\ntx_gem=%u\ntx_bursts=%u\n",
+-				     gpon_read(priv, GPON_DBG_GEM_HEC_ONE_ERR_CNT),
+-				     gpon_read(priv, GPON_DBG_GEM_HEC_TWO_ERR_CNT),
+-				     gpon_read(priv, GPON_DBG_GEM_HEC_UC_ERR_CNT),
+-				     gpon_read(priv, GPON_DBG_RX_CRC_ERR_CNT),
+-				     gpon_read(priv, GPON_DBG_RX_GEM_CNT),
+-				     gpon_read(priv, GPON_DBG_RX_GTC_CNT),
+-				     gpon_read(priv, GPON_DBG_TX_GEM_CNT),
+-				     gpon_read(priv, GPON_DBG_TX_BST_CNT));
++				     "hec_corrected_1bit=%llu\nhec_corrected_2bit=%llu\n"
++				     "hec_uncorrectable=%llu\nrx_crc_errors=%llu\n"
++				     "rx_gem=%llu\nrx_gtc=%llu\ntx_gem=%llu\ntx_bursts=%llu\n"
++				     "mac_saturated=%u\n",
++				     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
++				     mac[6], mac[7], saturated);
++	}
+ 
+ 	if (!airoha_xpon_phy_get_gpon_rx_counters(priv->phy, &c))
+ 		len += sysfs_emit_at(buf, len,
+@@ -4289,6 +4339,8 @@ static void airoha_xpon_phy_link_work_fn(struct work_struct *work)
+ 	if (priv->mode == AIROHA_XPON_MODE_GPON && READ_ONCE(priv->mac_enabled))
+ 		gpon_link_sync_state(priv, fsm_link, was_up && !fsm_link);
+ 
++	gpon_mac_counters_sample(priv);
++
+ rearm:
+ 	gpon_bb_sample(priv);
+ 	if (READ_ONCE(priv->phy_powered))
+@@ -5791,6 +5843,7 @@ static int airoha_xpon_init_gpon(struct platform_device *pdev,
+ 	priv->ber_interval_ms = 1000;
+ 	spin_lock_init(&priv->bip_lock);
+ 	spin_lock_init(&priv->pon_id_lock);
++	spin_lock_init(&priv->mac_cnt_lock);
+ 	timer_setup(&priv->ber_timer, gpon_ber_timer_fn, 0);
+ 
+ 	priv->ploam = ploam_alloc(&gpon_ploam_ops, priv, priv->hw_sn,
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index eef38b9..5e36507 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -520,6 +520,15 @@ struct xpon_priv {
+ 	u32			bip_last;
+ 	u64			bip_total;
+ 	u64			bip_session_total;
++	/*
++	 * The GPON_DBG MAC counters widened to 64 bits by the link poll:
++	 * totals since boot, the last raw values, and the counters seen
++	 * stuck at 0xffffffff (per bit, in gpon_mac_cnt_regs order).
++	 */
++	spinlock_t		mac_cnt_lock;
++	u64			mac_cnt_total[8];
++	u32			mac_cnt_prev[8];
++	u8			mac_cnt_saturated;
+ 	u64			bip_pending;
+ 	unsigned long		bip_next;
+ 	/* GEM delineation losses seen by the ISR (counted, not logged) */
+-- 
+2.47.3
+
