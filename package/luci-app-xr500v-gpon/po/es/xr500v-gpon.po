@@ -758,6 +758,11 @@ msgstr "Potencia transmitida por la OLT"
 msgid "PON port"
 msgstr "Puerto PON"
 
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "no name"
+msgstr "sin nombre"
+
 msgid "The OLT started sending a PON-ID (%s): the line may have moved"
 msgstr "La OLT empezó a mandar un PON-ID (%s): pudieron mover la línea"
 

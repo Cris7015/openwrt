@@ -171,7 +171,7 @@ return baseclass.extend({
 				: _('Signal lost for less than 250 ms; only the PHY saw it');
 		case 'pon_id_new':
 			return _('The OLT started sending a PON-ID (%s): the line may have moved').replace('%s', ev.pon);
-		case 'pon_moved':  return _('The PON port changed, now %s').replace('%s', ev.pon);
+		case 'pon_moved':  return _('The PON port changed, now %s').replace('%s', ev.pon || _('no name'));
 		case 'wan_auth':   return _('The ISP rejected the PPPoE login: the credentials may have changed');
 		case 'wan_no_pado': return _('No PPPoE server answered: the VLAN or the service may have changed');
 		case 'sn_stuck':   return _('Stuck before O5 with light on the fiber: the OLT may have dropped this serial');

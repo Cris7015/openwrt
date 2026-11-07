@@ -759,6 +759,11 @@ msgstr ""
 msgid "PON port"
 msgstr ""
 
+#: htdocs/luci-static/resources/view/xr500v-gpon/fiber.js
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "no name"
+msgstr ""
+
 msgid "The OLT started sending a PON-ID (%s): the line may have moved"
 msgstr ""
 

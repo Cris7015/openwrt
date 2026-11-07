@@ -266,15 +266,14 @@ function ingest(raw) {
 	st.gem = parse_gem_mib(raw.gem_mib, raw.t, st.gem);
 	st.line = parse_counters(raw.counters);
 	st.pon = parse_pon_id(raw.pon_id);
-	// Movistar's OLT never sent one, so its arrival is news in itself.
+	// The first PON-ID is the baseline: Movistar's OLT sends one too, with
+	// an empty name. A different one later (e.g. empty -> a real name)
+	// means the line moved to another port or operator.
 	if (st.pon) {
 		let seen = length(st.pon_seen) ? st.pon_seen[0] : null;
-		if (seen == null)
-			add_event(raw.t, { type: 'pon_id_new', severity: 'warn', pon: st.pon.id,
-				msg: `The OLT started sending a PON-ID (${st.pon.id}): the line may have moved` });
-		else if (seen != st.pon.id_hex)
-			add_event(raw.t, { type: 'pon_moved', severity: 'crit', pon: st.pon.id,
-				msg: `The PON port changed, now ${st.pon.id}` });
+		if (seen != null && seen != st.pon.id_hex)
+			add_event(raw.t, { type: 'pon_moved', severity: 'crit', pon: st.pon.id ?? '',
+				msg: `The PON port changed, now ${st.pon.id ?? 'no name'}` });
 		st.pon_seen = [ st.pon.id_hex ];
 	}
 	// A counter that went backwards was reset (driver reload): count from 0.

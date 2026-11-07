@@ -45,6 +45,12 @@ eq('parse_pon_id_class', pon?.class, 'C+');
 near('parse_pon_id_tol', pon?.tol_dbm, 5.6, 0.001);
 eq('parse_pon_id_none', parse_pon_id('count=0\n'), null);
 eq('parse_pon_id_no_file', parse_pon_id(null), null);
+// Movistar's OLT: class B+, empty name, no power.
+let mpon = parse_pon_id('count=3 class=B+ source=olt id=....... id_hex=00000000000000 tol=65535\n');
+ok('parse_pon_id_empty_parsed', mpon != null);
+eq('parse_pon_id_empty_id', mpon?.id, null);
+eq('parse_pon_id_empty_hex', mpon?.id_hex, '00000000000000');
+eq('parse_pon_id_empty_class', mpon?.class, 'B+');
 eq('parse_pon_id_no_tol', parse_pon_id('count=1 class=B+ source=olt id=A id_hex=41 tol=65535')?.tol_dbm, null);
 eq('parse_bip_garbage', parse_bip('x'), null);
 

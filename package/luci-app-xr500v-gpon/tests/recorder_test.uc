@@ -403,8 +403,9 @@ eq('recorder_migration_sip_ok', count(state_case('v3', 5, 13, REG('registered'))
 eq('recorder_migration_sip_wan_down', count(state_case('v4', 5, 13,
 	{ voip: { wan_up: false, lines: [ { registrations: [ { state: 'failed' } ] } ] } }), 'sip_fail'), 0);
 
-// recorder_pon_id_*: Movistar sends none, so the first one is news, and a new
-// name means the line moved. The same name again says nothing.
+// recorder_pon_id_*: the first PON-ID is the baseline (Movistar's has an
+// empty name), and a different one means the line moved. The same again says
+// nothing.
 const PONID = (id, hex) => `count=5 class=C+ source=olt id=${id} id_hex=${hex} tol=356\n`;
 function pon_case(name, ids) {
 	let s = [];
@@ -416,12 +417,26 @@ let po = pon_case('p1', [ 'count=0\n', 'count=0\n' ]);
 eq('recorder_pon_id_none', count(types(po?.events), 'pon_id_new'), 0);
 eq('recorder_pon_id_none_summary', po?.pon, null);
 po = pon_case('p2', [ 'count=0\n', PONID('O011906', '4f'), PONID('O011906', '4f') ]);
-eq('recorder_pon_id_first', count(types(po?.events), 'pon_id_new'), 1);
+eq('recorder_pon_id_first', count(types(po?.events), 'pon_id_new'), 0);
 eq('recorder_pon_id_same', count(types(po?.events), 'pon_moved'), 0);
 eq('recorder_pon_id_summary', po?.pon?.id, 'O011906');
 ok('recorder_pon_id_loss', po?.pon?.loss_db > 20 && po?.pon?.loss_db < 30);
 po = pon_case('p3', [ PONID('O011906', '4f'), PONID('O022222', '50') ]);
 eq('recorder_pon_id_moved', count(types(po?.events), 'pon_moved'), 1);
+// Movistar (empty name) to a named port: the migration.
+const EMPTY = 'count=2 class=B+ source=olt id=....... id_hex=00000000000000 tol=65535\n';
+po = pon_case('p4', [ EMPTY, EMPTY, PONID('O011906', '4f') ]);
+let moved = filter(po?.events || [], (e) => e.type == 'pon_moved');
+eq('recorder_pon_id_empty_to_named', length(moved), 1);
+eq('recorder_pon_id_empty_to_named_pon', moved[0]?.pon, 'O011906');
+po = pon_case('p5', [ EMPTY, EMPTY ]);
+eq('recorder_pon_id_empty_quiet', length(filter(po?.events || [], (e) => index([ 'pon_id_new', 'pon_moved' ], e.type) >= 0)), 0);
+eq('recorder_pon_id_empty_summary_id', po?.pon?.id, null);
+eq('recorder_pon_id_empty_summary_class', po?.pon?.class, 'B+');
+po = pon_case('p6', [ PONID('O011906', '4f'), EMPTY ]);
+moved = filter(po?.events || [], (e) => e.type == 'pon_moved');
+eq('recorder_pon_id_named_to_empty', length(moved), 1);
+eq('recorder_pon_id_named_to_empty_pon', moved[0]?.pon, '');
 
 r = replay('save', { save: `${BASE}/good.json.gz`, samples: [ sample(T0), sample(T0 + 60) ] });
 ok('snapshot_roundtrip_saved', fs.stat(`${BASE}/good.json.gz`) != null);

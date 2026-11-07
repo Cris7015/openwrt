@@ -127,7 +127,8 @@ export function parse_counters(text) {
 };
 
 // gpon_pon_id: "count=N class=C+ source=olt id=O011906 id_hex=... tol=356".
-// Null until the OLT sends one, which it does only if the operator set it up.
+// Null until the OLT sends one. Movistar's sends an empty identifier (all
+// zero bytes, shown as dots): id is null then, and id_hex still tells it.
 export function parse_pon_id(text) {
 	if (type(text) != 'string')
 		return null;
@@ -140,7 +141,8 @@ export function parse_pon_id(text) {
 	if (!(int(r.count) > 0) || !r.id_hex)
 		return null;
 	let tol = int(r.tol);
-	return { id: r.id, id_hex: r.id_hex, class: r.class,
+	let empty = match(r.id_hex, /^0+$/) != null;
+	return { id: empty ? null : r.id, id_hex: r.id_hex, class: r.class,
 		tol_dbm: (tol < 65535) ? tol / 10.0 - 30 : null };
 };
 
