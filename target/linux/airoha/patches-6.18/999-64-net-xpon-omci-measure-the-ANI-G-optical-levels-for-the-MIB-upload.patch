@@ -1,0 +1,151 @@
+From faab30a2e157ffebc17a6ab79feffc7f1d0f3982 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 7 Nov 2026 17:35:59 -0300
+Subject: [PATCH] net: xpon: omci: measure the ANI-G optical levels for the MIB
+ upload
+
+A Get of the ANI-G optical signal level or transmit optical level already
+measures them, but the instance stores zeros, so the MIB upload told the
+OLT 0 dBm for both. Refresh the two levels from the optical frontend when
+the OLT starts an upload, as a Get would; a level that cannot be measured
+keeps its stored value. The ani_g_upload_levels parameter turns this off.
+Nothing else in the ANI-G changes: the SR indication stays 0.
+
+Also count what the OLT reads of the optics, to tell whether it ever asks
+for the levels: agent_ani_g_level_gets (Gets that include either level),
+agent_ani_g_tests (ANI-G self tests) and agent_mib_uploads.
+
+Get responses are unchanged for 25 MEs and all 65536 masks
+(tests/get_compare.py); tests/ani_g_upload_test.py checks the values,
+offsets and the upload record.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/xpon/omci/agent.c    | 35 +++++++++++++++++++++++++++++++++++
+ net/xpon/omci/internal.h |  4 ++++
+ net/xpon/omci/sysfs.c    |  6 ++++++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/net/xpon/omci/agent.c b/net/xpon/omci/agent.c
+index cb302ce..852c492 100644
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -17,6 +17,7 @@
+ #include <linux/kernel.h>
+ #include <linux/math.h>
+ #include <linux/math64.h>
++#include <linux/moduleparam.h>
+ #include <linux/reboot.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -180,6 +181,16 @@ static bool omci_agent_result_can_be_faked(u8 result)
+ #define OMCI_NW_TO_DBM_0P002_OFFSET	30000
+ #define OMCI_NW_TO_DBUW_0P002_OFFSET	15000
+ 
++/*
++ * The ANI-G instance stores 0 in its optical levels, which reads as 0 dBm.
++ * A Get measures them; with this set the MIB upload does too, so the copy
++ * the OLT keeps after an upload holds the levels of that moment.
++ */
++static bool ani_g_upload_levels = true;
++module_param(ani_g_upload_levels, bool, 0644);
++MODULE_PARM_DESC(ani_g_upload_levels,
++		 "Measure the ANI-G optical levels for the MIB upload (default: on)");
++
+ #define OMCI_VLAN_FILTER_LIST_MASK	0x8000
+ #define OMCI_VLAN_FILTER_FORWARD_MASK	0x4000
+ #define OMCI_VLAN_FILTER_COUNT_MASK	0x2000
+@@ -4353,6 +4364,24 @@ static u16 omci_agent_refresh_ani_g_levels(struct omci_device *odev,
+ 	return failed;
+ }
+ 
++/*
++ * Before a MIB upload snapshot: store the measured levels in the ANI-G
++ * instance. A level that cannot be measured keeps its stored value.
++ */
++static void omci_agent_upload_ani_g_levels_locked(struct omci_device *odev)
++{
++	struct omci_mib_object *object;
++
++	if (!READ_ONCE(ani_g_upload_levels) || !odev->ops ||
++	    !odev->ops->get_telemetry)
++		return;
++	object = omci_mib_lookup(&odev->agent, OMCI_CLASS_ANI_G,
++				 OMCI_ANI_G_ENTITY_ID);
++	if (object)
++		omci_agent_refresh_ani_g_levels(odev, object,
++						OMCI_ANI_G_OPTICAL_LEVEL_MASK);
++}
++
+ static bool omci_agent_get_uses_ani_g_telemetry(u16 class_id, u16 entity_id,
+ 						u16 mask)
+ {
+@@ -4486,6 +4515,9 @@ static u8 omci_agent_get_locked(struct omci_device *odev, u16 class_id,
+ 		return omci_agent_get_attribute_locked(odev, entity_id, mask,
+ 			response_content, response_capacity, response_len);
+ 
++	if (class_id == OMCI_CLASS_ANI_G &&
++	    (mask & OMCI_ANI_G_OPTICAL_LEVEL_MASK))
++		atomic64_inc(&agent->ani_g_level_gets);
+ 	if (omci_agent_get_uses_ani_g_telemetry(class_id, entity_id, mask) &&
+ 	    odev->ops && odev->ops->get_telemetry)
+ 		return omci_agent_get_ani_g_levels(odev, mask, extended,
+@@ -4654,6 +4686,7 @@ omci_agent_send_ani_g_test_result(struct omci_device *odev,
+ 	u16 value;
+ 	int ret;
+ 
++	atomic64_inc(&agent->ani_g_tests);
+ 	if (!odev->ops || !odev->ops->get_telemetry)
+ 		return -EOPNOTSUPP;
+ 
+@@ -5006,6 +5039,8 @@ omci_agent_build_response_locked(struct omci_device *odev,
+ 	case OMCI_MSG_TYPE_MIB_UPLOAD:
+ 		if (capacity < 2)
+ 			return -EMSGSIZE;
++		atomic64_inc(&agent->mib_uploads);
++		omci_agent_upload_ani_g_levels_locked(odev);
+ 		ret = omci_agent_upload_snapshot_locked(agent);
+ 		if (ret)
+ 			return ret;
+diff --git a/net/xpon/omci/internal.h b/net/xpon/omci/internal.h
+index ec8a4ab..c2e4bc9 100644
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -207,6 +207,10 @@ struct omci_agent {
+ 	atomic64_t fake_responses;
+ 	/* Get and Set answered with result 9, attribute failed or unknown */
+ 	atomic64_t attribute_failures;
++	/* What the OLT reads of the optics: ANI-G levels, Test, MIB upload */
++	atomic64_t ani_g_level_gets;
++	atomic64_t ani_g_tests;
++	atomic64_t mib_uploads;
+ };
+ 
+ struct omci_device {
+diff --git a/net/xpon/omci/sysfs.c b/net/xpon/omci/sysfs.c
+index 141bcfa..93a7c41 100644
+--- a/net/xpon/omci/sysfs.c
++++ b/net/xpon/omci/sysfs.c
+@@ -193,6 +193,9 @@ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_duplicates, duplicates);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_unsupported, unsupported);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_fake_responses, fake_responses);
+ OMCI_AGENT_ATOMIC64_ATTR_RO(agent_attribute_failures, attribute_failures);
++OMCI_AGENT_ATOMIC64_ATTR_RO(agent_ani_g_level_gets, ani_g_level_gets);
++OMCI_AGENT_ATOMIC64_ATTR_RO(agent_ani_g_tests, ani_g_tests);
++OMCI_AGENT_ATOMIC64_ATTR_RO(agent_mib_uploads, mib_uploads);
+ 
+ static ssize_t mib_sync_show(struct device *dev, struct device_attribute *attr,
+ 			     char *buf)
+@@ -721,6 +724,9 @@ static struct attribute *omci_attrs[] = {
+ 	&dev_attr_agent_unsupported.attr,
+ 	&dev_attr_agent_fake_responses.attr,
+ 	&dev_attr_agent_attribute_failures.attr,
++	&dev_attr_agent_ani_g_level_gets.attr,
++	&dev_attr_agent_ani_g_tests.attr,
++	&dev_attr_agent_mib_uploads.attr,
+ 	&dev_attr_mib_sync.attr,
+ 	&dev_attr_agent_operational.attr,
+ 	&dev_attr_gem_pm.attr,
+-- 
+2.47.3
+
