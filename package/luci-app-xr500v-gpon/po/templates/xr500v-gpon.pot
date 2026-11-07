@@ -738,3 +738,24 @@ msgstr ""
 
 msgid "The ISP rejected the PPPoE login: the credentials may have changed"
 msgstr ""
+
+msgid "Fiber loss"
+msgstr ""
+
+msgid "ODN class"
+msgstr ""
+
+msgid "OLT transmitted power"
+msgstr ""
+
+msgid "PON port"
+msgstr ""
+
+msgid "The OLT started sending a PON-ID (%s): the line may have moved"
+msgstr ""
+
+msgid "The PON port changed, now %s"
+msgstr ""
+
+msgid "computed"
+msgstr ""

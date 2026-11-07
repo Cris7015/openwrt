@@ -737,3 +737,24 @@ msgstr "Trabado antes de O5 con luz en la fibra: la OLT pudo dar de baja este n�
 
 msgid "The ISP rejected the PPPoE login: the credentials may have changed"
 msgstr "La operadora rechazó el usuario PPPoE: pudieron cambiar las credenciales"
+
+msgid "Fiber loss"
+msgstr "Pérdida de la fibra"
+
+msgid "ODN class"
+msgstr "Clase de la ODN"
+
+msgid "OLT transmitted power"
+msgstr "Potencia transmitida por la OLT"
+
+msgid "PON port"
+msgstr "Puerto PON"
+
+msgid "The OLT started sending a PON-ID (%s): the line may have moved"
+msgstr "La OLT empezó a mandar un PON-ID (%s): pudieron mover la línea"
+
+msgid "The PON port changed, now %s"
+msgstr "Cambió el puerto PON, ahora %s"
+
+msgid "computed"
+msgstr "calculado"

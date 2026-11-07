@@ -18,7 +18,7 @@ import * as uloop from 'uloop';
 import * as ubus from 'ubus';
 import { cursor } from 'uci';
 import {
-	normalize_status, parse_bip, parse_counters, sip_failed, thresholds, evaluate, detect, aggregate, ring_push
+	nw_to_dbm, normalize_status, parse_bip, parse_counters, parse_pon_id, sip_failed, thresholds, evaluate, detect, aggregate, ring_push
 } from 'lib';
 import { eye_scan, eye_metrics } from 'eye';
 
@@ -55,6 +55,7 @@ let st = {
 	last: null, known: null, info: null, serial: null,
 	// moments kept as uptime when known (immune to NTP steps), else wall time
 	o5_up: null, o5_t: null, deact: 0, deact_up: null, deact_t: null,
+	pon_seen: [],
 	// in O5 at least once since boot; until then an unused fiber port
 	// (WAN over Ethernet, say) raises no alert and no event
 	ever_o5: false, snap_boot: null,
@@ -210,7 +211,7 @@ function open_window(t) {
 
 function add_event(t, ev) {
 	let e = { t, type: ev.type, severity: ev.severity, msg: ev.msg };
-	for (let k in [ 'n', 'flags', 'delay', 'diff', 'delta' ])	/* the browser words the event with these */
+	for (let k in [ 'n', 'flags', 'delay', 'diff', 'delta', 'pon' ])	/* the browser words the event with these */
 		if (ev[k] != null)
 			e[k] = ev[k];
 	ring_push(st.events, e, cfg.events_max);
@@ -264,6 +265,18 @@ function ingest(raw) {
 	};
 	st.gem = parse_gem_mib(raw.gem_mib, raw.t, st.gem);
 	st.line = parse_counters(raw.counters);
+	st.pon = parse_pon_id(raw.pon_id);
+	// Movistar's OLT never sent one, so its arrival is news in itself.
+	if (st.pon) {
+		let seen = length(st.pon_seen) ? st.pon_seen[0] : null;
+		if (seen == null)
+			add_event(raw.t, { type: 'pon_id_new', severity: 'warn', pon: st.pon.id,
+				msg: `The OLT started sending a PON-ID (${st.pon.id}): the line may have moved` });
+		else if (seen != st.pon.id_hex)
+			add_event(raw.t, { type: 'pon_moved', severity: 'crit', pon: st.pon.id,
+				msg: `The PON port changed, now ${st.pon.id}` });
+		st.pon_seen = [ st.pon.id_hex ];
+	}
 	// A counter that went backwards was reset (driver reload): count from 0.
 	if (sample.bip_total != null && prev?.bip_total != null)
 		sample.bip = sample.bip_total >= prev.bip_total
@@ -401,6 +414,9 @@ function summary(now) {
 			fec_seconds: st.line?.fec_seconds, lof: st.line?.lof,
 			hec_uncorrectable: st.line?.hec_uncorrectable,
 			rx_crc: st.line?.rx_crc_errors },
+		pon: st.pon ? { id: st.pon.id, class: st.pon.class, tol_dbm: st.pon.tol_dbm,
+			loss_db: (st.pon.tol_dbm != null && l?.rx_nw > 0)
+				? st.pon.tol_dbm - nw_to_dbm(l.rx_nw) : null } : null,
 		gem: st.gem ? { enabled: st.gem.enabled, ready: st.gem.ready,
 			type: st.gem.type, ports: st.gem.ports } : null,
 		serial_hint: st.serial ? substr(st.serial, 0, 4) + '…' : null
@@ -467,7 +483,8 @@ function events_list(limit) {
 function save_snapshot(path) {
 	return write_gz(path, {
 		version: 1, saved: time(), boot_id: boot_id_of(),
-		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30, eye: st.eye
+		m1: st.m1, m5: st.m5, m30: st.m30, p5: st.p5, p30: st.p30, eye: st.eye,
+		pon_seen: st.pon_seen
 	});
 }
 
@@ -480,7 +497,7 @@ function load_snapshot(path) {
 		warn(`xr500v-gpon: ignoring unreadable snapshot ${path}\n`);
 		return false;
 	}
-	for (let k in [ 'm1', 'm5', 'm30', 'p5', 'p30', 'eye' ])
+	for (let k in [ 'm1', 'm5', 'm30', 'p5', 'p30', 'eye', 'pon_seen' ])
 		if (type(data[k]) == 'array')
 			st[k] = data[k];
 	st.snap_boot = data.boot_id;
@@ -662,6 +679,7 @@ function collect(bus) {
 		t: time(), up: uptime(), status, voip,
 		bip: fs.readfile(XMAC + '/gpon_bip'),
 		counters: fs.readfile(XMAC + '/gpon_counters'),
+		pon_id: fs.readfile(XMAC + '/gpon_pon_id'),
 		gem_delin: fs.readfile(XMAC + '/gpon_gem_delin'),
 		gem_mib: fs.readfile(XMAC + '/gpon_gem_mib'),
 		sfifo_resync: fs.readfile(DBG + '/gpon_sfifo_resync_count'),
@@ -717,7 +735,7 @@ function replay(path) {
 	print(sprintf('%J\n', {
 		events: st.events, m1_len: length(st.m1),
 		m5_len: length(history('7d').points), health: assess(now).health,
-		counters: summary(now).counters, gem: summary(now).gem,
+		counters: summary(now).counters, gem: summary(now).gem, pon: summary(now).pon,
 		skipped: st.skipped, last: st.last,
 		o5_since: wall(st.o5_up, st.o5_t), ever_o5: st.ever_o5,
 		windows: map(st.windows, (w) => ({ t0: w.t0, t1: w.t1, n: length(w.points) })),

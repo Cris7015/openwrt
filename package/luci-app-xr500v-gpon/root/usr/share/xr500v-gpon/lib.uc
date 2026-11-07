@@ -126,6 +126,24 @@ export function parse_counters(text) {
 	return length(r) ? r : null;
 };
 
+// gpon_pon_id: "count=N class=C+ source=olt id=O011906 id_hex=... tol=356".
+// Null until the OLT sends one, which it does only if the operator set it up.
+export function parse_pon_id(text) {
+	if (type(text) != 'string')
+		return null;
+	let r = {};
+	for (let kv in split(trim(text), /[ \t\n]+/)) {
+		let m = match(kv, /^([a-z_]+)=(.+)$/);
+		if (m)
+			r[m[1]] = m[2];
+	}
+	if (!(int(r.count) > 0) || !r.id_hex)
+		return null;
+	let tol = int(r.tol);
+	return { id: r.id, id_hex: r.id_hex, class: r.class,
+		tol_dbm: (tol < 65535) ? tol / 10.0 - 30 : null };
+};
+
 // The code of a failed SIP registration (0 if it has none), or null. With the
 // WAN down every registration fails, and the WAN is what is wrong then.
 export function sip_failed(voip) {

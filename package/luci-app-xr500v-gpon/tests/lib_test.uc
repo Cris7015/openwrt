@@ -3,7 +3,7 @@
 
 import { ok, eq, near, done } from 'assert';
 import {
-	nw_to_dbm, dbm_to_nw, parse_bip, parse_counters, normalize_status, thresholds,
+	nw_to_dbm, dbm_to_nw, parse_bip, parse_counters, parse_pon_id, normalize_status, thresholds,
 	evaluate, detect, aggregate, ring_push
 } from 'lib';
 
@@ -37,6 +37,15 @@ eq('parse_counters_64bit', line?.rx_frames, 8589934592);
 eq('parse_counters_lof', line?.lof, 1);
 eq('parse_counters_no_file', parse_counters(null), null);
 eq('parse_counters_empty', parse_counters(''), null);
+
+// The values of a real Huawei ONT on Personal: Class C+, O011906, 5.6 dBm.
+let pon = parse_pon_id('count=12 class=C+ source=olt id=O011906 id_hex=4f303131393036 tol=356\n');
+eq('parse_pon_id_id', pon?.id, 'O011906');
+eq('parse_pon_id_class', pon?.class, 'C+');
+near('parse_pon_id_tol', pon?.tol_dbm, 5.6, 0.001);
+eq('parse_pon_id_none', parse_pon_id('count=0\n'), null);
+eq('parse_pon_id_no_file', parse_pon_id(null), null);
+eq('parse_pon_id_no_tol', parse_pon_id('count=1 class=B+ source=olt id=A id_hex=41 tol=65535')?.tol_dbm, null);
 eq('parse_bip_garbage', parse_bip('x'), null);
 
 // Thresholds defaults.

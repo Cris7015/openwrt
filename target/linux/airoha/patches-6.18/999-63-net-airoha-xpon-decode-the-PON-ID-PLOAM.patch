@@ -1,0 +1,196 @@
+From 282979b5aa65035c898ebe248255e7466d8c19a9 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 7 Nov 2026 04:35:58 -0300
+Subject: [PATCH] net: airoha: xpon: decode the PON-ID PLOAM
+
+G.984.3 annex C: an OLT provisioned to do it broadcasts its ODN class, a
+PON port name and the launch power about once a second. It has no effect
+on the ONU but may be stored for a monitoring terminal, so keep the last
+one and show it in gpon_pon_id, with a line in the log when the name
+changes. The power changes all the time and would flood the log.
+
+The field logs hold no PON-ID from a Movistar OLT, so this has only been
+checked against the format of the Recommendation and the values a Huawei
+ONT displays on another line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/airoha/airoha_ploam.c |  5 +-
+ drivers/net/ethernet/airoha/airoha_ploam.h |  3 +
+ drivers/net/ethernet/airoha/airoha_xpon.c  | 69 ++++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_xpon.h  |  4 ++
+ 4 files changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.c b/drivers/net/ethernet/airoha/airoha_ploam.c
+index 97db290..7f43840 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.c
++++ b/drivers/net/ethernet/airoha/airoha_ploam.c
+@@ -807,10 +807,13 @@ void ploam_handle_downstream(struct ploam_priv *pp,
+ 	case PLOAM_DOWN_RANGING_ADJUSTMENT:
+ 		handle_ranging_adjustment(pp, onu_id, type, content);
+ 		break;
++	case PLOAM_DOWN_PON_ID:
++		if (onu_id == PLOAM_ONU_BCAST && pp->ops->pon_id)
++			pp->ops->pon_id(pp->hw_priv, content);
++		break;
+ 	case PLOAM_DOWN_PEE:
+ 	case PLOAM_DOWN_PST:
+ 	case PLOAM_DOWN_CHANGE_POWER_LEVEL:
+-	case PLOAM_DOWN_PON_ID:
+ 	case PLOAM_DOWN_SLEEP_ALLOW:
+ 		/* Stub: message acknowledged by presence in handler table */
+ 		break;
+diff --git a/drivers/net/ethernet/airoha/airoha_ploam.h b/drivers/net/ethernet/airoha/airoha_ploam.h
+index 5294baf..0671fa4 100644
+--- a/drivers/net/ethernet/airoha/airoha_ploam.h
++++ b/drivers/net/ethernet/airoha/airoha_ploam.h
+@@ -127,6 +127,8 @@ struct ploam_msg {
+  * @state_changed: ONU activation state has changed; start/stop TO1/TO2 timers,
+  *   manage carrier, MBI interface, etc.
+  * @deactivate: OLT sent Deactivate_ONU; trigger a full hardware disable/reset.
++ * @pon_id: optional; the OLT broadcast a PON-ID (G.984.3 annex C). Informative:
++ *   it has no effect on the ONU, and an OLT only sends it when provisioned to.
+  * @reactivate: optional; Disable_Serial_Number re-enabled the ONU from O7.
+  *   Return true if the hardware layer restarts the whole session (its enable
+  *   path calls ploam_start()), false to let the PLOAM layer go to O2 itself.
+@@ -151,6 +153,7 @@ struct ploam_ops {
+ 	int (*set_alloc_id)(void *priv, u16 alloc_id, bool allocate);
+ 	void (*state_changed)(void *priv, enum gpon_state state);
+ 	void (*deactivate)(void *priv);
++	void (*pon_id)(void *priv, const u8 content[PLOAM_CONTENT_LEN]);
+ 	bool (*reactivate)(void *priv);
+ };
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.c b/drivers/net/ethernet/airoha/airoha_xpon.c
+index b700abc..da52727 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -41,6 +41,7 @@
+ #include <linux/sched.h>
+ #include <linux/sfp.h>
+ #include <linux/timer.h>
++#include <linux/ctype.h>
+ #include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ #include <net/xpon/omci.h>
+@@ -2169,6 +2170,53 @@ static ssize_t gpon_counters_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(gpon_counters);
+ 
++/* G.984.3 C.2.2 ACCCpppp, the CCC bits. */
++static const char *gpon_pon_id_class(u8 type)
++{
++	static const char * const classes[] = { "A", "B", "B+", "C", "C+" };
++	u8 class = (type >> 4) & 7;
++
++	return class < ARRAY_SIZE(classes) ? classes[class] : "unknown";
++}
++
++/*
++ * The last PON-ID: an operator-provisioned port name and the launch power,
++ * tol in 0.1 dB above -30 dBm, 0xffff when the OLT does not report it.
++ */
++static ssize_t gpon_pon_id_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct xpon_priv *priv = dev_get_drvdata(dev);
++	u8 c[PLOAM_CONTENT_LEN];
++	char id[8];
++	unsigned long flags;
++	unsigned int i;
++	u32 count;
++
++	if (!priv)
++		return -ENODEV;
++
++	spin_lock_irqsave(&priv->pon_id_lock, flags);
++	count = priv->pon_id_count;
++	memcpy(c, priv->pon_id, sizeof(c));
++	spin_unlock_irqrestore(&priv->pon_id_lock, flags);
++
++	if (!count)
++		return sysfs_emit(buf, "count=0\n");
++
++	/* Any value of interest to the operator: keep the line parseable. */
++	for (i = 0; i < 7; i++)
++		id[i] = (isalnum(c[i + 1]) || c[i + 1] == '-') ? c[i + 1] : '.';
++	id[7] = '\0';
++
++	return sysfs_emit(buf,
++			  "count=%u class=%s source=%s id=%s id_hex=%7phN tol=%u\n",
++			  count, gpon_pon_id_class(c[0]),
++			  (c[0] & BIT(7)) ? "re" : "olt", id, c + 1,
++			  get_unaligned_be16(c + 8));
++}
++static DEVICE_ATTR_RO(gpon_pon_id);
++
+ static ssize_t gpon_gem_delin_show(struct device *dev,
+ 				   struct device_attribute *attr, char *buf)
+ {
+@@ -2309,6 +2357,7 @@ static DEVICE_ATTR_RW(gpon_gem_mib_enable);
+ static struct attribute *gpon_bip_attrs[] = {
+ 	&dev_attr_gpon_bip.attr,
+ 	&dev_attr_gpon_counters.attr,
++	&dev_attr_gpon_pon_id.attr,
+ 	&dev_attr_gpon_gem_delin.attr,
+ 	&dev_attr_gpon_irq_status.attr,
+ 	&dev_attr_gpon_gem_mib.attr,
+@@ -3427,6 +3476,24 @@ static bool gpon_cb_reactivate(void *hw_priv)
+ 	return true;
+ }
+ 
++/* The launch power changes all the time: only a new name is worth a line. */
++static void gpon_cb_pon_id(void *hw_priv, const u8 content[PLOAM_CONTENT_LEN])
++{
++	struct xpon_priv *priv = hw_priv;
++	unsigned long flags;
++	bool changed;
++
++	spin_lock_irqsave(&priv->pon_id_lock, flags);
++	changed = !priv->pon_id_count || memcmp(priv->pon_id, content, 8);
++	memcpy(priv->pon_id, content, PLOAM_CONTENT_LEN);
++	priv->pon_id_count++;
++	spin_unlock_irqrestore(&priv->pon_id_lock, flags);
++
++	if (changed)
++		dev_info(priv->dev, "GPON PON-ID: class %s, identifier %7phN\n",
++			 gpon_pon_id_class(content[0]), content + 1);
++}
++
+ static void gpon_cb_rx_trace(void *hw_priv, u8 type, u8 onu_id, u8 result)
+ {
+ 	gpon_bb_record(hw_priv, GPON_BB_RX, type, onu_id, result, 0);
+@@ -3449,6 +3516,7 @@ static const struct ploam_ops gpon_ploam_ops = {
+ 	.set_alloc_id        = gpon_cb_set_alloc_id,
+ 	.state_changed       = gpon_cb_state_changed,
+ 	.deactivate          = gpon_cb_deactivate,
++	.pon_id              = gpon_cb_pon_id,
+ 	.reactivate          = gpon_cb_reactivate,
+ };
+ 
+@@ -5625,6 +5693,7 @@ static int airoha_xpon_init_gpon(struct platform_device *pdev,
+ 
+ 	priv->ber_interval_ms = 1000;
+ 	spin_lock_init(&priv->bip_lock);
++	spin_lock_init(&priv->pon_id_lock);
+ 	timer_setup(&priv->ber_timer, gpon_ber_timer_fn, 0);
+ 
+ 	priv->ploam = ploam_alloc(&gpon_ploam_ops, priv, priv->hw_sn,
+diff --git a/drivers/net/ethernet/airoha/airoha_xpon.h b/drivers/net/ethernet/airoha/airoha_xpon.h
+index f38b90e..a58b846 100644
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -510,6 +510,10 @@ struct xpon_priv {
+ 	spinlock_t		ploam_tx_lock;
+ 	/* BIP errors, from the PHY read-and-clear counter, for REI and sysfs */
+ 	spinlock_t		bip_lock;
++	/* Last PON-ID PLOAM, as received; count 0 means none yet. */
++	spinlock_t		pon_id_lock;
++	u8			pon_id[PLOAM_CONTENT_LEN];
++	u32			pon_id_count;
+ 	bool			bip_active;
+ 	bool			bip_valid;
+ 	u32			bip_session;
+-- 
+2.47.3
+

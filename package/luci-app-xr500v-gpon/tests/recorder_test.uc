@@ -397,6 +397,26 @@ eq('recorder_migration_sip_ok', count(state_case('v3', 5, 13, REG('registered'))
 eq('recorder_migration_sip_wan_down', count(state_case('v4', 5, 13,
 	{ voip: { wan_up: false, lines: [ { registrations: [ { state: 'failed' } ] } ] } }), 'sip_fail'), 0);
 
+// recorder_pon_id_*: Movistar sends none, so the first one is news, and a new
+// name means the line moved. The same name again says nothing.
+const PONID = (id, hex) => `count=5 class=C+ source=olt id=${id} id_hex=${hex} tol=356\n`;
+function pon_case(name, ids) {
+	let s = [];
+	for (let i = 0; i < length(ids); i++)
+		push(s, sample(T0 + 60 * i, { pon_id: ids[i] }));
+	return replay(name, { boot: T0, samples: s }).out;
+}
+let po = pon_case('p1', [ 'count=0\n', 'count=0\n' ]);
+eq('recorder_pon_id_none', count(types(po?.events), 'pon_id_new'), 0);
+eq('recorder_pon_id_none_summary', po?.pon, null);
+po = pon_case('p2', [ 'count=0\n', PONID('O011906', '4f'), PONID('O011906', '4f') ]);
+eq('recorder_pon_id_first', count(types(po?.events), 'pon_id_new'), 1);
+eq('recorder_pon_id_same', count(types(po?.events), 'pon_moved'), 0);
+eq('recorder_pon_id_summary', po?.pon?.id, 'O011906');
+ok('recorder_pon_id_loss', po?.pon?.loss_db > 20 && po?.pon?.loss_db < 30);
+po = pon_case('p3', [ PONID('O011906', '4f'), PONID('O022222', '50') ]);
+eq('recorder_pon_id_moved', count(types(po?.events), 'pon_moved'), 1);
+
 r = replay('save', { save: `${BASE}/good.json.gz`, samples: [ sample(T0), sample(T0 + 60) ] });
 ok('snapshot_roundtrip_saved', fs.stat(`${BASE}/good.json.gz`) != null);
 r = replay('load', { snapshot: `${BASE}/good.json.gz`, samples: [ sample(T0 + 120) ] });

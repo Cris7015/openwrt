@@ -418,6 +418,15 @@ return view.extend({
 			[ _('Deactivate from the OLT'), c.deactivate, _('kernel log') ]
 		];
 
+		/* Only when the OLT sends a PON-ID; Movistar's does not. */
+		if (L.isObject(s.pon))
+			rows = rows.concat([
+				[ _('PON port'), s.pon.id, 'PLOAM PON-ID' ],
+				[ _('ODN class'), s.pon['class'], 'PLOAM PON-ID' ],
+				[ _('OLT transmitted power'), (s.pon.tol_dbm != null) ? '%.1f dBm'.format(s.pon.tol_dbm) : null, 'PLOAM PON-ID' ],
+				[ _('Fiber loss'), (s.pon.loss_db != null) ? '%.1f dB'.format(s.pon.loss_db) : null, _('computed') ]
+			]);
+
 		/* lab debugfs counters are optional: no row when absent */
 		rows = rows.filter(function(r) {
 			return r[1] != null || r[2].indexOf('debugfs') != 0;
