@@ -211,7 +211,7 @@ function open_window(t) {
 
 function add_event(t, ev) {
 	let e = { t, type: ev.type, severity: ev.severity, msg: ev.msg };
-	for (let k in [ 'n', 'flags', 'delay', 'diff', 'delta', 'pon' ])	/* the browser words the event with these */
+	for (let k in [ 'n', 'flags', 'delay', 'diff', 'delta', 'pon', 'state', 'events', 'acted' ])	/* the browser words the event with these */
 		if (ev[k] != null)
 			e[k] = ev[k];
 	ring_push(st.events, e, cfg.events_max);
@@ -367,6 +367,14 @@ function on_klog(line, t) {
 	} else if (index(line, 'GPON TO2 expired in O6') >= 0) {
 		add_event(wall(up, t), { type: 'to2', severity: 'warn',
 			msg: 'No Popup within 100 ms (TO2); GPON restarting' });
+	} else if (index(line, 'GPON PHY latched a short downstream loss') >= 0) {
+		// LOS/ILLG latched by the PHY between two 250 ms link samples that
+		// both had the link up; logged at most once per kernel ratelimit
+		let m = match(line, /loss in (O[0-9]): events=(0x[0-9a-f]+)/);
+		add_event(wall(up, t), { type: 'phy_glitch', severity: 'warn',
+			state: m ? m[1] : null, events: m ? m[2] : null,
+			acted: index(line, 'treating it as LOS') >= 0,
+			msg: 'Signal lost for less than 250 ms, latched by the PHY' });
 	} else if (index(line, 'pppd') >= 0) {
 		if (index(line, 'authentication failed') >= 0)
 			wan_failed(t, 'wan_auth', 'crit',

@@ -165,6 +165,10 @@ return baseclass.extend({
 				? _('The OLT adjusted the equalization delay by %d bits').replace('%d', ev.delta)
 				: _('The OLT adjusted the equalization delay');
 		case 'to2':        return _('No Popup within 100 ms (TO2); the GPON link restarted');
+		case 'phy_glitch':
+			return ev.acted
+				? _('Signal lost for less than 250 ms; treated as a loss (O6)')
+				: _('Signal lost for less than 250 ms; only the PHY saw it');
 		case 'pon_id_new':
 			return _('The OLT started sending a PON-ID (%s): the line may have moved').replace('%s', ev.pon);
 		case 'pon_moved':  return _('The PON port changed, now %s').replace('%s', ev.pon);

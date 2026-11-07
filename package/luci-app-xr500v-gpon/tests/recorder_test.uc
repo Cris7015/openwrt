@@ -112,10 +112,16 @@ r = replay('relock', { boot: T0 + 240, samples, klog: [
 	{ t: T0 + 260, line: `[   20.000000] ${XM}GPON O6: PHY psync-to-SOF delay 39190, -3 from the O5 entry of this session` },
 	{ t: T0 + 260, line: `[   20.050000] ${XM}GPON O5: PHY psync-to-SOF delay 39199, 6 from the O5 entry of this session` },
 	{ t: T0 + 270, line: `[   30.000000] ${XM}GPON O5 EqD adjustment: current=266532 new=266550 delta=18` },
-	{ t: T0 + 280, line: `[   40.000000] ${XM}GPON TO2 expired in O6, resetting` }
+	{ t: T0 + 280, line: `[   40.000000] ${XM}GPON TO2 expired in O6, resetting` },
+	{ t: T0 + 290, line: `[   50.000000] ${XM}GPON PHY latched a short downstream loss in O5: events=0x21` },
+	{ t: T0 + 295, line: `[   55.000000] ${XM}GPON PHY latched a short downstream loss in O5: events=0x40, treating it as LOS` }
 ] });
-let relock = filter(r.out?.events || [], (e) => index([ 'o6', 'phy_shift', 'eqd_adjust', 'to2' ], e.type) >= 0);
-eq('recorder_replay_relock_types', join(',', types(relock)), 'o6,phy_shift,eqd_adjust,to2');
+let relock = filter(r.out?.events || [], (e) => index([ 'o6', 'phy_shift', 'eqd_adjust', 'to2', 'phy_glitch' ], e.type) >= 0);
+eq('recorder_replay_relock_types', join(',', types(relock)), 'o6,phy_shift,eqd_adjust,to2,phy_glitch,phy_glitch');
+eq('recorder_replay_glitch_events', relock[4]?.events, '0x21');
+eq('recorder_replay_glitch_state', relock[4]?.state, 'O5');
+eq('recorder_replay_glitch_count_only', relock[4]?.acted, false);
+eq('recorder_replay_glitch_acted', relock[5]?.acted, true);
 eq('recorder_replay_relock_o6_diff', relock[0]?.diff, -3);
 eq('recorder_replay_relock_shift', relock[1]?.diff, 6);
 eq('recorder_replay_relock_shift_severity', relock[1]?.severity, 'warn');

@@ -683,6 +683,14 @@ msgid "Signal lost for an instant (O6); waiting up to 100 ms for the OLT"
 msgstr "La señal se cortó un instante (O6); se espera hasta 100 ms a la OLT"
 
 #: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Signal lost for less than 250 ms; treated as a loss (O6)"
+msgstr "La señal se cortó menos de 250 ms; se trató como pérdida (O6)"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
+msgid "Signal lost for less than 250 ms; only the PHY saw it"
+msgstr "La señal se cortó menos de 250 ms; solo lo vio el PHY"
+
+#: htdocs/luci-static/resources/xr500v-gpon/analysis.js
 msgid "Back in O5 without new ranging; the PHY delay moved %d units of 3.2 ns"
 msgstr "De vuelta en O5 sin nuevo ranging; el retardo del PHY se movió %d unidades de 3,2 ns"
 
