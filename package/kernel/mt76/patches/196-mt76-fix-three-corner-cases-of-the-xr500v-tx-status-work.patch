@@ -1,0 +1,87 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Subject: [PATCH] wifi: mt76: fix three corner cases of the XR500v TX status
+ work
+
+Found in a review of the parameters /etc/modules.d/xr500v-wifi turns on
+(192):
+
+- mt76_dma_tx_cleanup() read tx_ddone_check twice, so writing 0 to the
+  parameter between the test and the modulo divided by zero in softirq.
+  Read it once.
+
+- mt76_dma_cleanup() flushes the TX rings after mt76_unregister_device()
+  has emptied the deferred status queue. With txs_defer_batch the
+  status of those frames went back to the queue and nobody flushed it
+  again, so unloading the driver with frames on the rings leaked them.
+  Flush the queue after the TX rings.
+
+- 192 made mt76x02_mac_work() poll the TX status FIFO, outside
+  dev->mutex, while the watchdog reset clears the stations under that
+  mutex (memset of the msta, idr_destroy). Poll under the mutex, and
+  skip it once the reset has begun.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/dma.c b/dma.c
+--- a/dma.c
++++ b/dma.c
+@@ -486,6 +486,7 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev
+ 	struct mt76_queue_entry entry;
+ 	int last, tail, done = 0, rereads = 0;
+ 	int max_reread = READ_ONCE(tx_max_reread);
++	unsigned int ddone_check;
+ 	bool ddone;
+ 
+ 	if (!q || !q->ndesc)
+@@ -517,8 +518,8 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev
+ 			last = mt76_dma_read_dma_idx(q, -1);
+ 			txc_verify++;
+ 			txc_verify_more += last != tail;
+-		} else if (READ_ONCE(tx_ddone_check) &&
+-			   !(++txc_ddone_sweeps % READ_ONCE(tx_ddone_check))) {
++		} else if ((ddone_check = READ_ONCE(tx_ddone_check)) &&
++			   !(++txc_ddone_sweeps % ddone_check)) {
+ 			int idx = mt76_dma_read_dma_idx(q, -1);
+ 
+ 			if (idx >= 0 &&
+@@ -1414,6 +1415,12 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
+ 		mt76_dma_tx_cleanup(dev, dev->q_mcu[i], true);
+ 
++	/*
++	 * The flushes above queue the status of the frames still on the rings
++	 * for rx_lock; with txs_defer_batch nothing would report them now.
++	 */
++	mt76_tx_status_flush_deferred(dev, true);
++
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
+diff --git a/mt76x02_mac.c b/mt76x02_mac.c
+--- a/mt76x02_mac.c
++++ b/mt76x02_mac.c
+@@ -1344,16 +1344,19 @@ void mt76x02_mac_work(struct work_struct
+ 	if (dev->ed_monitor)
+ 		mt76x02_edcca_check(dev);
+ 
+-	mutex_unlock(&dev->mt76.mutex);
+-
+ 	/*
+ 	 * Without the TX status interrupt (tx_stat_irq=0) the FIFO is only
+ 	 * read on TX activity: the status of the last frames before the link
+-	 * goes idle would wait there until the 250 ms timeout below.
++	 * goes idle would wait there until the 250 ms timeout below. Under
++	 * the mutex, so it never runs while the watchdog reset clears the
++	 * stations, and not at all once that reset has begun.
+ 	 */
+-	if (mt76_is_mmio(&dev->mt76))
++	if (mt76_is_mmio(&dev->mt76) &&
++	    !test_bit(MT76_RESET, &dev->mphy.state))
+ 		mt76x02_mac_poll_tx_status(dev, false);
+ 
++	mutex_unlock(&dev->mt76.mutex);
++
+ 	mt76_tx_status_check(&dev->mt76, false);
+ 
+ 	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
