@@ -1,5 +1,5 @@
 From: Cristian Papa <pcristian292@gmail.com>
-Subject: [PATCH] mt76: XR500v WiFi lab of 25-oct (TX status, completions, RX)
+Subject: [PATCH] mt76: XR500v WiFi throughput work of 25-oct (TX status, completions, RX)
 
 Lab state of the 25-oct WiFi work, which the wifiagents image carried
 only as build_dir edits (lost when 190/191 made the package re-prepare).

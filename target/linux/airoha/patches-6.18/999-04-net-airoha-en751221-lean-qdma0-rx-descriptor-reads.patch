@@ -1,5 +1,5 @@
 From: Cristian Papa <pcristian292@gmail.com>
-Subject: [PATCH] lab: net: airoha: en751221: read only the QDMA0 RX descriptor words in use
+Subject: [PATCH] net: airoha: en751221: read only the QDMA0 RX descriptor words in use
 
 On QDMA0 (LAN and WHNAT downstream) econet_qdma_rx_process_one() only
 uses the info word and msg.erx.bitfield_0 (CRSN, SPORT, PPE entry and

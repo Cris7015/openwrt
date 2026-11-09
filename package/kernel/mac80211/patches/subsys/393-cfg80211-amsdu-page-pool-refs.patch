@@ -1,5 +1,5 @@
 From: Cristian Papa <pcristian292@gmail.com>
-Subject: [PATCH] cfg80211: XR500v lab: A-MSDU subframes keep page_pool references
+Subject: [PATCH] cfg80211: XR500v: A-MSDU subframes keep page_pool references
 
 amsdu_pp_ref (0644, off by default): __frame_add_frag took get_page() on
 page_pool pages, so the pool released them on every A-MSDU (xarray +

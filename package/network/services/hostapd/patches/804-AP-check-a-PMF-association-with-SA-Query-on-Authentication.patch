@@ -1,5 +1,5 @@
 From: Cristian Papa <pcristian292@gmail.com>
-Subject: [PATCH] lab: AP: check a PMF association with SA Query on Authentication
+Subject: [PATCH] AP: check a PMF association with SA Query on Authentication
 
 With PMF, handle_auth() keeps the station entry of an associated STA, so
 that an unprotected Authentication frame cannot tear down a protected
