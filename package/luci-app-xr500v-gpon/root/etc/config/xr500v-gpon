@@ -7,7 +7,7 @@ config monitor 'main'
 	option event_writes_per_day '100'
 	option windows_per_day '10'
 	# lab eye scan every N minutes while in O5 (needs xr500v_eye.ko); 0 = off
-	option eye_minutes '60'
+	option eye_minutes '0'
 
 config thresholds 'thresholds'
 	option rx_warn_dbm '-25'

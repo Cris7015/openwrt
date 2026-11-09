@@ -3,7 +3,7 @@
 // how many show their event in the box.
 async (page) => {
   page.xgFixture = 'normal';
-  await page.goto('http://192.168.68.222/cgi-bin/luci/admin/network/omci/fiber');
+  await page.goto('http://192.168.1.1/cgi-bin/luci/admin/network/omci/fiber');
   await page.evaluate(async () => { const v = L.env.resource_version; for (const p of ['view/xr500v-gpon/fiber.js', 'xr500v-gpon/graph.js', 'xr500v-gpon/analysis.js']) await fetch('/luci-static/resources/' + p + '?v=' + v, { cache: 'reload' }); });
   await page.reload();
   await page.click('.cbi-tabmenu li[data-tab="graphs"] a');
