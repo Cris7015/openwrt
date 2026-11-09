@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Mon, 9 Nov 2026 19:30:00 -0300
+Subject: [PATCH] net: airoha: xpon: forget a GEM port OMCI deleted even if the table
+ write failed
+
+airoha_gpon_omci_hw_set_gem_port() returned before clearing the port in
+omci_gems when writing the GEM table failed. The MIB reset ignores that
+error and drops the ME anyway, so the bit stayed set with nothing behind
+it, and since 999-59 gpon_restore_omci_gems() enabled that port again on
+every OMCC up until a reboot. Clear the bit for a delete whatever the
+write returned; the error still reaches the caller.
+
+Found in a review of 999-58..67.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2843,13 +2843,20 @@ int airoha_gpon_omci_hw_set_gem_port(voi
+ 	 */
+ 	ret = __gpon_set_gem_port_hw(priv, gem_port_id, valid, encrypted,
+ 				     true);
+-	if (ret)
++	if (ret && valid)
+ 		return ret;
+ 
+-	/* Survives session restarts, like the agent's MIB. */
++	/*
++	 * Survives session restarts, like the agent's MIB. A port OMCI
++	 * deleted leaves the set even when the table write failed: the agent
++	 * drops the ME either way, and gpon_restore_omci_gems() would enable
++	 * the port again on every OMCC up.
++	 */
+ 	mutex_lock(&priv->gem_mib_lock);
+ 	__assign_bit(gem_port_id, priv->omci_gems, valid);
+ 	mutex_unlock(&priv->gem_mib_lock);
++	if (ret)
++		return ret;
+ 
+ 	gpon_refresh_netdev_link(priv, false);
+ 	dev_info(priv->dev,
