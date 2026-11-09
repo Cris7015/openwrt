@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Mon, 9 Nov 2026 19:40:00 -0300
+Subject: [PATCH] net: airoha: xpon: fold the GEM port counters in before the session
+ stop
+
+gpon_disable() cleared mac_enabled before gpon_clear_hw_tables(), so the
+accumulate that runs when the GEM table changes returned early and the
+counts since the last poll (up to a minute) were dropped when the slots
+were freed. With gpon_stop_clear_gems on by default (999-67) that
+happens on every session stop, and ME 341 under-reported the 15-minute
+interval holding the restart. Accumulate first, while the MAC runs.
+
+Found in a review of 999-58..67.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -3970,6 +3970,18 @@ static void gpon_disable(struct xpon_pri
+ 		gpon_read(priv, GPON_INT_STATUS));
+ 
+ 	/*
++	 * Fold the per-GEM MIB in while the MAC still runs: the stop clears
++	 * the GEM table and the rows are reassigned on the next session, so
++	 * the last poll window (up to a minute) would be lost from ME 341.
++	 */
++	if (mac_enabled) {
++		mutex_lock(&priv->gem_mib_lock);
++		if (priv->gem_mib_enabled)
++			gpon_mib_accumulate_locked(priv);
++		mutex_unlock(&priv->gem_mib_lock);
++	}
++
++	/*
+ 	 * Mask the MAC before cancelling queued FSM work. The Linux IRQ line
+ 	 * remains enabled so no activation edge is lost across a restart.
+ 	 */
