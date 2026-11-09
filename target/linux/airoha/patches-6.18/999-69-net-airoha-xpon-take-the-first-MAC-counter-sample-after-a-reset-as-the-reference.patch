@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Mon, 9 Nov 2026 19:35:00 -0300
+Subject: [PATCH] net: airoha: xpon: take the first MAC counter sample after a reset as
+ the reference
+
+The 64-bit GPON_DBG totals (999-66) take a drop below a previous value
+of 0xf0000000 or more for a wrap. With the MAC reset at session stop on
+by default (999-67), a session long enough to bring rx_gtc or tx_bursts
+near the top adds up to 2^28 of nothing after the next restart. Whether
+the reset zeroes these counters is not known, so after a GPON MAC reset
+(session start on SoCs that reset there, and session stop) the first
+sample only becomes the new reference. Nothing is added for the moment
+between the reset and that sample, while the session is coming up.
+
+The flag lives under mac_cnt_lock, which only GPON mode initialises, so
+it is set from the GPON paths and not from airoha_xpon_reset_mac(),
+which EPON uses too.
+
+Found in a review of 999-58..67.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -529,6 +529,7 @@ struct xpon_priv {
+ 	u64			mac_cnt_total[8];
+ 	u32			mac_cnt_prev[8];
+ 	u8			mac_cnt_saturated;
++	bool			mac_cnt_rebase;
+ 	u64			bip_pending;
+ 	unsigned long		bip_next;
+ 	/* GEM delineation losses seen by the ISR (counted, not logged) */
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -2137,6 +2137,7 @@ static void gpon_mac_counters_sample(str
+ 	unsigned long flags;
+ 	unsigned int i;
+ 	u32 cur, prev;
++	bool rebase;
+ 
+ 	BUILD_BUG_ON(ARRAY_SIZE(gpon_mac_cnt_regs) !=
+ 		     ARRAY_SIZE(priv->mac_cnt_total));
+@@ -2146,8 +2147,21 @@ static void gpon_mac_counters_sample(str
+ 		return;
+ 
+ 	spin_lock_irqsave(&priv->mac_cnt_lock, flags);
++	rebase = priv->mac_cnt_rebase;
+ 	for (i = 0; i < ARRAY_SIZE(gpon_mac_cnt_regs); i++) {
+ 		cur = gpon_read(priv, gpon_mac_cnt_regs[i]);
++		if (rebase) {
++			/*
++			 * The MAC was reset since the last sample. Whether the
++			 * reset zeroes these counters is not known, so the first
++			 * reading after it is only the new reference; a prev
++			 * near the top would otherwise be taken for a wrap.
++			 */
++			priv->mac_cnt_prev[i] = cur;
++			if (cur != U32_MAX)
++				priv->mac_cnt_saturated &= ~BIT(i);
++			continue;
++		}
+ 		prev = priv->mac_cnt_prev[i];
+ 		if (cur >= prev || prev >= GPON_MAC_CNT_WRAP_FLOOR)
+ 			priv->mac_cnt_total[i] += (u32)(cur - prev);
+@@ -2159,6 +2173,18 @@ static void gpon_mac_counters_sample(str
+ 			priv->mac_cnt_saturated &= ~BIT(i);
+ 		priv->mac_cnt_prev[i] = cur;
+ 	}
++	if (rebase)
++		priv->mac_cnt_rebase = false;
++	spin_unlock_irqrestore(&priv->mac_cnt_lock, flags);
++}
++
++/* Called after a GPON MAC reset; mac_cnt_lock exists only in GPON mode. */
++static void gpon_mac_counters_rebase(struct xpon_priv *priv)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&priv->mac_cnt_lock, flags);
++	priv->mac_cnt_rebase = true;
+ 	spin_unlock_irqrestore(&priv->mac_cnt_lock, flags);
+ }
+ 
+@@ -3641,6 +3667,7 @@ static int gpon_enable(struct xpon_priv
+ 		ret = airoha_xpon_reset_mac(priv);
+ 		if (ret)
+ 			goto err_disable_frontend;
++		gpon_mac_counters_rebase(priv);
+ 	}
+ 
+ 	/*
+@@ -3916,6 +3943,7 @@ static void gpon_stop_reset_mac(struct x
+ 	ret = reset_control_reset(priv->mac_reset);
+ 	if (ret)
+ 		dev_warn(priv->dev, "GPON MAC reset failed: %d\n", ret);
++	gpon_mac_counters_rebase(priv);
+ 	usleep_range(1000, 2000);
+ 	/* gpon_dev_reset_GPON_MAC() stops the MBI again after the pulse. */
+ 	gpon_set_bits(priv, GPON_MBI_MPI_STOP, MBI_RX_STOP | MBI_TX_STOP);
