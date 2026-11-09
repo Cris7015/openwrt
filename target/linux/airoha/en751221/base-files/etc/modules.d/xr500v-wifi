@@ -1,0 +1,4 @@
+mt76x2e linear_tx=0 amsdu_no_odd=1
+mt76x02-lib rx_buf_size=4096 tx_status_interval=16 txw_poll_fifo=N tx_delay_int=1 tx_stat_irq=0 txs_complete_poll=0 tx_wb_ddone=1
+mt76 txs_defer_batch=1 rx_batch=32 tx_ddone=1
+cfg80211 amsdu_pp_ref=1
