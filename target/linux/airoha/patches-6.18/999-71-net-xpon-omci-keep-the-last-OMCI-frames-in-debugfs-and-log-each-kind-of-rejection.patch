@@ -1,0 +1,430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Mon, 9 Nov 2026 22:00:00 -0300
+Subject: [PATCH] net: xpon: omci: keep the last OMCI frames in debugfs and log each
+ kind of rejection
+
+There was no way to see what an OLT asks of the agent short of dynamic
+debug or a capture of the OMCC, and neither is available on a router in
+service. Keep the last 64 OMCI frames, received and sent, in a ring and
+show them decoded in /sys/kernel/debug/omci/trace<id>: time as in dmesg,
+TCI, message type, ME class and instance, the result of a response and
+the first content bytes. The content of ME 148 (authentication security
+method), which can carry user names and passwords, is not kept, also when
+a MIB upload next carries it.
+
+Also log, once per kind (ME class, message type, result), each answer
+that is not a success, with the names of the message type, the ME and
+the result.
+
+The idea of both comes from omcid (reject_report and the frames ubus
+method), not its code.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/net/xpon/omci/internal.h
++++ b/net/xpon/omci/internal.h
+@@ -154,6 +154,9 @@ struct omci_agent_config {
+ 	u8 reboot_source;
+ };
+ 
++/* Kinds of rejection already logged, see omci_agent_report_reject_locked() */
++#define OMCI_REJECTS_LOGGED		64
++
+ struct omci_agent {
+ 	/* Serializes configuration, MIB and transaction state. */
+ 	struct mutex lock;
+@@ -211,6 +214,41 @@ struct omci_agent {
+ 	atomic64_t ani_g_level_gets;
+ 	atomic64_t ani_g_tests;
+ 	atomic64_t mib_uploads;
++
++	/* class << 16 | action << 8 | result, under @lock */
++	u32 rejects_logged[OMCI_REJECTS_LOGGED];
++	unsigned int rejects_logged_count;
++};
++
++/*
++ * The last OMCI frames in both directions, for /sys/kernel/debug/omci/trace<id>.
++ * Each entry keeps the first OMCI_TRACE_BYTES of the PDU: a whole baseline
++ * message without its trailer, or the header and the start of an extended one.
++ */
++#define OMCI_TRACE_LEN			64
++#define OMCI_TRACE_BYTES		48
++#define OMCI_TRACE_F_CRC		BIT(0)
++#define OMCI_TRACE_F_SEND_FAILED	BIT(1)
++#define OMCI_TRACE_F_NOT_KEPT		BIT(2)
++
++struct omci_trace_entry {
++	u64 ns;
++	u16 len;
++	u8 kept;
++	u8 flags;
++	bool tx;
++	u8 data[OMCI_TRACE_BYTES];
++};
++
++struct dentry;
++
++struct omci_trace {
++	/* Protects the ring, head and counts: RX work and senders */
++	spinlock_t lock;
++	unsigned int head;
++	u64 count[2];
++	struct omci_trace_entry ring[OMCI_TRACE_LEN];
++	struct dentry *file;
+ };
+ 
+ struct omci_device {
+@@ -252,10 +290,16 @@ struct omci_device {
+ 	atomic64_t tx_bytes;
+ 	atomic64_t tx_errors;
+ 
++	struct omci_trace trace;
+ 	struct omci_agent agent;
+ };
+ 
+ int omci_validate_tx(struct omci_device *odev, struct sk_buff *skb);
++void omci_trace_record(struct omci_device *odev, bool tx, const u8 *data,
++		       size_t len, u8 flags);
++const char *omci_msg_type_name(u8 message_type);
++const char *omci_result_name(u8 result);
++bool omci_msg_type_has_result(u8 message_type);
+ int omci_device_xmit(struct omci_device *odev, const void *data, size_t len);
+ void omci_device_notify(struct omci_device *odev, u8 event);
+ 
+--- a/net/xpon/omci/core.c
++++ b/net/xpon/omci/core.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/atomic.h>
++#include <linux/debugfs.h>
+ #include <linux/device.h>
+ #include <linux/err.h>
+ #include <linux/list.h>
+@@ -14,6 +15,8 @@
+ #include <linux/netdevice.h>
+ #include <linux/netlink.h>
+ #include <linux/notifier.h>
++#include <linux/sched/clock.h>
++#include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/unaligned.h>
+ #include <net/genetlink.h>
+@@ -285,6 +288,189 @@ out_unlock_devices:
+ 	return ret;
+ }
+ 
++static struct dentry *omci_debugfs_root;
++
++static const char *const omci_msg_type_names[32] = {
++	[4] = "Create",
++	[6] = "Delete",
++	[8] = "Set",
++	[9] = "Get",
++	[11] = "Get all alarms",
++	[12] = "Get all alarms next",
++	[13] = "MIB upload",
++	[14] = "MIB upload next",
++	[15] = "MIB reset",
++	[16] = "Alarm",
++	[17] = "AVC",
++	[18] = "Test",
++	[19] = "Start SW download",
++	[20] = "Download section",
++	[21] = "End SW download",
++	[22] = "Activate image",
++	[23] = "Commit image",
++	[24] = "Synchronize time",
++	[25] = "Reboot",
++	[26] = "Get next",
++	[27] = "Test result",
++	[28] = "Get current data",
++	[29] = "Set table",
++};
++
++const char *omci_msg_type_name(u8 message_type)
++{
++	return omci_msg_type_names[message_type & 0x1f] ?: "unknown type";
++}
++
++/* G.988 11.2.4.1; 8 is not assigned */
++static const char *const omci_result_names[] = {
++	"success", "processing error", "not supported", "parameter error",
++	"unknown ME", "unknown ME instance", "device busy", "instance exists",
++	"result 8", "attribute(s) failed or unknown",
++};
++
++const char *omci_result_name(u8 result)
++{
++	return result < ARRAY_SIZE(omci_result_names) ?
++	       omci_result_names[result] : "unknown result";
++}
++
++/* Responses whose first content byte is a result, reason */
++bool omci_msg_type_has_result(u8 message_type)
++{
++	switch (message_type & 0x1f) {
++	case 4: case 6: case 8: case 9: case 15: case 18: case 19:
++	case 20: case 21: case 22: case 23: case 24: case 25: case 26:
++	case 28: case 29:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* ME 148, authentication security method: user names and passwords */
++#define OMCI_TRACE_SECRET_CLASS		148
++
++static bool omci_trace_secret(const u8 *data, size_t len, size_t header)
++{
++	if (len < 8)
++		return false;
++	if (get_unaligned_be16(data + 4) == OMCI_TRACE_SECRET_CLASS)
++		return true;
++	/* A MIB upload next response carries the uploaded ME's attributes */
++	return (data[2] & 0x3f) == (0x20 | 14) && len >= header + 2 &&
++	       get_unaligned_be16(data + header) == OMCI_TRACE_SECRET_CLASS;
++}
++
++void omci_trace_record(struct omci_device *odev, bool tx, const u8 *data,
++		       size_t len, u8 flags)
++{
++	struct omci_trace *trace = &odev->trace;
++	struct omci_trace_entry *entry;
++	unsigned long irqflags;
++	size_t header, kept;
++
++	header = len >= 4 && data[3] == OMCI_EXTENDED_DEV_ID ?
++		 OMCI_EXTENDED_HEADER_LEN : 8;
++	kept = min_t(size_t, len, OMCI_TRACE_BYTES);
++	if (omci_trace_secret(data, len, header)) {
++		kept = min(kept, header);
++		flags |= OMCI_TRACE_F_NOT_KEPT;
++	}
++
++	spin_lock_irqsave(&trace->lock, irqflags);
++	entry = &trace->ring[trace->head];
++	trace->head = (trace->head + 1) % OMCI_TRACE_LEN;
++	trace->count[tx]++;
++	entry->ns = local_clock();
++	entry->len = min_t(size_t, len, U16_MAX);
++	entry->kept = kept;
++	entry->flags = flags;
++	entry->tx = tx;
++	memcpy(entry->data, data, kept);
++	spin_unlock_irqrestore(&trace->lock, irqflags);
++}
++
++static void omci_trace_show_entry(struct seq_file *s,
++				  const struct omci_trace_entry *entry,
++				  u8 profile)
++{
++	const struct omci_me_desc *desc;
++	u64 secs = entry->ns;
++	u32 rem = do_div(secs, NSEC_PER_SEC);
++	size_t header;
++	u16 class_id;
++	u8 type;
++
++	seq_printf(s, "[%5llu.%06u] %s", secs, (u32)(rem / NSEC_PER_USEC),
++		   entry->tx ? "TX" : "RX");
++	if (entry->kept < 8) {
++		seq_printf(s, " %u bytes: %*ph\n", entry->len, entry->kept,
++			   entry->data);
++		return;
++	}
++
++	type = entry->data[2];
++	class_id = get_unaligned_be16(entry->data + 4);
++	desc = omci_me_lookup_profile(profile, class_id);
++	header = entry->data[3] == OMCI_EXTENDED_DEV_ID ?
++		 OMCI_EXTENDED_HEADER_LEN : 8;
++	seq_printf(s, " tci %04x %s%s%s %s (%u) %04x len %u%s",
++		   get_unaligned_be16(entry->data), omci_msg_type_name(type),
++		   type & 0x40 ? " AR" : "", type & 0x20 ? " AK" : "",
++		   desc ? desc->name : "ME", class_id,
++		   get_unaligned_be16(entry->data + 6), entry->len,
++		   header == OMCI_EXTENDED_HEADER_LEN ? " extended" : "");
++	if ((type & 0x20) && omci_msg_type_has_result(type) &&
++	    entry->kept > header)
++		seq_printf(s, " result %u %s", entry->data[header],
++			   omci_result_name(entry->data[header]));
++	if (entry->flags & OMCI_TRACE_F_CRC)
++		seq_puts(s, " crc-error");
++	if (entry->flags & OMCI_TRACE_F_SEND_FAILED)
++		seq_puts(s, " send-failed");
++	if (entry->flags & OMCI_TRACE_F_NOT_KEPT)
++		seq_puts(s, " content-not-kept");
++	if (entry->kept > header)
++		seq_printf(s, " | %*ph", (int)(entry->kept - header),
++			   entry->data + header);
++	seq_putc(s, '\n');
++}
++
++static int omci_trace_show(struct seq_file *s, void *unused)
++{
++	struct omci_device *odev = s->private;
++	struct omci_trace *trace = &odev->trace;
++	struct omci_trace_entry *ring;
++	unsigned long irqflags;
++	unsigned int head, i, n;
++	u64 rx, tx;
++	u8 profile;
++
++	ring = kmalloc(sizeof(trace->ring), GFP_KERNEL);
++	if (!ring)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&trace->lock, irqflags);
++	memcpy(ring, trace->ring, sizeof(trace->ring));
++	head = trace->head;
++	rx = trace->count[0];
++	tx = trace->count[1];
++	spin_unlock_irqrestore(&trace->lock, irqflags);
++
++	n = min_t(u64, rx + tx, OMCI_TRACE_LEN);
++	seq_printf(s,
++		   "# %llu OMCI frames received, %llu sent; the last %u, oldest first, times as in dmesg.\n"
++		   "# The content of ME %u (authentication security method) is not kept.\n",
++		   rx, tx, n, OMCI_TRACE_SECRET_CLASS);
++	profile = READ_ONCE(odev->agent.profile_effective);
++	for (i = 0; i < n; i++)
++		omci_trace_show_entry(s, &ring[(head + OMCI_TRACE_LEN - n + i) %
++					       OMCI_TRACE_LEN], profile);
++	kfree(ring);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(omci_trace);
++
+ int omci_validate_tx(struct omci_device *odev, struct sk_buff *skb)
+ {
+ 	const u8 *data = skb->data;
+@@ -352,6 +538,8 @@ int omci_device_xmit(struct omci_device
+ 
+ 	tx_len = tx_skb->len;
+ 	ret = odev->ops->xmit(odev, tx_skb, gem_port_id);
++	omci_trace_record(odev, true, data, tx_len,
++			  ret ? OMCI_TRACE_F_SEND_FAILED : 0);
+ 	if (ret)
+ 		goto free_skb;
+ 
+@@ -420,6 +608,8 @@ static int omci_cmd_tx(struct sk_buff *s
+ 
+ 	tx_len = tx_skb->len;
+ 	ret = odev->ops->xmit(odev, tx_skb, gem_port_id);
++	omci_trace_record(odev, true, nla_data(pdu_attr), tx_len,
++			  ret ? OMCI_TRACE_F_SEND_FAILED : 0);
+ 	if (ret)
+ 		goto free_tx_skb;
+ 
+@@ -1185,6 +1375,10 @@ static void omci_rx_work(struct work_str
+ 		}
+ 		spin_unlock_bh(&odev->state_lock);
+ 
++		omci_trace_record(odev, false, skb->data, skb->len,
++				  cb->flags & OMCI_F_CRC_ERROR ?
++				  OMCI_TRACE_F_CRC : 0);
++
+ 		/*
+ 		 * The OMCI trailer carries a CRC-32 and G.988 expects a frame
+ 		 * that fails it to be discarded, the OLT retransmitting it.
+@@ -1339,6 +1533,7 @@ omci_device_register(struct xpon_device
+ 	mutex_init(&odev->lifecycle_lock);
+ 	mutex_init(&odev->owner_lock);
+ 	spin_lock_init(&odev->state_lock);
++	spin_lock_init(&odev->trace.lock);
+ 	skb_queue_head_init(&odev->rx_queue);
+ 	INIT_WORK(&odev->rx_work, omci_rx_work);
+ 	odev->xpon = xpon;
+@@ -1371,6 +1566,17 @@ omci_device_register(struct xpon_device
+ 
+ 	mutex_lock(&omci_devices_lock);
+ 	list_add_tail(&odev->list, &omci_devices);
++	/* Devices can register before module_init, see the link order. */
++	if (!omci_debugfs_root)
++		omci_debugfs_root = debugfs_create_dir("omci", NULL);
++	{
++		char name[16];
++
++		snprintf(name, sizeof(name), "trace%u", odev->id);
++		odev->trace.file = debugfs_create_file(name, 0400,
++						       omci_debugfs_root, odev,
++						       &omci_trace_fops);
++	}
+ 	mutex_unlock(&omci_devices_lock);
+ 
+ 	dev_info(odev->parent, "registered OMCI agent device %u\n", odev->id);
+@@ -1433,6 +1639,8 @@ void omci_device_unregister(struct omci_
+ 	mutex_lock(&omci_devices_lock);
+ 	list_del_init(&odev->list);
+ 	mutex_unlock(&omci_devices_lock);
++	/* Waits for a reader of the trace still holding @odev */
++	debugfs_remove(odev->trace.file);
+ 	omci_device_stop(odev);
+ 
+ 	cancel_work_sync(&odev->rx_work);
+@@ -1703,6 +1911,7 @@ static void __exit omci_exit(void)
+ 	netlink_unregister_notifier(&omci_netlink_nb);
+ 	genl_unregister_family(&omci_genl_family);
+ 	omci_sysfs_exit();
++	debugfs_remove_recursive(omci_debugfs_root);
+ }
+ module_exit(omci_exit);
+ 
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -5163,6 +5163,39 @@ omci_agent_cache_exchange_locked(struct
+ 	return 0;
+ }
+ 
++/*
++ * Log the first answer of each kind (ME class, message type, result) that
++ * is not a success, with names: what the OLT asks that we refuse, without
++ * dynamic debug or a capture. Later ones of the same kind are not logged.
++ */
++static void
++omci_agent_report_reject_locked(struct omci_device *odev,
++				const struct omci_wire_request *request,
++				u8 result)
++{
++	struct omci_agent *agent = &odev->agent;
++	const struct omci_me_desc *desc;
++	u8 action = request->message_type & 0x1f;
++	u32 key = (u32)request->class_id << 16 | action << 8 | result;
++	unsigned int i;
++
++	for (i = 0; i < agent->rejects_logged_count; i++)
++		if (agent->rejects_logged[i] == key)
++			return;
++	if (agent->rejects_logged_count == OMCI_REJECTS_LOGGED)
++		return;
++	agent->rejects_logged[agent->rejects_logged_count++] = key;
++
++	desc = omci_me_lookup(agent, request->class_id);
++	dev_notice(odev->parent,
++		   "OMCI %s on %s (class %u) instance %#06x answered %s (%u)%s\n",
++		   omci_msg_type_name(action), desc ? desc->name : "ME",
++		   request->class_id, request->entity_id,
++		   omci_result_name(result), result,
++		   agent->rejects_logged_count == OMCI_REJECTS_LOGGED ?
++		   "; further kinds are not logged" : "");
++}
++
+ static void
+ omci_agent_report_operational(struct omci_device *odev, bool operational)
+ {
+@@ -5249,6 +5282,10 @@ void omci_agent_receive(struct omci_devi
+ 		}
+ 		omci_agent_cache_exchange_locked(agent, skb, response,
+ 						 response_len, fake);
++		if (content_len && content[0] &&
++		    omci_msg_type_has_result(request.message_type))
++			omci_agent_report_reject_locked(odev, &request,
++							content[0]);
+ 	}
+ 	mutex_unlock(&agent->lock);
+ 
