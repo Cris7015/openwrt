@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 04:38:31 -0300
+Subject: [PATCH] net: airoha: en751221: isolate the ports of the external
+ MT7530
+
+The reset of the companion MT7530 leaves the port matrix of every port
+at its default, all ports, and nothing changed it: from the moment the
+links come up in U-Boot until the OS resets and sets the switch up,
+about twelve seconds later on the Archer XR500v, the LAN ports forward
+to each other. Ports that are cabled to different networks, here the
+house LAN on one and the WAN side VLAN on two others, are bridged
+together for that time on every boot. A switch with loop prevention
+downstream answered by shutting a port off for a minute.
+
+Set the port matrix of ports 0 to 5 to the CPU port right after the
+reset. U-Boot only needs each port to reach the CPU port, which keeps
+its matrix and still reaches all of them.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/airoha_eth.c
++++ b/drivers/net/airoha_eth.c
+@@ -374,6 +374,7 @@
+ #define MT7530_PBUS_PAGE_REG		31
+ #define MT7530_PBUS_HIGH_REG		16
+ #define MT7530_EXT_PHY_NUM		5
++#define MT7530_EXT_CPU_PORT		6
+ #define MT7530_EXT_PHY_ID1		0x03a2
+ #define MT7530_EXT_PHY_ID2		0x9412
+ 
+@@ -2311,6 +2312,23 @@ static int en751221_mt7530_init(struct a
+ 		return ret;
+ 	udelay(100);
+ 
++	/*
++	 * The reset leaves every port forwarding to all the others, so the
++	 * LAN ports bridge whatever networks they are cabled to until the OS
++	 * sets the switch up, several seconds later.  U-Boot only needs each
++	 * of them to reach the CPU port.
++	 */
++	for (i = 0; i < MT7530_EXT_CPU_PORT; i++) {
++		ret = en751221_mt7530_pbus_read(eth, SWITCH_PCR(i), &reg);
++		if (ret)
++			return ret;
++		reg &= ~SWITCH_PCR_MATRIX;
++		reg |= FIELD_PREP(SWITCH_PCR_MATRIX, BIT(MT7530_EXT_CPU_PORT));
++		ret = en751221_mt7530_pbus_write(eth, SWITCH_PCR(i), reg);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = en751221_mt7530_pbus_read(eth, MT7530_FC_CTRL, &reg);
+ 	if (ret)
+ 		return ret;
