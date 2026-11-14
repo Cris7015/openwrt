@@ -1,0 +1,60 @@
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 05:34:31 -0300
+Subject: [PATCH] mt76x02: read the packet numbers after the MAC has stopped
+
+A watchdog restart reads the packet number each hardware key reached
+(MT_WCID_IV) into the key, and mac80211 installs the keys again from
+there. mt76x02_reset_state() read them first thing, with the MAC still
+enabled: the frames the hardware went on to send before
+MT_MAC_SYS_CTRL was cleared used numbers past the ones read, and after
+the restart the key started from the old value and used them again.
+With CCMP that is the same nonce on two different frames, pairwise or
+group key alike.
+
+Read them after the MAC and the DMA have been stopped. Keys with a
+software packet number are not affected: the number is taken when the
+frame is built and the frames still queued are dropped.
+
+Found by reading the source in a security review of the Wi-Fi drivers;
+no watchdog restart was provoked to see it on the air.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/mt76x02_mmio.c
++++ b/mt76x02_mmio.c
+@@ -528,12 +528,22 @@ static void mt76x02_reset_state(struct m
+ 
+ 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ 
++	dev->mt76.vif_mask = 0;
++	dev->mt76.beacon_mask = 0;
++}
++
++/* Take the packet numbers the hardware reached, for the keys to be installed
++ * again with them after the restart. Only once the MAC has stopped sending:
++ * a frame that goes out after they are read uses a number the key then
++ * starts from again, and the same number protects two different frames.
++ */
++static void mt76x02_sync_tx_pn(struct mt76x02_dev *dev)
++{
++	lockdep_assert_held(&dev->mt76.mutex);
++
+ 	rcu_read_lock();
+ 	ieee80211_iter_keys_rcu(dev->mt76.hw, NULL, mt76x02_key_sync, NULL);
+ 	rcu_read_unlock();
+-
+-	dev->mt76.vif_mask = 0;
+-	dev->mt76.beacon_mask = 0;
+ }
+ 
+ /* Only after the frames left in the hardware queues have been completed:
+@@ -616,6 +626,8 @@ static void mt76x02_watchdog_reset(struc
+ 	mt76_clear(dev, MT_WPDMA_GLO_CFG,
+ 		   MT_WPDMA_GLO_CFG_TX_DMA_EN | MT_WPDMA_GLO_CFG_RX_DMA_EN);
+ 	usleep_range(5000, 10000);
++	if (restart)
++		mt76x02_sync_tx_pn(dev);
+ 	mt76_wr(dev, MT_INT_SOURCE_CSR, 0xffffffff);
+ 
+ 	/* let fw reset DMA */
