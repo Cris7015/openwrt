@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 05:09:48 -0300
+Subject: [PATCH] net: xpon: omci: keep the serial number from unprivileged
+ users
+
+The GPON serial number is what the OLT authenticates the ONU with, and
+on some networks it is the only credential. Any local user could read
+it: the serial_number attribute in sysfs was 0644, and the MIB get and
+MIB next commands of the Generic Netlink family, which return the ONU-G
+and circuit pack objects that hold it, had no permission flag. The
+password attribute is write only and the config get command already
+asks for CAP_NET_ADMIN.
+
+On an OpenWrt router the services that face the network and do not run
+as root, dnsmasq, ntpd and hostapd, are the ones this matters for. Make
+serial_number 0600 and require CAP_NET_ADMIN for MIB get and MIB next.
+The status, class get and class next commands return no identity and
+stay open.
+
+Found in a security review of the OMCI agent.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/net/xpon/omci/core.c
++++ b/net/xpon/omci/core.c
+@@ -1280,6 +1280,7 @@ static const struct genl_ops omci_genl_o
+ 	},
+ 	{
+ 		.cmd = OMCI_CMD_MIB_GET,
++		.flags = GENL_ADMIN_PERM,
+ 		.policy = omci_policy,
+ 		.doit = omci_cmd_mib_get,
+ 	},
+@@ -1303,6 +1304,7 @@ static const struct genl_ops omci_genl_o
+ 	},
+ 	{
+ 		.cmd = OMCI_CMD_MIB_NEXT,
++		.flags = GENL_ADMIN_PERM,
+ 		.policy = omci_policy,
+ 		.doit = omci_cmd_mib_next,
+ 	},
+--- a/net/xpon/omci/sysfs.c
++++ b/net/xpon/omci/sysfs.c
+@@ -434,7 +434,8 @@ static ssize_t serial_number_store(struc
+ 	return omci_sysfs_string_store(omci_dev_from_dev(dev),
+ 				       OMCI_CONFIG_SERIAL_NUMBER, buf, count);
+ }
+-static DEVICE_ATTR_RW(serial_number);
++/* The serial number is what the OLT authenticates: not for every user. */
++static DEVICE_ATTR_ADMIN_RW(serial_number);
+ 
+ static ssize_t password_store(struct device *dev,
+ 			      struct device_attribute *attr,
