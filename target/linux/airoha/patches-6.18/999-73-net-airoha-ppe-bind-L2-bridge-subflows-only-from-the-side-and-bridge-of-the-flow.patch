@@ -1,0 +1,379 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 01:03:17 -0300
+Subject: [PATCH] net: airoha: ppe: bind L2 bridge subflows only from the side and
+ bridge of the flow
+
+An L2 bridge flow (bridger) reaches the v1 backend as a MAC pair, an
+optional VLAN and an output; its traffic is bound later, one L3 subflow
+per connection, when airoha_ppe_v1_rx_check() sees an unbound frame with
+that MAC pair. Nothing recorded where the flow comes in, and the check
+runs for every frame of both QDMAs, so a frame carrying the two MAC
+addresses got a subflow whatever port it entered through: from the fibre
+with the addresses of two hosts of the LAN bridge, or from a LAN port of
+one bridge with those of a flow of another. The subflow then forwards
+that connection in hardware to the output of the flow, past the bridge
+and the firewall.
+
+Remember, for each L2 flow, the side of the netdev its rule was added on
+(bridger adds it on the DSA conduit for a switch port and on the xPON
+netdev for the fibre) and the bridge its output device is a port of.
+The RX path now passes the QDMA a frame was received on, and the special
+tag gives the switch port. A subflow is only created when the frame came
+in on the side of the flow and, where the port can be told, through a
+port of that bridge; behind a switch a frame without the special tag is
+one the CPU put on the LAN QDMA (WHNAT) and gets none. Frames refused
+are counted in l2_ingress_reject (debugfs ppe/regs).
+
+Within one bridge any port can still use the addresses of another host,
+as on any bridge; and a flow that is already bound is matched by its
+5-tuple alone, by the hardware and by the rebind, as before.
+
+ppe_v1_l2_ingress_check=N restores the old behaviour.
+
+Found in a security review; the same holds for the L2 flows of the
+MediaTek PPE this was modelled on.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -514,7 +514,8 @@ static void econet_qdma_rx_process_one(s
+ 	if (airoha_is(eth, econet_en751221) && reason ==
+ 	    AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR) {
+ 		airoha_ppe_dev_check_skb_reason(eth->ppe_dev, skb, hash,
+-						reason, ingress_gem);
++						reason, ingress_gem,
++						q->qdma->qdma->id);
+ 		dev_kfree_skb(skb);
+ 		return;
+ 	}
+@@ -522,7 +523,7 @@ static void econet_qdma_rx_process_one(s
+ 	skb_set_hash(skb, jhash_1word(hash, 0),
+ 		     PKT_HASH_TYPE_L4);
+ 	airoha_ppe_dev_check_skb_reason(eth->ppe_dev, skb, hash, reason,
+-					ingress_gem);
++					ingress_gem, q->qdma->qdma->id);
+ 
+ 	if (airoha_is(q->qdma->qdma->eth, econet_en7528))
+ 		sport = FIELD_GET(EN7528_ERX_SPORT_MASK,
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -809,6 +809,14 @@ struct airoha_flow_table_entry {
+ 	bool v1_dead;
+ 	/* v1: GPON ingress GEM recorded at bind, or AIROHA_PPE_RX_GEM_NONE. */
+ 	u16 v1_ingress_gem;
++	/*
++	 * v1 L2 bridge flow: where its traffic may enter. The side is that of
++	 * the netdev the rule was added on, kept in @v1_l2_idev; the bridge
++	 * (ifindex, 0 if none) is the one the output device is a port of.
++	 */
++	u8 v1_l2_side;
++	int v1_l2_bridge;
++	struct net_device *v1_l2_idev;
+ 	u16 addr_type;
+ 	u16 src_port;
+ 	u16 dest_port;
+@@ -1197,6 +1205,7 @@ struct airoha_ppe_v1 {
+ 	u32 l2_reaped;
+ 	u32 l2_lookups;
+ 	u32 l2_misses;
++	u32 l2_ingress_reject;
+ 	struct airoha_flow_table_entry **foe_owner;
+ 	bool armed;
+ 	u32 rx_multicast_skip;
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -2689,6 +2689,17 @@ module_param_named(ppe_v1_lan_qdma, airo
+ MODULE_PARM_DESC(ppe_v1_lan_qdma,
+ 		 "Forward EN751221 downstream LAN flows through the LAN QDMA (applies to new flows)");
+ 
++/*
++ * An L2 bridge flow reaches the PPE as two MAC addresses and an output.
++ * Checking nothing else, a frame with that MAC pair got a hardware subflow
++ * whatever port it came in through; N restores that.
++ */
++static bool airoha_ppe_v1_l2_ingress_check = true;
++module_param_named(ppe_v1_l2_ingress_check, airoha_ppe_v1_l2_ingress_check,
++		   bool, 0644);
++MODULE_PARM_DESC(ppe_v1_l2_ingress_check,
++		 "Bind an L2 bridge subflow only for a frame that entered through the side and the bridge of its flow");
++
+ static void airoha_foe_v1_entry_set_pse_port(struct airoha_foe_entry *entry,
+ 					      u8 port)
+ {
+@@ -2984,6 +2995,9 @@ static u16 airoha_ppe_v1_find_bind_way(s
+ 	return AIROHA_FOE_V1_INVALID_HASH;
+ }
+ 
++/* Source port in the special tag the MT7530 puts in front of a frame. */
++#define AIROHA_FOE_V1_MTK_TAG_SPORT	GENMASK(2, 0)
++
+ struct airoha_foe_v1_tuple {
+ 	u16 addr_type;
+ 	u8 l4proto;
+@@ -3005,6 +3019,9 @@ struct airoha_foe_v1_tuple {
+ 	u16 vlan;
+ 	u16 pppoe_sid;
+ 	bool pppoe;
++	/* Received from a switch port, named by the special tag. */
++	bool dsa_tag;
++	u8 dsa_port;
+ };
+ 
+ static bool airoha_foe_v1_parse_tuple(struct sk_buff *skb,
+@@ -3037,6 +3054,8 @@ static bool airoha_foe_v1_parse_tuple(st
+ 		/* MTK special tag occupies the ethertype/TCI position. */
+ 		if (len < ETH_HLEN + 4)
+ 			return false;
++		tuple->dsa_tag = true;
++		tuple->dsa_port = proto & AIROHA_FOE_V1_MTK_TAG_SPORT;
+ 		proto_off += 4;
+ 		proto = get_unaligned_be16(data + proto_off);
+ 	}
+@@ -3215,18 +3234,134 @@ static unsigned long airoha_ppe_v1_flow_
+ #define AIROHA_PPE_V1_L2_MAX_SUBFLOWS	256
+ #define AIROHA_PPE_V1_L2_SUBFLOW_IDLE	(30 * HZ)
+ 
++/* Where the traffic of an L2 bridge flow enters the frame engine. */
++enum {
++	AIROHA_PPE_V1_L2_SIDE_ANY,	/* not known: not checked */
++	AIROHA_PPE_V1_L2_SIDE_LAN,	/* GDM1, received on QDMA0 */
++	AIROHA_PPE_V1_L2_SIDE_WAN,	/* GDM2, received on QDMA1 */
++};
++
++/*
++ * bridger adds the rule of a bridge flow on the netdev the frames come in
++ * through or on the one below it: the DSA conduit for a switch port, the
++ * xPON netdev for the fibre. That gives the side. The bridge is the one the
++ * output device is a port of.
++ */
++static void airoha_ppe_v1_l2_set_ingress(struct airoha_flow_table_entry *flow,
++					 struct net_device *dev,
++					 struct net_device *odev)
++{
++	struct airoha_gdm_common *gdm = airoha_gdm_common_from_netdev(dev);
++	struct net_device *master;
++
++	flow->v1_l2_idev = dev;
++	if (gdm && gdm->pse_port == FE_PSE_PORT_GDM1)
++		flow->v1_l2_side = AIROHA_PPE_V1_L2_SIDE_LAN;
++	else if (gdm && gdm->pse_port == FE_PSE_PORT_GDM2)
++		flow->v1_l2_side = AIROHA_PPE_V1_L2_SIDE_WAN;
++
++	rcu_read_lock();
++	master = netdev_master_upper_dev_get_rcu(odev);
++	if (master)
++		flow->v1_l2_bridge = master->ifindex;
++	rcu_read_unlock();
++}
++
++static int airoha_ppe_v1_upper_is(struct net_device *upper,
++				  struct netdev_nested_priv *priv)
++{
++	return upper->ifindex == *(int *)priv->data;
++}
++
++/* @dev is a port of bridge @bridge, directly or through devices above it. */
++static bool airoha_ppe_v1_dev_in_bridge(struct net_device *dev, int bridge)
++{
++	struct netdev_nested_priv priv = { .data = &bridge };
++
++	return netdev_walk_all_upper_dev_rcu(dev, airoha_ppe_v1_upper_is, &priv);
++}
++
++/* The user port, of the switch behind @conduit, that the special tag names. */
++static struct net_device *airoha_ppe_v1_dsa_user(struct net_device *conduit,
++						 u8 port)
++{
++	struct dsa_port *cpu_dp = conduit->dsa_ptr, *dp;
++
++	dsa_tree_for_each_user_port(dp, cpu_dp->dst)
++		if (dp->cpu_dp == cpu_dp && dp->index == port)
++			return dp->user;
++
++	return NULL;
++}
++
++/*
++ * May a frame received on @qdma_id get a subflow of @parent? It has to come
++ * in on the side the flow was offloaded for and, where the port can be told,
++ * through a port of the bridge the flow forwards in. The MAC addresses are
++ * not enough: any port can send a frame with the addresses of a flow of
++ * another bridge, or of the other side, and its subflow would then carry
++ * that traffic in hardware past the bridge and the firewall.
++ */
++static bool
++airoha_ppe_v1_l2_ingress_ok(const struct airoha_flow_table_entry *parent,
++			    const struct airoha_foe_v1_tuple *tuple, u8 qdma_id)
++{
++	struct net_device *in = parent->v1_l2_idev;
++	bool ok = true;
++
++	if (!READ_ONCE(airoha_ppe_v1_l2_ingress_check) ||
++	    parent->v1_l2_side == AIROHA_PPE_V1_L2_SIDE_ANY)
++		return true;
++	if (parent->v1_l2_side != (qdma_id ? AIROHA_PPE_V1_L2_SIDE_WAN :
++					 AIROHA_PPE_V1_L2_SIDE_LAN))
++		return false;
++	if (!parent->v1_l2_bridge)
++		return true;
++
++	rcu_read_lock();
++	if (qdma_id) {
++		ok = airoha_ppe_v1_dev_in_bridge(in, parent->v1_l2_bridge);
++	} else if (netdev_uses_dsa(in)) {
++		struct net_device *user;
++
++		/*
++		 * Behind a switch every frame of a port carries the special
++		 * tag. One without it was put on the LAN QDMA by the CPU (a
++		 * WiFi frame handed over by WHNAT), not received on a port. A
++		 * port without a netdev cannot be told: leave it alone.
++		 */
++		if (!tuple->dsa_tag) {
++			ok = false;
++		} else {
++			user = airoha_ppe_v1_dsa_user(in, tuple->dsa_port);
++			if (user)
++				ok = airoha_ppe_v1_dev_in_bridge(user,
++								 parent->v1_l2_bridge);
++		}
++	}
++	rcu_read_unlock();
++
++	return ok;
++}
++
+ static struct airoha_flow_table_entry *
+ airoha_ppe_v1_l2_lookup(struct airoha_ppe *ppe,
+-			const struct airoha_foe_v1_tuple *tuple)
++			const struct airoha_foe_v1_tuple *tuple, u8 qdma_id)
+ {
+ 	struct airoha_flow_table_entry *flow;
++	bool rejected = false;
+ 
+ 	list_for_each_entry(flow, &ppe->v1.l2_flows, v1_list) {
+-		if (flow->v1_l2_vlan == tuple->vlan &&
+-		    ether_addr_equal(flow->v1_l2_smac, tuple->smac) &&
+-		    ether_addr_equal(flow->v1_l2_dmac, tuple->dmac))
++		if (flow->v1_l2_vlan != tuple->vlan ||
++		    !ether_addr_equal(flow->v1_l2_smac, tuple->smac) ||
++		    !ether_addr_equal(flow->v1_l2_dmac, tuple->dmac))
++			continue;
++		if (airoha_ppe_v1_l2_ingress_ok(flow, tuple, qdma_id))
+ 			return flow;
++		rejected = true;
+ 	}
++	if (rejected)
++		ppe->v1.l2_ingress_reject++;
+ 
+ 	return NULL;
+ }
+@@ -3371,7 +3506,8 @@ airoha_ppe_v1_l2_subflow(struct airoha_p
+ }
+ 
+ static void airoha_ppe_v1_rx_check(struct airoha_ppe *ppe, struct sk_buff *skb,
+-				u16 hash, u8 reason, u16 ingress_gem)
++				u16 hash, u8 reason, u16 ingress_gem,
++				u8 qdma_id)
+ {
+ 	struct airoha_foe_v1_tuple tuple;
+ 	struct airoha_flow_table_entry *flow, *parent;
+@@ -3415,7 +3551,7 @@ static void airoha_ppe_v1_rx_check(struc
+ 	if (list_empty(&ppe->v1.l2_flows))
+ 		goto out;
+ 	ppe->v1.l2_lookups++;
+-	parent = airoha_ppe_v1_l2_lookup(ppe, &tuple);
++	parent = airoha_ppe_v1_l2_lookup(ppe, &tuple, qdma_id);
+ 	if (!parent)
+ 		ppe->v1.l2_misses++;
+ 	if (parent) {
+@@ -3429,12 +3565,13 @@ out:
+ 
+ static void airoha_ppe_check_skb_reason(struct airoha_ppe_dev *ppe_dev,
+ 				       struct sk_buff *skb, u16 hash, u8 reason,
+-				       u16 ingress_gem)
++				       u16 ingress_gem, u8 qdma_id)
+ {
+ 	struct airoha_ppe *ppe = ppe_dev->priv;
+ 
+ 	if (ppe->common.eth->soc->foe_format == AIROHA_FOE_FORMAT_V1)
+-		airoha_ppe_v1_rx_check(ppe, skb, hash, reason, ingress_gem);
++		airoha_ppe_v1_rx_check(ppe, skb, hash, reason, ingress_gem,
++				       qdma_id);
+ }
+ 
+ static void airoha_ppe_v1_flush(struct airoha_ppe *ppe)
+@@ -3852,6 +3989,7 @@ static int airoha_ppe_v1_flow_set_output
+  * traffic is bound later as L3 subflows by airoha_ppe_v1_rx_check().
+  */
+ static int airoha_ppe_v1_l2_flow_replace(struct airoha_ppe *ppe,
++					 struct net_device *dev,
+ 					 struct flow_cls_offload *cls,
+ 					 const void *owner)
+ {
+@@ -3934,6 +4072,7 @@ static int airoha_ppe_v1_l2_flow_replace
+ 	ether_addr_copy(flow->v1_l2_smac, addrs.key->src);
+ 	ether_addr_copy(flow->v1_l2_dmac, addrs.key->dst);
+ 	flow->v1_l2_vlan = vlan;
++	airoha_ppe_v1_l2_set_ingress(flow, dev, odev);
+ 	flow->hash = AIROHA_FOE_V1_INVALID_HASH;
+ 	flow->v1_lastused = jiffies;
+ 	flow->v1_ingress_gem = AIROHA_PPE_RX_GEM_NONE;
+@@ -3987,7 +4126,7 @@ static int airoha_ppe_v1_flow_offload_re
+ 		return -EEXIST;
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS) &&
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+-		return airoha_ppe_v1_l2_flow_replace(ppe, cls, owner);
++		return airoha_ppe_v1_l2_flow_replace(ppe, dev, cls, owner);
+ 	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ 		NL_SET_ERR_MSG_MOD(cls->common.extack,
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -607,6 +607,8 @@ static int airoha_ppe_v1_debugfs_regs_sh
+ 	seq_printf(m, "l2_reaped=%u\n", READ_ONCE(ppe->v1.l2_reaped));
+ 	seq_printf(m, "l2_lookups=%u\n", READ_ONCE(ppe->v1.l2_lookups));
+ 	seq_printf(m, "l2_misses=%u\n", READ_ONCE(ppe->v1.l2_misses));
++	seq_printf(m, "l2_ingress_reject=%u\n",
++		   READ_ONCE(ppe->v1.l2_ingress_reject));
+ 	seq_printf(m, "flows=%u\n", flows);
+ 	seq_printf(m, "foe_cpu=%px\n", ppe->common.foe);
+ 	seq_printf(m, "foe_dma=%pad\n", &ppe->common.foe_dma);
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -31,7 +31,8 @@ struct airoha_ppe_dev {
+ 				  bool rx_wlan);
+ 		void (*check_skb_reason)(struct airoha_ppe_dev *dev,
+ 					 struct sk_buff *skb, u16 hash,
+-					 u8 reason, u16 ingress_gem);
++					 u8 reason, u16 ingress_gem,
++					 u8 qdma_id);
+ 		int (*setup_tc)(struct airoha_ppe_dev *dev,
+ 				struct net_device *netdev,
+ 				enum tc_setup_type type, void *type_data);
+@@ -62,10 +63,11 @@ static inline void airoha_ppe_dev_check_
+ static inline void
+ airoha_ppe_dev_check_skb_reason(struct airoha_ppe_dev *dev,
+ 				struct sk_buff *skb, u16 hash, u8 reason,
+-				u16 ingress_gem)
++				u16 ingress_gem, u8 qdma_id)
+ {
+ 	if (dev && dev->ops.check_skb_reason)
+-		dev->ops.check_skb_reason(dev, skb, hash, reason, ingress_gem);
++		dev->ops.check_skb_reason(dev, skb, hash, reason, ingress_gem,
++					   qdma_id);
+ }
+ 
+ static inline int airoha_ppe_dev_setup_tc(struct airoha_ppe_dev *dev,
+@@ -104,7 +106,7 @@ static inline void airoha_ppe_dev_check_
+ static inline void
+ airoha_ppe_dev_check_skb_reason(struct airoha_ppe_dev *dev,
+ 				struct sk_buff *skb, u16 hash, u8 reason,
+-				u16 ingress_gem)
++				u16 ingress_gem, u8 qdma_id)
+ {
+ }
+ 
