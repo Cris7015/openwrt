@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 02:25:13 -0300
+Subject: [PATCH] net: xpon: omci: drop the services of an ANI-side bridge port when it is deleted
+
+A Delete marks the object pending_delete, works the services out again
+and only then removes it. omci_agent_resolve_bridge_locked() skips a
+UNI-side MAC bridge port that is marked, and the lookups of the mapper,
+the GEM interworking TP, the GEM port CTP and the T-CONT do not return a
+marked object, but the walk over the ANI-side ports of the bridge took
+every stored port. Deleting an ANI-side MAC bridge port configuration
+data therefore left its services installed in hardware until some later
+Create, Set or Delete of a datapath class worked them out again.
+
+Skip an ANI-side port that is not active, as the UNI side does.
+
+Read in the source in a security review of the OMCI agent.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -3205,9 +3205,14 @@ omci_agent_resolve_bridge_locked(struct
+ 		u8 wan_type;
+ 		unsigned int pcp;
+ 
++		/*
++		 * A port that is being deleted is still stored, marked, while
++		 * the services are worked out without it.
++		 */
+ 		if (wan_port->class_id !=
+ 		    OMCI_CLASS_MAC_BRIDGE_PORT_CONFIG_DATA ||
+ 		    wan_port == lan_port ||
++		    !omci_mib_object_active(agent, wan_port) ||
+ 		    get_unaligned_be16(wan_port->data) != bridge_id)
+ 			continue;
+ 		wan_type = wan_port->data[3];
