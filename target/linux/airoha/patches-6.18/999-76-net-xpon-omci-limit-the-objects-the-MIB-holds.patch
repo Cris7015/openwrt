@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 03:51:38 -0300
+Subject: [PATCH] net: xpon: omci: limit the objects the MIB holds
+
+The MIB is an xarray keyed by class and instance, and nothing limited
+how many objects it holds. omci_me_active() accepts every class below
+240, 256 to 349 and 400 to 452 besides the described ones, and a Create
+is allowed on any of them that has no descriptor, so the OLT can create
+65536 instances of each of some 380 classes. Every object is a
+kmalloc-2k allocation: about 60000 Creates use the 128 MB this router
+has free, and the kernel cannot give that memory back. With permissive
+or fake OMCI a Get of an unknown instance stores an object too.
+
+Hold at most 4096 objects. A provisioned HGU holds a few hundred (457
+here, against a Huawei OLT). A Create on a full MIB is refused with a
+processing error before the hardware is touched, and
+omci_mib_store_locked() refuses to add a new key, which covers the
+objects a Set or a Get creates and the ones written from userspace.
+The objects the ONU creates itself (defaults and profile seeds) are
+exempt, so a profile change still finds room: their number is fixed by
+the code.
+
+The service reconciliation still walks the whole MIB once for every
+pair of UNI-side and ANI-side bridge port and priority, so an OLT that
+fills the MIB with bridge ports can keep the agent busy for a long
+time. The limit bounds that, it does not make it cheap.
+
+Found by reading the source in a security review of the OMCI agent.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -102,6 +102,14 @@ static bool omci_agent_result_can_be_fak
+ #define OMCI_DEFAULT_QUEUES_PER_TCONT		1
+ #define OMCI_MAX_TCONT_RESOURCES		32
+ #define OMCI_MAX_QUEUES_PER_TCONT		8
++/*
++ * The most objects the MIB holds. Each one takes a kmalloc-2k slot and the
++ * OLT may create any instance of every class the agent accepts, so with no
++ * limit a faulty or hostile OLT fills the memory of the router. A
++ * provisioned HGU holds a few hundred. The objects the ONU creates itself
++ * are always stored: their number is fixed by the code.
++ */
++#define OMCI_MIB_MAX_OBJECTS		4096
+ 
+ #define OMCI_OMCI_ME_TYPE_TABLE_MASK		BIT(15)
+ #define OMCI_OMCI_MESSAGE_TYPE_TABLE_MASK	BIT(14)
+@@ -672,12 +680,32 @@ static void omci_agent_reset_alarm_seque
+ 	spin_unlock(&agent->alarm_lock);
+ }
+ 
++static bool omci_mib_full_locked(struct omci_agent *agent)
++{
++	struct omci_mib_object *object;
++	unsigned int count = 0;
++	unsigned long index;
++
++	xa_for_each(&agent->mib, index, object)
++		if (++count >= OMCI_MIB_MAX_OBJECTS)
++			return true;
++
++	return false;
++}
++
+ static int omci_mib_store_locked(struct omci_agent *agent,
+ 				 const struct omci_mib_object *source)
+ {
+ 	struct omci_mib_object *object;
+ 	void *old;
+ 
++	/* Replacing a stored object does not make the MIB any larger. */
++	if (source->origin != OMCI_MIB_ORIGIN_DEFAULT &&
++	    !xa_load(&agent->mib,
++		     omci_mib_key(source->class_id, source->entity_id)) &&
++	    omci_mib_full_locked(agent))
++		return -ENOSPC;
++
+ 	object = kmemdup(source, sizeof(*object), GFP_KERNEL);
+ 	if (!object)
+ 		return -ENOMEM;
+@@ -3941,6 +3969,13 @@ static u8 omci_agent_create_locked(struc
+ 		return OMCI_RESULT_NOT_SUPPORTED;
+ 	if (omci_mib_lookup(agent, class_id, entity_id))
+ 		return OMCI_RESULT_INSTANCE_EXISTS;
++	/* Refuse before the hardware is touched; it is not a passing state. */
++	if (omci_mib_full_locked(agent)) {
++		dev_warn_ratelimited(odev->parent,
++				     "OMCI MIB full (%u objects): Create of class %u instance %#x refused\n",
++				     OMCI_MIB_MAX_OBJECTS, class_id, entity_id);
++		return OMCI_RESULT_PROCESSING_ERROR;
++	}
+ 
+ 	desc = omci_me_lookup(agent, class_id);
+ 	object = kzalloc(sizeof(*object), GFP_KERNEL);
