@@ -4,7 +4,7 @@
 'require omci.rpc as omci';
 
 function notifyError(err) {
-	ui.addNotification(null, E('p', {}, _('Failed to apply OMCI profile: %s').format(err)), 'error');
+	ui.addNotification(null, E('p', {}, [ _('Failed to apply OMCI profile: %s').format(err?.message || err) ]), 'error');
 }
 
 function profileById(profiles, id) {

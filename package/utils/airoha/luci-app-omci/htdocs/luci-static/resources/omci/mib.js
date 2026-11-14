@@ -53,7 +53,7 @@ function field(label, node, description) {
 
 function notifyError(operation, error) {
 	ui.addNotification(null,
-		E('p', {}, _('%s failed: %s').format(operation, error?.message || error)),
+		E('p', {}, [ _('%s failed: %s').format(operation, error?.message || error) ]),
 		'error');
 }
 
