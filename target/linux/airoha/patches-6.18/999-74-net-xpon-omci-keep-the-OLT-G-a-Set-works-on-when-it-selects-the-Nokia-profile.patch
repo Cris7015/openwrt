@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sat, 14 Nov 2026 02:25:13 -0300
+Subject: [PATCH] net: xpon: omci: keep the OLT-G a Set works on when it selects the Nokia profile
+
+omci_agent_set_locked() holds the stored OLT-G object while
+omci_agent_profile_refresh_locked() works out the OLT profile from it.
+When that selects the Nokia profile on an HGU, the profile seed stores a
+default OLT-G ("ALCL", "ISAM") under the same key: omci_mib_store_locked()
+replaces the stored object and frees the old one, the one the Set still
+holds. The Set then read it in omci_agent_hw_update() and, if a later
+step failed, copied the saved state back over it: a read, or a write of
+the whole object, in freed kmalloc-2k memory.
+
+One baseline Set from the OLT does it: OLT-G instance 0, OLT vendor ID
+"ALCL" or "NOKI" (or an equipment ID naming Nokia or Alcatel), with the
+OLT profile on auto and another profile in effect. It became reachable
+with 930-416, which creates OLT-G in every profile: before that the Set
+was refused with an unknown instance. It also threw away what the OLT
+had just written: the stored OLT-G was the seed, with no parsed
+identity, so the next refresh from the MIB went back to the generic
+profile.
+
+airoha/kernel has the same fix since 8bc68c4c1 ("net: xpon: omci: seed
+OLT-G so the OLT can name itself", 2-nov-2026), which added the OLT-G of
+every profile there: skip the Nokia seed of OLT-G once the OLT has named
+itself. Take that part as it is. In addition, make the Set check that
+the refresh left its object in place before using it again, so that a
+seed added later cannot bring this back.
+
+Found by reading the source in a security review of the OMCI agent; not
+run against a Nokia OLT.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/net/xpon/omci/agent.c
++++ b/net/xpon/omci/agent.c
+@@ -1293,7 +1293,13 @@ omci_agent_seed_nokia_locked(struct omci
+ 		if (ret)
+ 			return ret;
+ 
+-		/* Class 131 (OLT-G): pre-seed the Nokia/ALCL OLT identity. */
++		/*
++		 * Class 131 (OLT-G): pre-seed the Nokia/ALCL OLT identity. An
++		 * OLT that named itself is why we are here: its Set is still
++		 * using the object, and its identity is the real one.
++		 */
++		if (omci_agent_olt_g_locked(agent))
++			return 0;
+ 		memset(data, 0, sizeof(data));
+ 		memcpy(data, "ALCL", 4);
+ 		memcpy(data + 4, "ISAM                ", 20);
+@@ -4127,6 +4133,17 @@ static u8 omci_agent_set_locked(struct o
+ 	if (class_id == OMCI_CLASS_OLT_G) {
+ 		ret = omci_agent_profile_refresh_locked(odev, &object->olt_g,
+ 							profile_changed);
++		/*
++		 * A profile change rebuilds part of the MIB and has to leave
++		 * this object in place. Should it ever not, the object is
++		 * gone: neither read it nor roll it back.
++		 */
++		if (WARN_ON_ONCE(xa_load(&agent->mib,
++					 omci_mib_key(class_id, entity_id)) !=
++				 object)) {
++			ret = OMCI_RESULT_PROCESSING_ERROR;
++			goto out_free_previous;
++		}
+ 		if (ret)
+ 			goto rollback_processing;
+ 	}
