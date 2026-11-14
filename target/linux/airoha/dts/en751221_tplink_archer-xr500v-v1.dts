@@ -7,6 +7,16 @@
 	model = "TP-Link Archer XR500v v1";
 	compatible = "tplink,archer-xr500v-v1", "econet,en751221";
 
+	/*
+	 * The EIP-93 driver registers its ciphers and hashes above the
+	 * software ones (priority 1500), was written for little-endian
+	 * systems and runs here with the crypto self-tests off. Nothing uses
+	 * it: keep it out until it has been validated on this SoC.
+	 */
+	crypto@1e004000 {
+		status = "disabled";
+	};
+
 	/* The sampled board identifies as EN7526G within the EN751221 family. */
 	memory@0 {
 		device_type = "memory";
