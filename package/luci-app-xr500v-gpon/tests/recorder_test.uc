@@ -395,6 +395,16 @@ function state_case(name, state, n, over) {
 eq('recorder_migration_stuck', count(state_case('s1', 3, 6, {}), 'sn_stuck'), 1);
 eq('recorder_migration_stuck_short', count(state_case('s2', 3, 3, {}), 'sn_stuck'), 0);
 eq('recorder_migration_no_light', count(state_case('s3', 1, 6, {}), 'sn_stuck'), 0);
+// The MAC reports O2 after a restart even with the fiber unplugged.
+function dark_case(name, state, n, rx) {
+	let s = [];
+	for (let i = 0; i < n; i++)
+		push(s, sample(T0 + 60 * i, { status: status({ state, bosa_rx_power_nw: rx }) }));
+	return types(replay(name, { boot: T0, samples: s }).out?.events);
+}
+eq('recorder_migration_stuck_unplugged', count(dark_case('s4', 2, 6, 0), 'sn_stuck'), 0);
+eq('recorder_migration_stuck_below_crit', count(dark_case('s5', 2, 6, 1000), 'sn_stuck'), 0);
+eq('recorder_migration_stuck_dim_light', count(dark_case('s6', 2, 6, 3000), 'sn_stuck'), 1);
 
 const REG = (state) => ({ voip: { wan_up: true, lines: [ { registrations: [ { state, code: 403 } ] } ] } });
 eq('recorder_migration_sip', count(state_case('v1', 5, 13, REG('failed')), 'sip_fail'), 1);

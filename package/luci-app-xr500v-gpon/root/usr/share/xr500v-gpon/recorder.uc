@@ -296,7 +296,11 @@ function ingest(raw) {
 		for (let ev in detect(st.known, sample, sample.bip, th))
 			add_event(sample.t, ev);
 	// O2-O4 with light on the fiber: the OLT does not take this serial.
-	if (sample.state >= 2 && sample.state <= 4) {
+	// The MAC reports O2 as soon as it restarts, with or without light,
+	// so the light is checked here: without it the fiber is just out.
+	let rx_dbm = nw_to_dbm(sample.rx_nw);
+	if (sample.state >= 2 && sample.state <= 4 &&
+	    rx_dbm != null && rx_dbm > th.rx_crit_dbm) {
 		if (st.stuck_t == null)
 			st.stuck_t = sample.t;
 		else if (sample.t - st.stuck_t >= STUCK_SECS && !st.stuck_told) {
