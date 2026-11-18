@@ -150,6 +150,28 @@
 
 &switch0 {
 	status = "okay";
+
+	/*
+	 * Flow control on the path between the LAN ports and the frame
+	 * engine. The LAN ports of the companion MT7530 negotiate pause and
+	 * the frame engine already stops for the switch, but the three switch
+	 * MACs in between had none: a pause from a LAN link partner ended at
+	 * the companion, which dropped the downstream frames at the ingress
+	 * of its port 6.
+	 */
+	ports {
+		port@6 {
+			fixed-link {
+				pause;
+			};
+		};
+	};
+};
+
+&gport5 {
+	fixed-link {
+		pause;
+	};
 };
 
 /* The four RJ45 ports hang off the MT7530 (switch1) behind the internal
@@ -169,6 +191,12 @@
 
 &switch1 {
 	status = "okay";
+};
+
+&mcm_port6 {
+	fixed-link {
+		pause;
+	};
 };
 
 &gsw_port1 {
