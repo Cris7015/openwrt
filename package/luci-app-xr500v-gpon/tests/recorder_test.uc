@@ -100,6 +100,29 @@ eq('recorder_replay_deactivate_events', length(filter(types(r.out?.events), (t) 
 eq('recorder_replay_deactivate_counter', r.out?.counters?.deactivate, 1);
 eq('recorder_replay_deactivate_health', r.out?.health, 'crit');
 
+// recorder_klog_source_*: only the kernel's own lines count. logread prints
+// the date, then who logged; a daemon repeating a name from the network (a
+// DHCP host name, a login) cannot pass for the driver or for pppd.
+const DATE = 'Sun Nov 22 18:00:00 2026 ';
+r = replay('klog-logread', { boot: T0 + 440, samples,
+	klog: [ { t: T0 + 540, line: DATE + 'kern.info kernel: ' + DEACT } ] });
+eq('recorder_klog_source_logread_kernel', r.out?.counters?.deactivate, 1);
+r = replay('klog-forged', { boot: T0 + 440, samples, klog: [
+	{ t: T0 + 500, line: DATE + 'daemon.info dnsmasq-dhcp[1]: DHCPACK(br-lan) 192.168.1.5 ' +
+		'02:00:00:00:00:01 1fb60000.xmac.Deactivate_ONU-ID' },
+	{ t: T0 + 510, line: DATE + 'daemon.err uhttpd[2]: luci: failed login on / for ' +
+		'kern.info kernel: [  100.000000] airoha-xpon 1fb60000.xmac: Deactivate_ONU-ID' },
+	{ t: T0 + 520, line: DATE + 'authpriv.warn dropbear[3]: Bad password attempt for ' +
+		"'pppd[1]: CHAP authentication failed'" },
+	{ t: T0 + 525, line: DATE + 'authpriv.warn dropbear[3]: pppd[1]: CHAP authentication failed' },
+	{ t: T0 + 530, line: DATE + 'authpriv.warn dropbear[3]: pppd[1]: CHAP authentication failed' },
+	{ t: T0 + 535, line: DATE + 'authpriv.warn dropbear[3]: pppd[1]: CHAP authentication failed' }
+] });
+eq('recorder_klog_source_forged_deactivate', r.out?.counters?.deactivate, 0);
+eq('recorder_klog_source_forged_events', length(filter(types(r.out?.events),
+	(t) => t == 'deactivate' || t == 'wan_auth')), 0);
+eq('recorder_klog_source_forged_health', r.out?.health == 'crit', false);
+
 // recorder_replay_relock_events: an O6, the return to O5 with the PHY delay
 // moved, an EqD adjustment and a TO2 expiry become events with their numbers;
 // the first O5 delay of a session (no diff) does not.
@@ -385,6 +408,16 @@ eq('recorder_migration_auth_repeats', count(wan_case('m2', [ AUTH, AUTH, AUTH, A
 eq('recorder_migration_pado', count(wan_case('m3', [ PADO, PADO, PADO ]), 'wan_no_pado'), 1);
 eq('recorder_migration_login_clears', count(wan_case('m4',
 	[ AUTH, AUTH, 'local  IP address 1.2.3.4', AUTH, AUTH ]), 'wan_auth'), 0);
+// the same lines as logread prints them, with the date in front
+function wan_case_dated(name, lines) {
+	let s = [], k = [];
+	for (let i = 0; i < 8; i++)
+		push(s, sample(T0 + 60 * i));
+	for (let i = 0; i < length(lines); i++)
+		push(k, { t: T0 + 60 * i + 30, line: 'Sun Nov  1 08:00:00 2026 ' + PPP + lines[i] });
+	return types(replay(name, { boot: T0, samples: s, klog: k }).out?.events);
+}
+eq('recorder_migration_auth_dated', count(wan_case_dated('m5', [ AUTH, AUTH, AUTH, AUTH ]), 'wan_auth'), 1);
 
 function state_case(name, state, n, over) {
 	let s = [];

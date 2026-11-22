@@ -337,8 +337,36 @@ function ingest(raw) {
 		st.serial = raw.status.serial;
 }
 
+// Who wrote a line of the log. `logread -e` filters on the text alone, so a
+// daemon that logs a name it was given over the network (a DHCP host name, a
+// login) could put the driver's words in the file. logread prints the 24
+// characters of the date, then "kern.<level> kernel:" for the kernel itself or
+// "<facility>.<level> <tag>[<pid>]:" for a daemon, and neither can be chosen
+// from outside; dmesg prints the bare "[seconds]" form.
+function klog_source(line) {
+	if (match(line, /^(.{24} kern\.[a-z]+ kernel: )?\[ *[0-9]+\.[0-9]+\] /))
+		return 'kernel';
+	if (match(line, /^(.{24} )?[a-z0-9]+\.[a-z]+ pppd\[[0-9]+\]: /))
+		return 'pppd';
+	return null;
+}
+
 // t: wall clock when the line was read, used if it has no kernel timestamp.
 function on_klog(line, t) {
+	let src = klog_source(line);
+	if (src == 'pppd') {
+		if (index(line, 'authentication failed') >= 0)
+			wan_failed(t, 'wan_auth', 'crit',
+				'The ISP rejected the PPPoE login: the credentials may have changed');
+		else if (index(line, 'Timeout waiting for PADO') >= 0)
+			wan_failed(t, 'wan_no_pado', 'warn',
+				'No PPPoE server answered: the VLAN or the service may have changed');
+		else if (index(line, 'local  IP address') >= 0)
+			st.wan_fail = {};
+		return;
+	}
+	if (src != 'kernel')
+		return;
 	let up = kernel_up(line);
 	if (index(line, 'Deactivate_ONU-ID') >= 0) {
 		st.deact++;
@@ -378,15 +406,6 @@ function on_klog(line, t) {
 			state: m ? m[1] : null, events: m ? m[2] : null,
 			acted: index(line, 'treating it as LOS') >= 0,
 			msg: 'Signal lost for less than 250 ms, latched by the PHY' });
-	} else if (index(line, 'pppd') >= 0) {
-		if (index(line, 'authentication failed') >= 0)
-			wan_failed(t, 'wan_auth', 'crit',
-				'The ISP rejected the PPPoE login: the credentials may have changed');
-		else if (index(line, 'Timeout waiting for PADO') >= 0)
-			wan_failed(t, 'wan_no_pado', 'warn',
-				'No PPPoE server answered: the VLAN or the service may have changed');
-		else if (index(line, 'local  IP address') >= 0)
-			st.wan_fail = {};
 	}
 }
 
