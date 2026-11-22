@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -297,7 +298,10 @@ static int aectap_file(const char *what)
 
 static void aectap_open(void)
 {
-	if (access("/tmp/xr500v-aectap", F_OK))
+	struct stat st;
+
+	/* /tmp is world writable: only root arms the taps, with a file of its own */
+	if (lstat("/tmp/xr500v-aectap", &st) || !S_ISREG(st.st_mode) || st.st_uid != 0)
 		return;
 	g_tap_mic = aectap_file("mic");
 	g_tap_ref = aectap_file("ref");
