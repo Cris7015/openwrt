@@ -1,0 +1,111 @@
+sdp: parse a multipart body in place and bound every part
+
+Backport of baresip commit 2cbfd2140be7 ("sdp: refactor
+sdp_decode_multipart handling and add test", v4.13.0, advisory
+GHSA-r8w9-gf54-m35r) to 3.16.0.
+
+sdp_decode_multipart() worked on a copy of the body. Two adjacent
+boundaries made the length of a part wrap around, so the part was
+searched far beyond the copy; and the offset of the SDP part was taken
+between the copy and the message buffer, which left the message pointing
+into the copy after it had been freed.
+
+Both are reached from the 18x and 2xx answers to an outgoing call.
+
+--- a/src/sdp.c
++++ b/src/sdp.c
+@@ -71,21 +71,24 @@
+ }
+ 
+ 
+-static void decode_part(const struct pl *part, struct mbuf *mb)
++static bool decode_part_next(const struct pl *part, struct mbuf *mb)
+ {
+ 	struct pl hdrs, body;
+ 
+ 	if (re_regex(part->p, part->l, "\r\n\r\n[^]+", &body))
+-		return;
++		return true;
+ 
+ 	hdrs.p = part->p;
+-	hdrs.l = body.p - part->p - 2;
++	hdrs.l = body.p - part->p;
+ 
+ 	if (0 == re_regex(hdrs.p, hdrs.l, "application/sdp")) {
++		mb->pos += hdrs.l;
++		mb->end = mb->pos + body.l;
+ 
+-		mb->pos += (body.p - (char *)mbuf_buf(mb));
+-		mb->end  = mb->pos + body.l;
++		return false;
+ 	}
++
++	return true;
+ }
+ 
+ 
+@@ -100,45 +103,43 @@
+ int sdp_decode_multipart(const struct pl *ctype_prm, struct mbuf *mb)
+ {
+ 	struct pl p, bnd;
+-	char bnd_str[64];
+-	char *s, *e;
+-	char *buf = NULL;
++	char bnd_str[73];
++	const char *s, *e;
++	int bnd_slen;
+ 	int err;
+ 
+ 	if (!ctype_prm || !mb)
+ 		return EINVAL;
+ 
+ 	/* fetch the boundary tag, excluding quotes */
+-	err = re_regex(ctype_prm->p, ctype_prm->l,
+-		       "boundary=[~]+", &bnd);
++	err = re_regex(ctype_prm->p, ctype_prm->l, "boundary=[~]+", &bnd);
+ 	if (err)
+ 		return err;
+ 
+-	err = pl_strcpy(&bnd, bnd_str, sizeof(bnd_str));
+-	if (err)
+-		return err;
++	bnd_slen = re_snprintf(bnd_str, sizeof(bnd_str), "--%r", &bnd);
++	if (bnd_slen == -1)
++		return EMSGSIZE;
+ 
+-	err = mbuf_strdup(mb, &buf, mbuf_get_left(mb));
+-	if (err)
+-		return err;
++	pl_set_mbuf(&p, mb);
+ 
+ 	/* find 1st boundary */
+-	s = strstr(buf, bnd_str);
++	s = pl_strstr(&p, bnd_str);
++	if (!s)
++		return EBADMSG;
+ 
+ 	/* iterate over each part */
+-	while (s) {
+-		e = strstr(s + bnd.l, bnd_str);
++	do {
++		mbuf_advance(mb, s - (char *)mbuf_buf(mb) + bnd_slen);
++		pl_set_mbuf(&p, mb);
++
++		e = pl_strstr(&p, bnd_str);
+ 		if (!e)
+ 			break;
+ 
+-		p.p = s + bnd.l + 2;
+-		p.l = e - p.p - 2;
++		p.l = e - p.p;
++		s   = e;
+ 
+-		decode_part(&p, mb);
+-
+-		s = e;
+-	}
++	} while (decode_part_next(&p, mb));
+ 
+-	mem_deref(buf);
+ 	return 0;
+ }
