@@ -81,11 +81,17 @@ static const u32 pcm_reg_defaults[PCM_REG_COUNT] = {
  */
 static void pcm_soft_reset(struct pcm_dev *p)
 {
-	u32 v = readl(p->scu + SCU_PCM_RESET);
+	void __iomem *reg = p->scu + SCU_PCM_RESET;
 
-	writel(v | SCU_PCM0_RESET_BIT, p->scu + SCU_PCM_RESET);
+	/*
+	 * The register also holds the resets of the xPON MAC, PCIe, the
+	 * switch and the frame engine, which their drivers pulse through the
+	 * reset controller. Read it again for every write: a value kept across
+	 * the sleep would put back whatever those bits were before it.
+	 */
+	writel(readl(reg) | SCU_PCM0_RESET_BIT, reg);
 	usleep_range(1000, 2000);
-	writel(v & ~SCU_PCM0_RESET_BIT, p->scu + SCU_PCM_RESET);
+	writel(readl(reg) & ~SCU_PCM0_RESET_BIT, reg);
 	usleep_range(1000, 2000);
 }
 

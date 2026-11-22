@@ -327,19 +327,24 @@ static void zsi_hw_init(void)
 /* ZSI SLIC reset: 0x1fb00834 bit0 then bit17 (EN751221). NOT bit25 (that's SPI). */
 static void zsi_slic_reset(void)
 {
-	u32 g, chip;
+	void __iomem *reg = sd.sys + SYS_GPIO_DATA;
+	u32 chip;
 
-	g = readl(sd.sys + SYS_GPIO_DATA);
-	writel(g | BIT(0), sd.sys + SYS_GPIO_DATA);
+	/*
+	 * The register also holds the resets of the xPON MAC, PCIe, the
+	 * switch and the frame engine, which their drivers pulse through the
+	 * reset controller. Read it again for every write: a value kept across
+	 * the sleep would put back whatever those bits were before it.
+	 */
+	writel(readl(reg) | BIT(0), reg);
 	msleep(5);
-	writel(g & ~BIT(0), sd.sys + SYS_GPIO_DATA);
+	writel(readl(reg) & ~BIT(0), reg);
 
 	chip = readl(sd.sys + SYS_CHIP_ID) & 0xffff0000;
 	if (chip != SYS_CHIP_EN7526C) {
-		g = readl(sd.sys + SYS_GPIO_DATA);
-		writel(g | BIT(17), sd.sys + SYS_GPIO_DATA);
+		writel(readl(reg) | BIT(17), reg);
 		msleep(5);
-		writel(g & ~BIT(17), sd.sys + SYS_GPIO_DATA);
+		writel(readl(reg) & ~BIT(17), reg);
 	}
 	msleep(10);	/* let the SLIC core boot after reset */
 }
