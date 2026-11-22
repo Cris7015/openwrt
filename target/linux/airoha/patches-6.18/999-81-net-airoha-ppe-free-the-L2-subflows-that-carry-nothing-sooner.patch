@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 22 Nov 2026 19:54:32 -0300
+Subject: [PATCH] net: airoha: ppe: free the L2 subflows that carry nothing
+ sooner
+
+An L2 bridge flow carries at most 256 connections in hardware, one
+subflow each, and a bridged line is one such flow per direction for the
+whole house. A subflow is created for every packet with a new tuple and
+freed only when its flow is full, once it has been idle for 30 s.
+
+On the XR500v in bridge mode, 26 h after boot: the upstream flow held 237
+of its 256 subflows on a quiet evening, the flows had been full 1481
+times, and 22434 packets of new connections had found no place. Among the
+subflows were port scans from the Internet, which nothing behind the
+router had asked for: one packet each, a place taken for 30 s.
+
+The PPE unbinds an entry by itself after 15 s without traffic, so past
+that a subflow only holds its place: give up a bound one after 20 s. One
+that never got a hardware entry is a single packet, since a connection is
+bound on its second one: give it up after 5 s. Both times and the cap are
+now parameters of the module (ppe_v1_l2_idle, ppe_v1_l2_unbound_idle,
+ppe_v1_l2_max_subflows), so they can be tried on a running router; the
+cap keeps its default because rx_check still walks every flow for each
+packet without one. l2_reaped_unbound in debugfs counts the second kind.
+
+Found in the 22-nov-2026 code audit. Compiles with the kernel's flags;
+not yet run on hardware.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3228,11 +3228,52 @@ static unsigned long airoha_ppe_v1_flow_
+ 
+ /*
+  * In bridge mode all the traffic of the house is a single MAC pair per
+- * direction, so this caps how many of its connections the PPE carries.
+- * Do not raise it before rx_check stops walking every flow per packet.
++ * direction, so the cap on the subflows of an L2 flow is how many of its
++ * connections the PPE carries. It is small because rx_check walks every flow
++ * for each packet that has none: do not raise the default before that
++ * changes. A subflow that carries nothing must then leave soon. Subflows
++ * are freed when their parent is full, at most once a second:
++ *
++ *  - one that owns a hardware entry, after ppe_v1_l2_idle seconds without
++ *    traffic. The PPE itself unbinds an entry that was idle for 15 s, so
++ *    past that the subflow only holds its place;
++ *  - one that never got a hardware entry, after ppe_v1_l2_unbound_idle
++ *    seconds. A connection is bound on its second packet; what stays
++ *    unbound is a single packet, such as a port scan from the Internet or a
++ *    DNS query, and each of those took a place for the full idle time.
+  */
+-#define AIROHA_PPE_V1_L2_MAX_SUBFLOWS	256
+-#define AIROHA_PPE_V1_L2_SUBFLOW_IDLE	(30 * HZ)
++static unsigned int airoha_ppe_v1_l2_max_subflows = 256;
++module_param_named(ppe_v1_l2_max_subflows, airoha_ppe_v1_l2_max_subflows,
++		   uint, 0644);
++MODULE_PARM_DESC(ppe_v1_l2_max_subflows,
++		 "Hardware subflows one L2 bridge flow may have, 16 to 1024 (default: 256)");
++
++static unsigned int airoha_ppe_v1_l2_idle = 20;
++module_param_named(ppe_v1_l2_idle, airoha_ppe_v1_l2_idle, uint, 0644);
++MODULE_PARM_DESC(ppe_v1_l2_idle,
++		 "Seconds without traffic after which a full L2 bridge flow gives up a bound subflow, 5 to 300 (default: 20)");
++
++static unsigned int airoha_ppe_v1_l2_unbound_idle = 5;
++module_param_named(ppe_v1_l2_unbound_idle, airoha_ppe_v1_l2_unbound_idle,
++		   uint, 0644);
++MODULE_PARM_DESC(ppe_v1_l2_unbound_idle,
++		 "The same for a subflow that never got a hardware entry, 1 to 300 (default: 5)");
++
++static unsigned int airoha_ppe_v1_l2_cap(void)
++{
++	return clamp(READ_ONCE(airoha_ppe_v1_l2_max_subflows), 16U, 1024U);
++}
++
++/* Does the flow own a hardware entry, bound or aged out by the PPE? */
++static bool airoha_ppe_v1_flow_has_slot(struct airoha_ppe *ppe,
++					struct airoha_flow_table_entry *flow)
++{
++	u16 hash = flow->hash;
++
++	return hash != AIROHA_FOE_V1_INVALID_HASH &&
++	       hash < ppe->common.eth->soc->ppe_dram_entries &&
++	       ppe->v1.foe_owner[hash] == flow;
++}
+ 
+ /* Where the traffic of an L2 bridge flow enters the frame engine. */
+ enum {
+@@ -3392,6 +3433,9 @@ static unsigned int airoha_ppe_v1_l2_rea
+ 					  struct airoha_flow_table_entry *parent,
+ 					  bool all)
+ {
++	unsigned long idle = clamp(READ_ONCE(airoha_ppe_v1_l2_idle), 5U, 300U) * HZ;
++	unsigned long unbound_idle =
++		clamp(READ_ONCE(airoha_ppe_v1_l2_unbound_idle), 1U, 300U) * HZ;
+ 	struct airoha_flow_table_entry *flow, *tmp;
+ 	unsigned int freed = 0;
+ 
+@@ -3399,10 +3443,17 @@ static unsigned int airoha_ppe_v1_l2_rea
+ 	list_for_each_entry_safe(flow, tmp, &ppe->v1.flows, v1_list) {
+ 		if (flow->v1_parent != parent)
+ 			continue;
+-		if (!all &&
+-		    time_before(jiffies, airoha_ppe_v1_flow_lastused(ppe, flow) +
+-					 AIROHA_PPE_V1_L2_SUBFLOW_IDLE))
+-			continue;
++		if (!all) {
++			unsigned long lastused =
++				airoha_ppe_v1_flow_lastused(ppe, flow);
++			bool slot = airoha_ppe_v1_flow_has_slot(ppe, flow);
++
++			if (time_before(jiffies,
++					lastused + (slot ? idle : unbound_idle)))
++				continue;
++			if (!slot)
++				ppe->v1.l2_reaped_unbound++;
++		}
+ 
+ 		airoha_ppe_v1_release_flow_slot(ppe, flow, true);
+ 		list_del(&flow->v1_list);
+@@ -3423,8 +3474,9 @@ airoha_ppe_v1_l2_subflow(struct airoha_p
+ 	struct airoha_foe_entry *entry;
+ 	__be16 sport = cpu_to_be16(tuple->src_port);
+ 	__be16 dport = cpu_to_be16(tuple->dest_port);
++	unsigned int cap = airoha_ppe_v1_l2_cap();
+ 
+-	if (parent->v1_children >= AIROHA_PPE_V1_L2_MAX_SUBFLOWS) {
++	if (parent->v1_children >= cap) {
+ 		unsigned long now = jiffies;
+ 
+ 		/*
+@@ -3445,7 +3497,7 @@ airoha_ppe_v1_l2_subflow(struct airoha_p
+ 			if (freed)
+ 				airoha_ppe_v1_cache_clean(ppe);
+ 		}
+-		if (parent->v1_children >= AIROHA_PPE_V1_L2_MAX_SUBFLOWS) {
++		if (parent->v1_children >= cap) {
+ 			ppe->v1.l2_subflow_full++;
+ 			return NULL;
+ 		}
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -1203,6 +1203,7 @@ struct airoha_ppe_v1 {
+ 	u32 l2_subflow_full;
+ 	u32 l2_reaps;
+ 	u32 l2_reaped;
++	u32 l2_reaped_unbound;
+ 	u32 l2_lookups;
+ 	u32 l2_misses;
+ 	u32 l2_ingress_reject;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -605,6 +605,8 @@ static int airoha_ppe_v1_debugfs_regs_sh
+ 		   READ_ONCE(ppe->v1.l2_subflow_full));
+ 	seq_printf(m, "l2_reaps=%u\n", READ_ONCE(ppe->v1.l2_reaps));
+ 	seq_printf(m, "l2_reaped=%u\n", READ_ONCE(ppe->v1.l2_reaped));
++	seq_printf(m, "l2_reaped_unbound=%u\n",
++		   READ_ONCE(ppe->v1.l2_reaped_unbound));
+ 	seq_printf(m, "l2_lookups=%u\n", READ_ONCE(ppe->v1.l2_lookups));
+ 	seq_printf(m, "l2_misses=%u\n", READ_ONCE(ppe->v1.l2_misses));
+ 	seq_printf(m, "l2_ingress_reject=%u\n",
