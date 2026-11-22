@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 22 Nov 2026 19:14:08 -0300
+Subject: [PATCH] net: optical: en7570: use only the TGEN counters that were read
+
+en7570_tgen() sweeps the T0/T1 timer reset points 32 times and keeps the
+largest T0C and T1C it reads back, the limits of the upstream burst
+timing. The result of each I2C read was ignored and the two-byte buffer
+is not initialised: when a read failed, whatever the stack held went
+into the maximum and from there into the timing registers of the laser
+driver, and the function still returned 0.
+
+Skip a sample whose read failed. If none could be read and the flash
+holds no production values either, report it: the caller already stops
+the GPON start when the timing calibration fails.
+
+Found reading the code; no failed read has been seen on the XR500v.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/optical/airoha/en7570_txrx.c
++++ b/drivers/net/optical/airoha/en7570_txrx.c
+@@ -329,6 +329,7 @@ int en7570_tgen(struct en7570_priv *priv
+ 	u32 t0ct1c = lddla_flash_read(&priv->lddla, EN7570_FL_T0CT1C);
+ 	u8 count[2];
+ 	u8 t0c = 0, t1c = 0;
++	int samples = 0;
+ 	u8 delay;
+ 	int i;
+ 
+@@ -371,9 +372,12 @@ int en7570_tgen(struct en7570_priv *priv
+ 		lddla_update8(&priv->lddla, EN7570_T1DELAY + 3,
+ 			       EN7570_TGEN_METHOD2_MASK, 0);
+ 
+-		lddla_rd(&priv->lddla, EN7570_T0C, count, sizeof(count));
++		/* a failed read leaves count as it was: do not take it */
++		if (lddla_rd(&priv->lddla, EN7570_T0C, count, sizeof(count)))
++			continue;
+ 		t0c = max(t0c, count[0]);
+ 		t1c = max(t1c, count[1]);
++		samples++;
+ 	}
+ 	mdelay(10);
+ 
+@@ -407,6 +411,16 @@ int en7570_tgen(struct en7570_priv *priv
+ 
+ 	en7570_cdr(priv, true);			/* back to lock-to-data */
+ 	en7570_pattern_stop(priv);
++
++	/*
++	 * Without one counter from the sweep and without production values,
++	 * the burst timing above is not a measurement.
++	 */
++	if (!samples && t0ct1c == EN7570_FLASH_ERASED) {
++		dev_err(priv->lddla.dev,
++			"no TGEN counter could be read: burst timing not calibrated\n");
++		return -EIO;
++	}
+ 	return 0;
+ }
+ 
