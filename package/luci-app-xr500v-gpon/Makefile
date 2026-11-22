@@ -2,7 +2,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=GPL-2.0-only
 LUCI_TITLE:=XR500v GPON fiber health
 LUCI_PKGARCH:=all

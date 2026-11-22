@@ -161,7 +161,7 @@ start_service() {
 			procd_set_param env "XR500V_DEVICE=$device" "XR500V_AEC=$aec" "XR500V_DENOISE=$denoise" "XR500V_PLAYBACK_PERCENT=$gain" \
 				"XR500V_CALL_WAITING=$cw"
 		fi
-		procd_set_param respawn 3600 5 5
+		procd_set_param respawn 3600 5 0
 		config_get mode "phone$line" account_mode
 		if [ -n "$mode" ]; then
 			config_get net "phone$line" network lan
@@ -188,7 +188,7 @@ start_service() {
 				"XR500V_CALL_WAITING=$cw" "XR500V_FLASH_MIN_MS=$flash_min" "XR500V_FLASH_MAX_MS=$flash_max" \
 				"XR500V_IDLE_FEED=$feed"
 		fi
-		procd_set_param respawn 3600 5 5
+		procd_set_param respawn 3600 5 0
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 		procd_close_instance
