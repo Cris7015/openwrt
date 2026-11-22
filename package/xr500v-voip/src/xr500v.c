@@ -499,11 +499,11 @@ static int cap_thread(void *arg)
 		if (io.nlp_on && !blank)
 			xr_nlp_run(&io.nlp, mic, ref, aec, cap, IO_FRAME);
 		if (io.tap_fd >= 0)
-			(void)write(io.tap_fd, cap, sizeof(cap));
+			(void)write(io.tap_fd, cap, IO_FRAME * sizeof(*cap));
 		if (blank)
-			memset(cap, 0, sizeof(cap));	/* driver mute stays exact silence */
+			memset(cap, 0, IO_FRAME * sizeof(*cap));	/* driver mute stays exact silence */
 		if (g_dtmf.mute) {
-			memset(cap, 0, sizeof(cap));
+			memset(cap, 0, IO_FRAME * sizeof(*cap));
 			g_dtmf.mute--;
 		}
 
