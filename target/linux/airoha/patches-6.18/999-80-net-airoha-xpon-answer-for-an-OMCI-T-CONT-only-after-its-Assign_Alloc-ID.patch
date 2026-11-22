@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 22 Nov 2026 19:28:29 -0300
+Subject: [PATCH] net: airoha: xpon: answer for an OMCI T-CONT only after its
+ Assign_Alloc-ID
+
+A T-CONT became valid in the MAC as soon as OMCI named its Alloc-ID: on a
+Set of ME 262, and when the services kept in the MIB were installed again
+at OMCC up. The MIB outlives a session, the Alloc-IDs do not: G.984.3
+takes them back on deactivation and the OLT assigns them again with
+Assign_Alloc-ID. So after every restart of the session the ONU answered
+the grants of the Alloc-IDs of the previous one before the OLT had given
+them back. The boot log of the XR500v shows it on each start, in the
+session that follows the identity restart:
+
+  32.694 GPON OMCC up: restored 4 OMCI GEM ports
+  32.908 GPON netdev link ready: O5=1 OMCI=1 service=1 started=1
+  32.935 GPON Alloc-ID assign: 257
+  33.124 GPON Alloc-ID assign: 513
+  33.300 GPON Alloc-ID assign: 769
+
+With the same ONU-ID the Huawei OLT assigns the same Alloc-IDs and
+nothing is wrong on the fibre. But they follow the ONU-ID (256, 512 and
+768 plus it): an ONU that comes back under another ONU-ID, or on another
+PON after the fibre was moved, with its MIB still in memory, transmits
+in the grants of a neighbour until the OLT resets the MIB. The Nokia
+profile seeds T-CONTs with the placeholder Alloc-IDs 256 and 257, which
+were made valid the same way.
+
+Reserve the channel when OMCI asks, open it on the Ethernet side as
+before so the services bind to it, and write the MAC entry when the
+Assign_Alloc-ID arrives. An Alloc-ID the OLT assigns first is unchanged.
+gpon_tcont_wait_ploam=N brings back the previous behaviour.
+
+Found in the 22-nov-2026 code audit. Compiles with the kernel's flags;
+not yet run on hardware.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Mythos 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_xpon.c
++++ b/drivers/net/ethernet/airoha/airoha_xpon.c
+@@ -818,6 +818,7 @@ static int gpon_dev_init(struct xpon_pri
+ 	mutex_lock(&priv->tcont_lock);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));
+ 	memset(priv->tcont_entity_id, 0xff, sizeof(priv->tcont_entity_id));
++	bitmap_zero(priv->tcont_pending, GPON_MAX_TCONT);
+ 	mutex_unlock(&priv->tcont_lock);
+ 	dev_dbg(priv->dev,
+ 		"GPON activation reset: onu=%#x state=%#x rsp=%#x pre=%#x eqd=%#x\n",
+@@ -1443,7 +1444,13 @@ static int gpon_set_alloc_id_hw(struct x
+ 				priv->tcont_alloc_id[index] = GPON_TCONT_UNASSIGNED;
+ 				priv->tcont_entity_id[index] =
+ 					GPON_TCONT_ENTITY_UNASSIGNED;
++				__clear_bit(index, priv->tcont_pending);
+ 			}
++		} else if (test_bit(index, priv->tcont_pending)) {
++			/* OMCI reserved it; the OLT assigns it only now. */
++			ret = gpon_config_tcont_hw(priv, index, alloc_id, true);
++			if (!ret)
++				__clear_bit(index, priv->tcont_pending);
+ 		}
+ 		goto out;
+ 	}
+@@ -1478,12 +1485,36 @@ static bool gpon_alloc_id_unassigned(u16
+ 	       alloc_id == GPON_ALLOC_ID_UNASSIGNED_XG;
+ }
+ 
++/*
++ * G.984.3 gives an ONU its Alloc-IDs with Assign_Alloc-ID PLOAMs and takes
++ * them all back when it is deactivated. OMCI only names the Alloc-ID of a
++ * T-CONT (ME 262), and the MIB that holds it outlives a session: the services
++ * of the previous one are installed again as soon as the OMCC is up, before
++ * the OLT has assigned anything. A T-CONT made valid from there answers the
++ * grants of an Alloc-ID that is not this ONU's until the OLT says so, and it
++ * is somebody else's if the ONU came back under another ONU-ID or on another
++ * PON.
++ *
++ * gpon_tcont_wait_ploam (default on): a T-CONT that OMCI asks for gets its
++ * channel, so services can be bound to it, and the MAC entry stays invalid
++ * until the Assign_Alloc-ID for it arrives. An Alloc-ID the OLT assigned
++ * first is valid from the PLOAM on, as before. Off: OMCI makes the T-CONT
++ * valid at once, as before this parameter existed.
++ */
++static bool gpon_tcont_wait_ploam = true;
++module_param(gpon_tcont_wait_ploam, bool, 0644);
++MODULE_PARM_DESC(gpon_tcont_wait_ploam,
++		 "A T-CONT set by OMCI answers grants only after the Assign_Alloc-ID PLOAM for it (default: on)");
++
+ static int gpon_set_omci_tcont_hw(struct xpon_priv *priv, u16 entity_id,
+ 				  u16 alloc_id, bool valid,
+-				  unsigned int *channel)
++				  unsigned int *channel, bool *pending)
+ {
+ 	int old_index, index, ret = 0;
+ 
++	if (pending)
++		*pending = false;
++
+ 	/*
+ 	 * An unassigned Alloc-ID releases the T-CONT: do not program a
+ 	 * valid hardware T-CONT that answers grants for Alloc-ID 255.
+@@ -1506,6 +1537,7 @@ static int gpon_set_omci_tcont_hw(struct
+ 			priv->tcont_alloc_id[old_index] = GPON_TCONT_UNASSIGNED;
+ 			priv->tcont_entity_id[old_index] =
+ 				GPON_TCONT_ENTITY_UNASSIGNED;
++			__clear_bit(old_index, priv->tcont_pending);
+ 			*channel = old_index;
+ 		}
+ 		goto out;
+@@ -1519,15 +1551,47 @@ static int gpon_set_omci_tcont_hw(struct
+ 			goto out;
+ 		}
+ 
+-		ret = gpon_config_tcont_hw(priv, index, alloc_id, true);
+-		if (ret)
+-			goto out;
++		if (READ_ONCE(gpon_tcont_wait_ploam)) {
++			/*
++			 * Open the channel on the Ethernet side as before, so
++			 * that what is queued on it is handled the same way,
++			 * and leave the MAC entry to Assign_Alloc-ID.
++			 */
++			if (!priv->gdm_dev) {
++				ret = -ENODEV;
++				goto out;
++			}
++			ret = airoha_eth_set_xpon_tcont_channel(priv->gdm_dev,
++								index, true);
++			if (ret)
++				goto out;
++			__set_bit(index, priv->tcont_pending);
++		} else {
++			ret = gpon_config_tcont_hw(priv, index, alloc_id, true);
++			if (ret)
++				goto out;
++		}
+ 		priv->tcont_alloc_id[index] = alloc_id;
+ 	}
++	if (pending)
++		*pending = test_bit(index, priv->tcont_pending);
+ 
+-	if (old_index >= 0 && old_index != index)
++	if (old_index >= 0 && old_index != index) {
++		/*
++		 * The entity moves to another Alloc-ID. An Alloc-ID the OLT
++		 * assigned stays, it is the OLT's to remove; one that was only
++		 * reserved for this entity goes with it.
++		 */
++		if (test_bit(old_index, priv->tcont_pending) &&
++		    !gpon_config_tcont_hw(priv, old_index,
++					  priv->tcont_alloc_id[old_index],
++					  false)) {
++			priv->tcont_alloc_id[old_index] = GPON_TCONT_UNASSIGNED;
++			__clear_bit(old_index, priv->tcont_pending);
++		}
+ 		priv->tcont_entity_id[old_index] =
+ 			GPON_TCONT_ENTITY_UNASSIGNED;
++	}
+ 	priv->tcont_entity_id[index] = entity_id;
+ 	*channel = index;
+ out:
+@@ -2828,6 +2892,7 @@ int airoha_gpon_omci_hw_set_tcont(void *
+ {
+ 	struct xpon_priv *priv = hw_priv;
+ 	unsigned int channel = 0;
++	bool pending = false;
+ 	int ret;
+ 
+ 	if (valid && gpon_alloc_id_unassigned(alloc_id)) {
+@@ -2838,11 +2903,15 @@ int airoha_gpon_omci_hw_set_tcont(void *
+ 	}
+ 
+ 	ret = gpon_set_omci_tcont_hw(priv, entity_id, alloc_id, valid,
+-				     &channel);
++				     &channel, &pending);
+ 	if (ret) {
+ 		dev_err(priv->dev,
+ 			"failed to configure OMCI T-CONT %#x alloc-id %u: %d\n",
+ 			entity_id, alloc_id, ret);
++	} else if (valid && pending) {
++		dev_info(priv->dev,
++			 "OMCI T-CONT %#x reserved alloc-id %u channel %u, valid on its Assign_Alloc-ID\n",
++			 entity_id, alloc_id, channel);
+ 	} else if (valid) {
+ 		dev_info(priv->dev,
+ 			 "OMCI T-CONT %#x enabled alloc-id %u channel %u\n",
+@@ -2949,7 +3018,7 @@ int airoha_gpon_omci_hw_replace_service(
+ 		} else {
+ 			ret = gpon_set_omci_tcont_hw(priv, service->tcont_entity_id,
+ 						     service->alloc_id, true,
+-						     &channel);
++						     &channel, NULL);
+ 			if (!ret)
+ 				tcont_index = channel;
+ 		}
+@@ -3929,6 +3998,7 @@ static void gpon_clear_hw_tables(struct
+ 		       sizeof(priv->tcont_alloc_id));
+ 		memset(priv->tcont_entity_id, 0xff,
+ 		       sizeof(priv->tcont_entity_id));
++		bitmap_zero(priv->tcont_pending, GPON_MAX_TCONT);
+ 		mutex_unlock(&priv->tcont_lock);
+ 	}
+ 
+@@ -5880,6 +5950,7 @@ static int airoha_xpon_init_gpon(struct
+ 	bitmap_zero(priv->omci_gems, GPON_MAX_GEM_ID);
+ 	memset(priv->tcont_alloc_id, 0xff, sizeof(priv->tcont_alloc_id));
+ 	memset(priv->tcont_entity_id, 0xff, sizeof(priv->tcont_entity_id));
++	bitmap_zero(priv->tcont_pending, GPON_MAX_TCONT);
+ 
+ 	INIT_WORK(&priv->irq_work, gpon_irq_work_fn);
+ 	INIT_DELAYED_WORK(&priv->to1_work, gpon_to1_work_fn);
+--- a/drivers/net/ethernet/airoha/airoha_xpon.h
++++ b/drivers/net/ethernet/airoha/airoha_xpon.h
+@@ -575,6 +575,8 @@ struct xpon_priv {
+ 	bool			netdev_link;
+ 	u16			tcont_alloc_id[GPON_MAX_TCONT];
+ 	u16			tcont_entity_id[GPON_MAX_TCONT];
++	/* reserved by OMCI, not valid in the MAC yet; under tcont_lock */
++	DECLARE_BITMAP(tcont_pending, GPON_MAX_TCONT);
+ 
+ 	/* EqD state for O5 incremental adjustment */
+ 	u32			byte_delay;
