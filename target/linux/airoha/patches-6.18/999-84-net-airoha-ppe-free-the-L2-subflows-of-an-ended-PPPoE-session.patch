@@ -1,0 +1,274 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Sun, 22 Nov 2026 22:13:53 -0300
+Subject: [PATCH] net: airoha: ppe: free the L2 subflows of an ended PPPoE
+ session
+
+Bridged IP traffic is bound as one L3 subflow per connection, made from
+the first packet of the connection and found again by its L3/L4 tuple
+only. A subflow keeps the PPPoE session header of that packet: the PPE
+takes the header off on ingress and writes the stored one on egress,
+without looking at the session of what it forwards.
+
+On the XR500v in bridge mode the router behind it is a PPPoE client of
+the BNG, and Movistar gave it the same address back after it connected
+again (twice on 22-nov-2026). Every connection that keeps its ports
+(WireGuard, a game, a fixed-port UDP flow) then keeps its subflow, and
+goes on in the old session, where the router or the BNG drops it. The
+subflow carries traffic, so it is never idle and never freed. Should the
+hardware entry go, the next packet finds the subflow by its tuple and
+binds the old header again.
+
+Watch the PPPoE discovery frames, which go through the CPU: when the BNG
+confirms a session (PADS, on the WAN side only), free the subflows of
+that MAC pair that belong to another session; on a PADT from either
+end, those of that session. And when a packet finds a subflow by its
+tuple with another L2 header (VLAN, MAC addresses, PPPoE session), free
+the subflow and make a new one from the parent. A subflow keeps its L2
+header for that in the fields of the parent key, unused by subflows.
+l2_pppoe_ended and l2_stale in debugfs count both.
+
+Found in the 22-nov-2026 code audit; the trigger was tried with a second
+PPPoE session behind the bridge, which got a new address each time, so
+the stale case itself was not seen on hardware. Compiles with the
+kernel's flags.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3425,6 +3425,18 @@ static void airoha_foe_v1_entry_apply_ou
+ 	airoha_foe_v1_l2(entry)[0] = airoha_foe_v1_l2(tmpl)[0];
+ }
+ 
++/* Free an L2 subflow. The caller cleans the PPE cache if it had a slot. */
++static void airoha_ppe_v1_l2_free_subflow(struct airoha_ppe *ppe,
++					  struct airoha_flow_table_entry *flow)
++{
++	struct airoha_flow_table_entry *parent = flow->v1_parent;
++
++	airoha_ppe_v1_release_flow_slot(ppe, flow, true);
++	list_del(&flow->v1_list);
++	parent->v1_children--;
++	kfree(flow);
++}
++
+ /*
+  * Free the subflows of @parent that have been idle, or all of them, and
+  * return how many were freed.
+@@ -3455,10 +3467,7 @@ static unsigned int airoha_ppe_v1_l2_rea
+ 				ppe->v1.l2_reaped_unbound++;
+ 		}
+ 
+-		airoha_ppe_v1_release_flow_slot(ppe, flow, true);
+-		list_del(&flow->v1_list);
+-		parent->v1_children--;
+-		kfree(flow);
++		airoha_ppe_v1_l2_free_subflow(ppe, flow);
+ 		freed++;
+ 	}
+ 
+@@ -3546,6 +3555,11 @@ airoha_ppe_v1_l2_subflow(struct airoha_p
+ 	flow->v1_lastused = jiffies;
+ 	flow->v1_ingress_gem = AIROHA_PPE_RX_GEM_NONE;
+ 	flow->v1_owner = parent->v1_owner;
++	ether_addr_copy(flow->v1_l2_smac, tuple->smac);
++	ether_addr_copy(flow->v1_l2_dmac, tuple->dmac);
++	flow->v1_l2_vlan = tuple->vlan;
++	flow->v1_l2_pppoe = tuple->pppoe;
++	flow->v1_l2_sid = tuple->pppoe_sid;
+ 	list_add_tail(&flow->v1_list, &ppe->v1.flows);
+ 	parent->v1_children++;
+ 	ppe->v1.l2_subflows++;
+@@ -3557,6 +3571,111 @@ airoha_ppe_v1_l2_subflow(struct airoha_p
+ 	return flow;
+ }
+ 
++/* Was the L2 subflow @flow made from a packet with the L2 header of @tuple? */
++static bool
++airoha_ppe_v1_subflow_l2_ok(const struct airoha_flow_table_entry *flow,
++			    const struct airoha_foe_v1_tuple *tuple)
++{
++	return flow->v1_l2_vlan == tuple->vlan &&
++	       flow->v1_l2_pppoe == tuple->pppoe &&
++	       (!tuple->pppoe || flow->v1_l2_sid == tuple->pppoe_sid) &&
++	       ether_addr_equal(flow->v1_l2_smac, tuple->smac) &&
++	       ether_addr_equal(flow->v1_l2_dmac, tuple->dmac);
++}
++
++#define AIROHA_PPPOE_CODE_PADS	0x65
++#define AIROHA_PPPOE_CODE_PADT	0xa7
++
++/*
++ * A PPPoE client behind a bridged line (a router behind the XR500v in bridge
++ * mode) gets a new session id each time it connects, often with the same
++ * address, and so with the same L3/L4 tuples as before. A subflow writes the
++ * session header of the packet it was made from on every packet it forwards,
++ * and the PPE does not look at the session of what it forwards: a connection
++ * that keeps its ports keeps its subflow, is never idle, and goes on in the
++ * old session, where the client or the BNG drops it.
++ *
++ * The discovery frames of the client go through the CPU. When the BNG
++ * confirms a session (PADS, from the WAN side) free the subflows of that MAC
++ * pair that belong to another session; when either end ends one (PADT) free
++ * those of that session. Returns whether @skb was a PPPoE discovery frame.
++ */
++static bool airoha_ppe_v1_pppoe_disc(struct airoha_ppe *ppe,
++				     struct sk_buff *skb, u8 qdma_id)
++{
++	unsigned int off = 12, len = skb_headlen(skb), freed = 0;
++	struct airoha_flow_table_entry *flow, *tmp;
++	const u8 *data = skb->data;
++	bool slot = false;
++	u16 proto, sid;
++	u8 code;
++
++	if (len < off + 2)
++		return false;
++	proto = get_unaligned_be16(data + off);
++	if (proto != ETH_P_PPP_DISC) {
++		if (proto == ETH_P_IP || proto == ETH_P_IPV6 ||
++		    proto == ETH_P_PPP_SES || proto == ETH_P_ARP)
++			return false;
++		/* A VLAN tag, or the MTK special tag in its place... */
++		off += 4;
++		if (len < off + 2)
++			return false;
++		proto = get_unaligned_be16(data + off);
++		/* ...which a VLAN tag may follow. */
++		if (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
++			off += VLAN_HLEN;
++			if (len < off + 2)
++				return false;
++			proto = get_unaligned_be16(data + off);
++		}
++		if (proto != ETH_P_PPP_DISC)
++			return false;
++	}
++
++	/* Version and type, code, session id, length. */
++	if (len < off + 8)
++		return true;
++	code = data[off + 3];
++	sid = get_unaligned_be16(data + off + 4);
++	if (data[off + 2] != 0x11 || !sid ||
++	    (code != AIROHA_PPPOE_CODE_PADT &&
++	     (code != AIROHA_PPPOE_CODE_PADS || !qdma_id)))
++		return true;
++
++	spin_lock_bh(&ppe->v1.lock);
++	list_for_each_entry_safe(flow, tmp, &ppe->v1.flows, v1_list) {
++		const u8 *a = data, *b = data + ETH_ALEN;
++
++		if (flow->type != FLOW_TYPE_L2_SUBFLOW || !flow->v1_l2_pppoe ||
++		    (flow->v1_l2_sid == sid) == (code == AIROHA_PPPOE_CODE_PADS))
++			continue;
++		if (!(ether_addr_equal(flow->v1_l2_smac, a) &&
++		      ether_addr_equal(flow->v1_l2_dmac, b)) &&
++		    !(ether_addr_equal(flow->v1_l2_smac, b) &&
++		      ether_addr_equal(flow->v1_l2_dmac, a)))
++			continue;
++
++		slot |= airoha_ppe_v1_flow_has_slot(ppe, flow);
++		airoha_ppe_v1_l2_free_subflow(ppe, flow);
++		freed++;
++	}
++	if (slot)
++		airoha_ppe_v1_cache_clean(ppe);
++	ppe->v1.l2_pppoe_ended += freed;
++	spin_unlock_bh(&ppe->v1.lock);
++
++	if (freed)
++		dev_info_ratelimited(ppe->common.eth->dev,
++				     "PPPoE %s for session %#06x between %pM and %pM: freed %u L2 subflows of %s\n",
++				     code == AIROHA_PPPOE_CODE_PADS ? "PADS" : "PADT",
++				     sid, data + ETH_ALEN, data, freed,
++				     code == AIROHA_PPPOE_CODE_PADS ?
++				     "other sessions" : "that session");
++
++	return true;
++}
++
+ static void airoha_ppe_v1_rx_check(struct airoha_ppe *ppe, struct sk_buff *skb,
+ 				u16 hash, u8 reason, u16 ingress_gem,
+ 				u8 qdma_id)
+@@ -3564,8 +3683,11 @@ static void airoha_ppe_v1_rx_check(struc
+ 	struct airoha_foe_v1_tuple tuple;
+ 	struct airoha_flow_table_entry *flow, *parent;
+ 
+-	if (!ppe || !READ_ONCE(ppe->v1.armed) ||
+-	    hash >= ppe->common.eth->soc->ppe_dram_entries)
++	if (!ppe || !READ_ONCE(ppe->v1.armed))
++		return;
++	if (airoha_ppe_v1_pppoe_disc(ppe, skb, qdma_id))
++		return;
++	if (hash >= ppe->common.eth->soc->ppe_dram_entries)
+ 		return;
+ 	if (reason == AIROHA_PPE_CPU_REASON_KEEPALIVE_DUP_OLD_HDR) {
+ 		airoha_ppe_v1_rx_keepalive(ppe, skb, hash, ingress_gem);
+@@ -3596,6 +3718,23 @@ static void airoha_ppe_v1_rx_check(struc
+ 		    !airoha_foe_v1_flow_matches_tuple(flow, &tuple))
+ 			continue;
+ 
++		/*
++		 * A subflow is found by its L3/L4 tuple only. Back with another
++		 * L2 header (a new PPPoE session whose PADS was missed, a new
++		 * MAC address of the BNG) it would bind the old one again:
++		 * free it and make a new one from the parent.
++		 */
++		if (flow->type == FLOW_TYPE_L2_SUBFLOW &&
++		    !airoha_ppe_v1_subflow_l2_ok(flow, &tuple)) {
++			bool slot = airoha_ppe_v1_flow_has_slot(ppe, flow);
++
++			airoha_ppe_v1_l2_free_subflow(ppe, flow);
++			if (slot)
++				airoha_ppe_v1_cache_clean(ppe);
++			ppe->v1.l2_stale++;
++			break;
++		}
++
+ 		airoha_ppe_v1_bind_flow(ppe, flow, hash, ingress_gem);
+ 		goto out;
+ 	}
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -833,13 +833,17 @@ struct airoha_flow_table_entry {
+ 	/*
+ 	 * v1 L2 bridge flow (FLOW_TYPE_L2): MAC/VLAN key, with the output in
+ 	 * @data. Bridged IP traffic is bound as L3 subflows that point back
+-	 * to it through @v1_parent.
++	 * to it through @v1_parent. A subflow (FLOW_TYPE_L2_SUBFLOW) keeps in
++	 * the same fields the L2 header of the packet it was made from, and
++	 * its PPPoE session in @v1_l2_pppoe and @v1_l2_sid.
+ 	 */
+ 	struct airoha_flow_table_entry *v1_parent;
+ 	u8 v1_l2_smac[ETH_ALEN];
+ 	u8 v1_l2_dmac[ETH_ALEN];
+ 	u16 v1_l2_vlan;
+ 	u16 v1_children;
++	u16 v1_l2_sid;
++	bool v1_l2_pppoe;
+ 	/* v1 L2 parent: jiffy of the last reap of its idle subflows. */
+ 	unsigned long v1_l2_reap_at;
+ 
+@@ -1207,6 +1211,8 @@ struct airoha_ppe_v1 {
+ 	u32 l2_lookups;
+ 	u32 l2_misses;
+ 	u32 l2_ingress_reject;
++	u32 l2_stale;
++	u32 l2_pppoe_ended;
+ 	struct airoha_flow_table_entry **foe_owner;
+ 	bool armed;
+ 	u32 rx_multicast_skip;
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -611,6 +611,8 @@ static int airoha_ppe_v1_debugfs_regs_sh
+ 	seq_printf(m, "l2_misses=%u\n", READ_ONCE(ppe->v1.l2_misses));
+ 	seq_printf(m, "l2_ingress_reject=%u\n",
+ 		   READ_ONCE(ppe->v1.l2_ingress_reject));
++	seq_printf(m, "l2_stale=%u\n", READ_ONCE(ppe->v1.l2_stale));
++	seq_printf(m, "l2_pppoe_ended=%u\n", READ_ONCE(ppe->v1.l2_pppoe_ended));
+ 	seq_printf(m, "flows=%u\n", flows);
+ 	seq_printf(m, "foe_cpu=%px\n", ppe->common.foe);
+ 	seq_printf(m, "foe_dma=%pad\n", &ppe->common.foe_dma);
