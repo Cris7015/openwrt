@@ -17,15 +17,15 @@ diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/air
 index 51eebdf85..e0ef0522b 100644
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -6,6 +6,7 @@
- 
+@@ -7,6 +7,7 @@
  #include <linux/devcoredump.h>
+ #include <linux/devm-helpers.h>
  #include <linux/firmware.h>
 +#include <linux/mfd/syscon.h>
  #include <linux/platform_device.h>
  #include <linux/of_net.h>
  #include <linux/of_platform.h>
-@@ -14,6 +15,8 @@
+@@ -15,6 +16,8 @@
  
  #include "airoha_eth.h"
  
@@ -34,7 +34,7 @@ index 51eebdf85..e0ef0522b 100644
  #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
  #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
  #define NPU_EN7581_7996_FIRMWARE_DATA		"airoha/en7581_MT7996_npu_data.bin"
-@@ -32,14 +35,10 @@
+@@ -33,14 +36,10 @@
  
  #define REG_NPU_LOCAL_SRAM		0x0
  
@@ -53,7 +53,7 @@ index 51eebdf85..e0ef0522b 100644
  
  #define NPU_MBOX_BASE_ADDR		0x30c000
  
-@@ -119,8 +118,18 @@ struct airoha_npu_fw {
+@@ -120,8 +119,18 @@ struct airoha_npu_fw {
  };
  
  struct airoha_npu_soc_data {
@@ -72,7 +72,7 @@ index 51eebdf85..e0ef0522b 100644
  };
  
  #define MBOX_MSG_FUNC_ID	GENMASK(14, 11)
-@@ -180,6 +189,9 @@ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+@@ -181,6 +190,9 @@ static int __airoha_npu_send_msg(struct
  	if (reply && reply_len > len)
  		return -EINVAL;
  
@@ -82,7 +82,7 @@ index 51eebdf85..e0ef0522b 100644
  	/*
  	 * Mailbox payloads are bidirectional (CPU request, NPU response).
  	 * On EN7581+MT7996, streaming DMA_BIDIRECTIONAL against the
-@@ -270,7 +282,7 @@ airoha_npu_load_firmware_from_dts(struct device *dev, void __iomem *addr,
+@@ -271,7 +283,7 @@ airoha_npu_load_firmware_from_dts(struct
  }
  
  static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
@@ -91,7 +91,7 @@ index 51eebdf85..e0ef0522b 100644
  {
  	const struct airoha_npu_soc_data *soc;
  	void __iomem *addr;
-@@ -280,7 +292,7 @@ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
+@@ -281,7 +293,7 @@ static int airoha_npu_run_firmware(struc
  	if (!soc)
  		return -EINVAL;
  
@@ -100,7 +100,7 @@ index 51eebdf85..e0ef0522b 100644
  	if (IS_ERR(addr))
  		return PTR_ERR(addr);
  
-@@ -333,7 +345,7 @@ static void airoha_npu_wdt_work(struct work_struct *work)
+@@ -334,7 +346,7 @@ static void airoha_npu_wdt_work(struct w
  		return;
  
  	c = core - &npu->cores[0];
@@ -109,7 +109,7 @@ index 51eebdf85..e0ef0522b 100644
  	snprintf(dump, NPU_DUMP_SIZE, "PC: %08x SP: %08x LR: %08x\n",
  		 val[0], val[1], val[2]);
  
-@@ -492,6 +504,12 @@ static int airoha_npu_wlan_msg_send(struct airoha_npu *npu, int ifindex,
+@@ -493,6 +505,12 @@ static int airoha_npu_wlan_msg_send(stru
  	struct wlan_mbox_data *wlan_data;
  	int err, len;
  
@@ -122,7 +122,7 @@ index 51eebdf85..e0ef0522b 100644
  	len = sizeof(*wlan_data) + data_len;
  	wlan_data = kzalloc(len, gfp);
  	if (!wlan_data)
-@@ -515,6 +533,12 @@ static int airoha_npu_wlan_msg_get(struct airoha_npu *npu, int ifindex,
+@@ -516,6 +534,12 @@ static int airoha_npu_wlan_msg_get(struc
  	struct wlan_mbox_data *wlan_data;
  	int err, len;
  
@@ -135,7 +135,7 @@ index 51eebdf85..e0ef0522b 100644
  	len = sizeof(*wlan_data) + data_len;
  	wlan_data = kzalloc(len, gfp);
  	if (!wlan_data)
-@@ -553,29 +577,32 @@ airoha_npu_wlan_set_reserved_memory(struct airoha_npu *npu,
+@@ -554,29 +578,32 @@ airoha_npu_wlan_set_reserved_memory(stru
  
  static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
  {
@@ -180,7 +180,7 @@ index 51eebdf85..e0ef0522b 100644
  
  	if (of_property_match_string(npu->dev->of_node, "memory-region-names",
  				     "ba") >= 0) {
-@@ -586,8 +613,12 @@ static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
+@@ -587,8 +614,12 @@ static int airoha_npu_wlan_init_memory(s
  	}
  
  	cmd = WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU;
@@ -194,7 +194,7 @@ index 51eebdf85..e0ef0522b 100644
  }
  
  static u32 airoha_npu_wlan_queue_addr_get(struct airoha_npu *npu, int qid,
-@@ -679,7 +710,139 @@ void airoha_npu_put(struct airoha_npu *npu)
+@@ -680,7 +711,139 @@ void airoha_npu_put(struct airoha_npu *n
  }
  EXPORT_SYMBOL_GPL(airoha_npu_put);
  
@@ -334,7 +334,7 @@ index 51eebdf85..e0ef0522b 100644
  	.fw_rv32 = {
  		.name = NPU_EN7581_FIRMWARE_RV32,
  		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-@@ -688,9 +851,63 @@ static const struct airoha_npu_soc_data en7581_npu_soc_data = {
+@@ -689,9 +852,63 @@ static const struct airoha_npu_soc_data
  		.name = NPU_EN7581_FIRMWARE_DATA,
  		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
  	},
@@ -398,7 +398,7 @@ index 51eebdf85..e0ef0522b 100644
  	.fw_rv32 = {
  		.name = NPU_AN7583_FIRMWARE_RV32,
  		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-@@ -699,9 +916,59 @@ static const struct airoha_npu_soc_data an7583_npu_soc_data = {
+@@ -700,9 +917,59 @@ static const struct airoha_npu_soc_data
  		.name = NPU_AN7583_FIRMWARE_DATA,
  		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
  	},
@@ -458,7 +458,7 @@ index 51eebdf85..e0ef0522b 100644
  	{ .compatible = "airoha,en7581-npu", .data = &en7581_npu_soc_data },
  	{ .compatible = "airoha,an7583-npu", .data = &an7583_npu_soc_data },
  	{ /* sentinel */ }
-@@ -719,11 +986,12 @@ static const struct regmap_config regmap_config = {
+@@ -720,11 +987,12 @@ static const struct regmap_config regmap
  static int airoha_npu_probe(struct platform_device *pdev)
  {
  	struct device *dev = &pdev->dev;
@@ -473,7 +473,7 @@ index 51eebdf85..e0ef0522b 100644
  
  	base = devm_platform_ioremap_resource(pdev, 0);
  	if (IS_ERR(base))
-@@ -733,6 +1001,10 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -734,6 +1002,10 @@ static int airoha_npu_probe(struct platf
  	if (!npu)
  		return -ENOMEM;
  
@@ -484,7 +484,7 @@ index 51eebdf85..e0ef0522b 100644
  	npu->dev = dev;
  	npu->ops.ppe_init = airoha_npu_ppe_init;
  	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
-@@ -752,9 +1024,28 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -753,9 +1025,28 @@ static int airoha_npu_probe(struct platf
  	if (IS_ERR(npu->regmap))
  		return PTR_ERR(npu->regmap);
  
@@ -516,7 +516,7 @@ index 51eebdf85..e0ef0522b 100644
  
  	irq = platform_get_irq(pdev, 0);
  	if (irq < 0)
-@@ -765,27 +1056,9 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -766,30 +1057,9 @@ static int airoha_npu_probe(struct platf
  	if (err)
  		return err;
  
@@ -530,12 +530,15 @@ index 51eebdf85..e0ef0522b 100644
 -		if (irq < 0)
 -			return irq;
 -
+-		err = devm_work_autocancel(dev, &core->wdt_work,
+-					   airoha_npu_wdt_work);
+-		if (err)
+-			return err;
+-
 -		err = devm_request_irq(dev, irq, airoha_npu_wdt_handler,
 -				       IRQF_SHARED, "airoha-npu-wdt", core);
 -		if (err)
 -			return err;
--
--		INIT_WORK(&core->wdt_work, airoha_npu_wdt_work);
 -	}
 -
 -	/* wlan IRQ lines */
@@ -546,9 +549,9 @@ index 51eebdf85..e0ef0522b 100644
  		if (irq < 0)
  			return irq;
  
-@@ -794,45 +1067,67 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -798,45 +1068,70 @@ static int airoha_npu_probe(struct platf
  
- 	err = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
+ 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
  	if (err)
 -		return err;
 +		return dev_err_probe(dev, err,
@@ -565,7 +568,10 @@ index 51eebdf85..e0ef0522b 100644
  
 +		spin_lock_init(&core->lock);
 +		core->npu = npu;
-+		INIT_WORK(&core->wdt_work, airoha_npu_wdt_work);
++		err = devm_work_autocancel(dev, &core->wdt_work,
++					   airoha_npu_wdt_work);
++		if (err)
++			return err;
 +
  		core->buf = dmam_alloc_coherent(dev, AIROHA_NPU_MBOX_SIZE,
  						&core->addr, GFP_KERNEL);
@@ -637,16 +643,7 @@ index 51eebdf85..e0ef0522b 100644
  	return 0;
  }
  
-@@ -841,7 +1136,7 @@ static void airoha_npu_remove(struct platform_device *pdev)
- 	struct airoha_npu *npu = platform_get_drvdata(pdev);
- 	int i;
- 
--	for (i = 0; i < ARRAY_SIZE(npu->cores); i++)
-+	for (i = 0; i < npu->soc_data->max_cores; i++)
- 		cancel_work_sync(&npu->cores[i].wdt_work);
- }
- 
-@@ -855,6 +1150,8 @@ static struct platform_driver airoha_npu_driver = {
+@@ -849,6 +1144,8 @@ static struct platform_driver airoha_npu
  };
  module_platform_driver(airoha_npu_driver);
  

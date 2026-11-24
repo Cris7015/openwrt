@@ -44,7 +44,7 @@ diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/air
 index fe6795471..119528566 100644
 --- a/drivers/net/ethernet/airoha/airoha_npu.c
 +++ b/drivers/net/ethernet/airoha/airoha_npu.c
-@@ -15,6 +15,7 @@
+@@ -16,6 +16,7 @@
  #include <linux/regmap.h>
  #include <linux/seq_file.h>
  #include <linux/xarray.h>
@@ -52,7 +52,7 @@ index fe6795471..119528566 100644
  
  #include "airoha_eth.h"
  
-@@ -29,6 +30,7 @@
+@@ -30,6 +31,7 @@
  #define NPU_EN7581_FIRMWARE_RV32_MAX_SIZE	0x200000
  #define NPU_EN7581_FIRMWARE_DATA_MAX_SIZE	0x10000
  #define NPU_DUMP_SIZE				512
@@ -60,7 +60,7 @@ index fe6795471..119528566 100644
  /*
   * Mailbox DMA payload size. Covers sizeof(struct ppe_mbox_data) (28) and
   * WLAN TLV messages (header + payload); largest in-tree WLAN payload today
-@@ -139,8 +141,10 @@ struct airoha_npu_priv {
+@@ -140,8 +142,10 @@ struct airoha_npu_priv {
  	struct airoha_npu npu;
  	struct reserved_mem *rmem;
  	void __iomem *base;
@@ -71,7 +71,7 @@ index fe6795471..119528566 100644
  	bool started;
  };
  
-@@ -375,28 +379,23 @@ airoha_npu_load_firmware_from_dts(struct device *dev, void __iomem *addr,
+@@ -376,28 +380,23 @@ airoha_npu_load_firmware_from_dts(struct
  }
  
  static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
@@ -103,7 +103,7 @@ index fe6795471..119528566 100644
  				       soc->fw_rv32.max_size);
  	if (ret)
  		return ret;
-@@ -1738,9 +1737,10 @@ static int airoha_npu_probe_cpu_cores(struct airoha_npu *npu)
+@@ -1739,9 +1738,10 @@ static int airoha_npu_probe_cpu_cores(st
  		goto out_unlock;
  	}
  
@@ -116,7 +116,7 @@ index fe6795471..119528566 100644
  		goto out_unlock;
  	}
  
-@@ -1786,6 +1786,24 @@ static int airoha_npu_probe_cpu_cores(struct airoha_npu *npu)
+@@ -1787,6 +1787,24 @@ out_unlock:
  	return err;
  }
  
@@ -141,7 +141,7 @@ index fe6795471..119528566 100644
  int airoha_npu_start(struct device *dev)
  {
  	struct platform_device *pdev;
-@@ -1815,6 +1833,14 @@ int airoha_npu_start(struct device *dev)
+@@ -1816,6 +1834,14 @@ int airoha_npu_start(struct device *dev)
  	}
  
  	err = airoha_npu_probe_cpu_cores(npu);
@@ -156,7 +156,7 @@ index fe6795471..119528566 100644
  
  out_unlock_device:
  	device_unlock(&pdev->dev);
-@@ -1845,6 +1871,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -1846,6 +1872,7 @@ static int airoha_npu_probe(struct platf
  	npu = &priv->npu;
  	priv->base = base;
  	mutex_init(&priv->start_lock);
@@ -164,7 +164,7 @@ index fe6795471..119528566 100644
  
  	npu->soc_data = of_device_get_match_data(dev);
  	if (!npu->soc_data)
-@@ -1878,6 +1905,10 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -1879,6 +1906,10 @@ static int airoha_npu_probe(struct platf
  	if (!rmem)
  		return -ENODEV;
  	priv->rmem = rmem;
@@ -175,14 +175,13 @@ index fe6795471..119528566 100644
  
  	np = of_parse_phandle(dev->of_node, "airoha,scu", 0);
  	if (!np)
-@@ -1954,8 +1985,10 @@ static int airoha_npu_probe(struct platform_device *pdev)
+@@ -1958,7 +1989,9 @@ static int airoha_npu_probe(struct platf
  static void airoha_npu_remove(struct platform_device *pdev)
  {
  	struct airoha_npu *npu = platform_get_drvdata(pdev);
 +	struct airoha_npu_priv *priv = airoha_npu_to_priv(npu);
- 	int i;
  
 +	cancel_delayed_work_sync(&priv->start_work);
  	airoha_npu_debugfs_remove(npu);
+ }
  
- 	for (i = 0; i < npu->soc_data->max_cores; i++)

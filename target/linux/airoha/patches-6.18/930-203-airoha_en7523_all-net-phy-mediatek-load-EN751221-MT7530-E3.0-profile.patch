@@ -12,8 +12,8 @@ diff --git a/drivers/net/phy/mediatek/mtk-ge.c b/drivers/net/phy/mediatek/mtk-ge
 index 97d845c90..7672d8048 100644
 --- a/drivers/net/phy/mediatek/mtk-ge.c
 +++ b/drivers/net/phy/mediatek/mtk-ge.c
-@@ -63,13 +63,78 @@ static void mtk_gephy_config_init(struct phy_device *phydev)
- 		       FIELD_PREP(MTK_MCC_NEARECHO_OFFSET_MASK, 0x3));
+@@ -75,10 +75,71 @@ static int mt7530_phy_probe(struct phy_d
+ 	return phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
  }
  
 +static bool mt7530_phy_is_en751221_companion(struct phy_device *phydev)
@@ -73,8 +73,8 @@ index 97d845c90..7672d8048 100644
 +
  static int mt7530_phy_config_init(struct phy_device *phydev)
  {
-+	int ret;
-+
+ 	int ret;
+ 
 +	if (mt7530_phy_is_en751221_companion(phydev)) {
 +		ret = mt7530_phy_en751221_config_init(phydev);
 +		if (ret)
@@ -82,6 +82,10 @@ index 97d845c90..7672d8048 100644
 +	}
 +
  	mtk_gephy_config_init(phydev);
+ 
+ 	/* The probe() clear alone is not durable: phy_init_hw() replays only
+@@ -96,8 +157,10 @@ static int mt7530_phy_config_init(struct
+ 	phy_disable_eee(phydev);
  
  	/* Increase post_update_timer */
 -	phy_write_paged(phydev, MTK_PHY_PAGE_EXTENDED_3,

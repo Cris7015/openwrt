@@ -12,7 +12,7 @@ diff --git a/drivers/net/dsa/mt7530-mdio.c b/drivers/net/dsa/mt7530-mdio.c
 index 78551cefe..662c46b54 100644
 --- a/drivers/net/dsa/mt7530-mdio.c
 +++ b/drivers/net/dsa/mt7530-mdio.c
-@@ -226,7 +226,12 @@ mt7530_probe(struct mdio_device *mdiodev)
+@@ -226,7 +226,12 @@ mt7530_probe(struct mdio_device *mdiodev
  	if (priv->id == ID_MT7531)
  		priv->create_sgmii = mt7531_create_sgmii;
  
@@ -26,34 +26,28 @@ index 78551cefe..662c46b54 100644
  }
  
  static void
-@@ -238,15 +243,19 @@ mt7530_remove(struct mdio_device *mdiodev)
+@@ -238,16 +243,18 @@ mt7530_remove(struct mdio_device *mdiode
  	if (!priv)
  		return;
  
--	ret = regulator_disable(priv->core_pwr);
--	if (ret < 0)
--		dev_err(priv->dev,
--			"Failed to disable core power: %d\n", ret);
+-	if (priv->id == ID_MT7530) {
 +	if (priv->core_pwr) {
-+		ret = regulator_disable(priv->core_pwr);
-+		if (ret < 0)
-+			dev_err(priv->dev,
-+				"Failed to disable core power: %d\n", ret);
+ 		ret = regulator_disable(priv->core_pwr);
+ 		if (ret < 0)
+ 			dev_err(priv->dev,
+ 				"Failed to disable core power: %d\n", ret);
 +	}
  
--	ret = regulator_disable(priv->io_pwr);
--	if (ret < 0)
--		dev_err(priv->dev, "Failed to disable io pwr: %d\n",
--			ret);
 +	if (priv->io_pwr) {
-+		ret = regulator_disable(priv->io_pwr);
-+		if (ret < 0)
+ 		ret = regulator_disable(priv->io_pwr);
+ 		if (ret < 0)
+-			dev_err(priv->dev, "Failed to disable io pwr: %d\n",
+-				ret);
 +			dev_err(priv->dev,
 +				"Failed to disable io pwr: %d\n", ret);
-+	}
+ 	}
  
  	mt7530_remove_common(priv);
- 
 diff --git a/drivers/net/dsa/mt7530-mmio.c b/drivers/net/dsa/mt7530-mmio.c
 index c9c60cae9..6737b464a 100644
 --- a/drivers/net/dsa/mt7530-mmio.c

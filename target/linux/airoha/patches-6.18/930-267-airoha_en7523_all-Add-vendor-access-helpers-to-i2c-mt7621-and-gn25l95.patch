@@ -17,16 +17,16 @@ diff --git a/drivers/i2c/busses/i2c-mt7621.c b/drivers/i2c/busses/i2c-mt7621.c
 index 06dd67bfd..b05c762ad 100644
 --- a/drivers/i2c/busses/i2c-mt7621.c
 +++ b/drivers/i2c/busses/i2c-mt7621.c
-@@ -154,7 +154,7 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
+@@ -154,7 +154,7 @@ static int mtk_i2c_xfer(struct i2c_adapt
  	struct mtk_i2c *i2c;
  	struct i2c_msg *pmsg;
  	u16 addr;
 -	int i, j, ret, len, page_len;
 +	int i, j, k, ret, len, page_len;
  	u32 cmd;
- 	u32 data[2];
  
-@@ -206,7 +206,9 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
+ 	i2c = i2c_get_adapdata(adap);
+@@ -207,7 +207,9 @@ static int mtk_i2c_xfer(struct i2c_adapt
  			} else {
  				data[0] = 0;
  				data[1] = 0;
@@ -35,12 +35,12 @@ index 06dd67bfd..b05c762ad 100644
 +					data[k / 4] |= (u32)pmsg->buf[j + k] <<
 +							       (8 * (k % 4));
  				iowrite32(data[0], i2c->base + REG_SM0D0_REG);
- 				iowrite32(data[1], i2c->base + REG_SM0D1_REG);
- 				cmd = SM0CTL1_WRITE;
-@@ -219,7 +221,9 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
- 			if (pmsg->flags & I2C_M_RD) {
+ 				if (page_len > 4)
+ 					iowrite32(data[1], i2c->base + REG_SM0D1_REG);
+@@ -222,7 +224,9 @@ static int mtk_i2c_xfer(struct i2c_adapt
  				data[0] = ioread32(i2c->base + REG_SM0D0_REG);
- 				data[1] = ioread32(i2c->base + REG_SM0D1_REG);
+ 				if (page_len > 4)
+ 					data[1] = ioread32(i2c->base + REG_SM0D1_REG);
 -				memcpy(&pmsg->buf[j], data, page_len);
 +				for (k = 0; k < page_len; k++)
 +					pmsg->buf[j + k] = data[k / 4] >>

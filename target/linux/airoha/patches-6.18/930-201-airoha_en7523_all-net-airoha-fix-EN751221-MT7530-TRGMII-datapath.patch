@@ -339,9 +339,9 @@ diff --git a/drivers/net/dsa/mt7530.h b/drivers/net/dsa/mt7530.h
 index c9748db3a..b066d53be 100644
 --- a/drivers/net/dsa/mt7530.h
 +++ b/drivers/net/dsa/mt7530.h
-@@ -927,6 +927,7 @@ struct mt7530_priv {
- 	u8 active_cpu_ports;
- 	struct mdio_device *mdiodev;
+@@ -935,6 +935,7 @@ struct mt7530_priv {
+ 	struct delayed_work stats_work;
+ 	unsigned long stats_last;
  	bool			mdio_bus_registered;
 +	bool			en751221_trgmii_ready;
  };
@@ -1069,8 +1069,8 @@ diff --git a/drivers/net/phy/mediatek/mtk-ge.c b/drivers/net/phy/mediatek/mtk-ge
 index 3336d1f45..97d845c90 100644
 --- a/drivers/net/phy/mediatek/mtk-ge.c
 +++ b/drivers/net/phy/mediatek/mtk-ge.c
-@@ -63,26 +63,6 @@ static void mtk_gephy_config_init(struct phy_device *phydev)
- 		       FIELD_PREP(MTK_MCC_NEARECHO_OFFSET_MASK, 0x3));
+@@ -75,26 +75,6 @@ static int mt7530_phy_probe(struct phy_d
+ 	return phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
  }
  
 -static int mt7530_match_phy_device(struct phy_device *phydev,
@@ -1095,15 +1095,15 @@ index 3336d1f45..97d845c90 100644
 -
  static int mt7530_phy_config_init(struct phy_device *phydev)
  {
- 	mtk_gephy_config_init(phydev);
-@@ -154,7 +134,6 @@ static struct phy_driver mtk_gephy_driver[] = {
+ 	int ret;
+@@ -182,7 +162,6 @@ static struct phy_driver mtk_gephy_drive
  	{
  		PHY_ID_MATCH_EXACT(MTK_GPHY_ID_MT7530),
  		.name		= "MediaTek MT7530 PHY",
 -		.match_phy_device = mt7530_match_phy_device,
+ 		.probe		= mt7530_phy_probe,
  		.config_init	= mt7530_phy_config_init,
  		/* Interrupts are handled by the switch, not the PHY
- 		 * itself.
 diff --git a/net/dsa/tag_mtk.c b/net/dsa/tag_mtk.c
 index 791f87349..bf5a99d80 100644
 --- a/net/dsa/tag_mtk.c

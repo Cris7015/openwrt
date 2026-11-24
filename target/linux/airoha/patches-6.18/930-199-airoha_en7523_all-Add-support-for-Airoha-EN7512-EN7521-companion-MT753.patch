@@ -141,7 +141,7 @@ diff --git a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
 index 678680de1..0db335f9c 100644
 --- a/drivers/net/dsa/mt7530.c
 +++ b/drivers/net/dsa/mt7530.c
-@@ -2287,8 +2287,7 @@ mt7530_free_mdio_irq(struct mt7530_priv *priv)
+@@ -2353,8 +2353,7 @@ mt7530_free_mdio_irq(struct mt7530_priv
  	}
  }
  
@@ -151,7 +151,7 @@ index 678680de1..0db335f9c 100644
  {
  	struct device_node *mnp, *np = priv->dev->of_node;
  	struct dsa_switch *ds = priv->ds;
-@@ -2297,6 +2296,9 @@ mt7530_setup_mdio(struct mt7530_priv *priv)
+@@ -2363,6 +2362,9 @@ mt7530_setup_mdio(struct mt7530_priv *pr
  	static int idx;
  	int ret = 0;
  
@@ -161,7 +161,7 @@ index 678680de1..0db335f9c 100644
  	mnp = of_get_child_by_name(np, "mdio");
  
  	if (mnp && !of_device_is_available(mnp))
-@@ -2329,12 +2331,15 @@ mt7530_setup_mdio(struct mt7530_priv *priv)
+@@ -2395,12 +2397,15 @@ mt7530_setup_mdio(struct mt7530_priv *pr
  		dev_err(dev, "failed to register MDIO bus: %d\n", ret);
  		if (priv->irq_domain && !mnp)
  			mt7530_free_mdio_irq(priv);
@@ -177,7 +177,7 @@ index 678680de1..0db335f9c 100644
  
  static int
  mt7530_setup(struct dsa_switch *ds)
-@@ -2361,6 +2366,24 @@ mt7530_setup(struct dsa_switch *ds)
+@@ -2427,6 +2432,24 @@ mt7530_setup(struct dsa_switch *ds)
  		break;
  	}
  
@@ -202,7 +202,7 @@ index 678680de1..0db335f9c 100644
  	if (!dn) {
  		dev_err(ds->dev, "parent OF node of DSA conduit not found");
  		return -EINVAL;
-@@ -2854,6 +2877,44 @@ static void en7528_mac_port_get_caps(struct dsa_switch *ds, int port,
+@@ -2926,6 +2949,44 @@ static void en7528_mac_port_get_caps(str
  	}
  }
  
@@ -247,7 +247,7 @@ index 678680de1..0db335f9c 100644
  static void
  mt7530_mac_config(struct dsa_switch *ds, int port, unsigned int mode,
  		  phy_interface_t interface)
-@@ -3189,7 +3250,7 @@ mt753x_conduit_state_change(struct dsa_switch *ds,
+@@ -3284,7 +3345,7 @@ mt753x_conduit_state_change(struct dsa_s
  	 * interface is up.
  	 */
  	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
@@ -256,9 +256,9 @@ index 678680de1..0db335f9c 100644
  		return;
  
  	mask = BIT(cpu_dp->index);
-@@ -3422,6 +3483,16 @@ const struct mt753x_info mt753x_table[] = {
+@@ -3518,6 +3579,16 @@ const struct mt753x_info mt753x_table[]
  		.phy_write_c45 = mt7531_ind_c45_phy_write,
- 		.mac_port_get_caps = en7528_mac_port_get_caps,
+ 		.mac_port_get_caps = en7581_mac_port_get_caps,
  	},
 +	[ID_EN751221] = {
 +		.id = ID_EN751221,
@@ -279,21 +279,21 @@ index de3e430c9..c9748db3a 100644
 +++ b/drivers/net/dsa/mt7530.h
 @@ -23,6 +23,7 @@ enum mt753x_id {
  	ID_AN7583 = 5,
- 	ID_EN7523 = 6,
- 	ID_EN7528 = 7,
+ 	ID_EN7528 = 6,
+ 	ID_EN7523 = 7,
 +	ID_EN751221 = 8,
  };
  
  #define	NUM_TRGMII_CTRL			5
-@@ -925,6 +926,7 @@ struct mt7530_priv {
- 	int (*create_sgmii)(struct mt7530_priv *priv);
- 	u8 active_cpu_ports;
- 	struct mdio_device *mdiodev;
+@@ -933,6 +934,7 @@ struct mt7530_priv {
+ 	spinlock_t stats_lock; /* protects cached stats counters */
+ 	struct delayed_work stats_work;
+ 	unsigned long stats_last;
 +	bool			mdio_bus_registered;
  };
  
  struct mt7530_hw_vlan_entry {
-@@ -962,6 +964,7 @@ static inline void INIT_MT7530_DUMMY_POLL(struct mt7530_dummy_poll *p,
+@@ -970,6 +972,7 @@ static inline void INIT_MT7530_DUMMY_POL
  }
  
  int mt7530_probe_common(struct mt7530_priv *priv);
@@ -1104,8 +1104,8 @@ diff --git a/drivers/net/phy/mediatek/mtk-ge.c b/drivers/net/phy/mediatek/mtk-ge
 index 97d845c90..3336d1f45 100644
 --- a/drivers/net/phy/mediatek/mtk-ge.c
 +++ b/drivers/net/phy/mediatek/mtk-ge.c
-@@ -63,6 +63,26 @@ static void mtk_gephy_config_init(struct phy_device *phydev)
- 		       FIELD_PREP(MTK_MCC_NEARECHO_OFFSET_MASK, 0x3));
+@@ -75,6 +75,26 @@ static int mt7530_phy_probe(struct phy_d
+ 	return phy_write_mmd(phydev, MDIO_MMD_AN, MDIO_AN_EEE_ADV, 0);
  }
  
 +static int mt7530_match_phy_device(struct phy_device *phydev,
@@ -1130,12 +1130,12 @@ index 97d845c90..3336d1f45 100644
 +
  static int mt7530_phy_config_init(struct phy_device *phydev)
  {
- 	mtk_gephy_config_init(phydev);
-@@ -134,6 +154,7 @@ static struct phy_driver mtk_gephy_driver[] = {
+ 	int ret;
+@@ -162,6 +182,7 @@ static struct phy_driver mtk_gephy_drive
  	{
  		PHY_ID_MATCH_EXACT(MTK_GPHY_ID_MT7530),
  		.name		= "MediaTek MT7530 PHY",
 +		.match_phy_device = mt7530_match_phy_device,
+ 		.probe		= mt7530_phy_probe,
  		.config_init	= mt7530_phy_config_init,
  		/* Interrupts are handled by the switch, not the PHY
- 		 * itself.

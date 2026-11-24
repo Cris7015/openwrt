@@ -101,7 +101,7 @@ index 2e856672e..06dd67bfd 100644
  
  	return ret;
  }
-@@ -95,14 +106,15 @@ static void mtk_i2c_reset(struct mtk_i2c *i2c)
+@@ -95,14 +106,15 @@ static void mtk_i2c_reset(struct mtk_i2c
  	 */
  	iowrite32(((i2c->clk_div << 16) & SM0CTL0_CLK_DIV_MASK) | SM0CTL0_EN |
  		  SM0CTL0_SCL_STRETCH, i2c->base + REG_SM0CTL0_REG);
@@ -119,7 +119,7 @@ index 2e856672e..06dd67bfd 100644
  		ioread32(i2c->base + REG_SM0CTL0_REG),
  		ioread32(i2c->base + REG_SM0CTL1_REG),
  		ioread32(i2c->base + REG_SM0D0_REG),
-@@ -156,7 +168,7 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
+@@ -155,7 +167,7 @@ static int mtk_i2c_xfer(struct i2c_adapt
  		if (ret)
  			goto err_timeout;
  
@@ -128,7 +128,7 @@ index 2e856672e..06dd67bfd 100644
  		ret = mtk_i2c_start(i2c);
  		if (ret)
  			goto err_timeout;
-@@ -192,6 +204,8 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
+@@ -193,6 +205,8 @@ static int mtk_i2c_xfer(struct i2c_adapt
  				cmd = (len > 8) ?
  					SM0CTL1_READ : SM0CTL1_READ_LAST;
  			} else {
@@ -136,10 +136,10 @@ index 2e856672e..06dd67bfd 100644
 +				data[1] = 0;
  				memcpy(data, &pmsg->buf[j], page_len);
  				iowrite32(data[0], i2c->base + REG_SM0D0_REG);
- 				iowrite32(data[1], i2c->base + REG_SM0D1_REG);
-@@ -206,14 +220,12 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
- 				data[0] = ioread32(i2c->base + REG_SM0D0_REG);
- 				data[1] = ioread32(i2c->base + REG_SM0D1_REG);
+ 				if (page_len > 4)
+@@ -209,14 +223,12 @@ static int mtk_i2c_xfer(struct i2c_adapt
+ 				if (page_len > 4)
+ 					data[1] = ioread32(i2c->base + REG_SM0D1_REG);
  				memcpy(&pmsg->buf[j], data, page_len);
 -			} else {
 -				if (!(pmsg->flags & I2C_M_IGNORE_NAK)) {
@@ -156,7 +156,7 @@ index 2e856672e..06dd67bfd 100644
  			}
  		}
  	}
-@@ -222,8 +234,8 @@ static int mtk_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
+@@ -225,8 +237,8 @@ static int mtk_i2c_xfer(struct i2c_adapt
  	if (ret)
  		goto err_timeout;
  
@@ -167,7 +167,7 @@ index 2e856672e..06dd67bfd 100644
  
  err_ack:
  	ret = mtk_i2c_stop(i2c);
-@@ -247,8 +259,21 @@ static const struct i2c_algorithm mtk_i2c_algo = {
+@@ -250,8 +262,21 @@ static const struct i2c_algorithm mtk_i2
  	.functionality = mtk_i2c_func,
  };
  
@@ -190,7 +190,7 @@ index 2e856672e..06dd67bfd 100644
  	{ /* sentinel */ }
  };
  
-@@ -257,10 +282,7 @@ MODULE_DEVICE_TABLE(of, i2c_mtk_dt_ids);
+@@ -260,10 +285,7 @@ MODULE_DEVICE_TABLE(of, i2c_mtk_dt_ids);
  static void mtk_i2c_init(struct mtk_i2c *i2c)
  {
  	i2c->clk_div = clk_get_rate(i2c->clk) / i2c->bus_freq - 1;
@@ -202,7 +202,7 @@ index 2e856672e..06dd67bfd 100644
  
  	mtk_i2c_reset(i2c);
  }
-@@ -275,6 +297,10 @@ static int mtk_i2c_probe(struct platform_device *pdev)
+@@ -278,6 +300,10 @@ static int mtk_i2c_probe(struct platform
  	if (!i2c)
  		return -ENOMEM;
  
