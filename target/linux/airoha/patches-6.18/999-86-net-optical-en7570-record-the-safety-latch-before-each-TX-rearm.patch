@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Tue, 24 Nov 2026 19:49:40 -0300
+Subject: [PATCH] net: optical: en7570: record the safety latch before each TX
+ rearm
+
+en7570_op_tx_rearm() runs on every PLOAM Upstream_Overhead: it resets
+the TX safety circuit of the EN7570 and reads SAFE_PROTECT and
+ROGUE_ONU_DET_CTRL before and after, but drops what it reads. A latch
+set by a real fault (BEN stuck on, overcurrent) is rearmed with no
+trace beyond the "safety circuit rearmed" line of every rearm.
+
+Keep the behaviour and keep what was read: count the rearms, keep the
+last raw words, and warn (ratelimited) and count when the TX fault
+status bit was set before the rearm. The bit is BIT(15) of
+SAFE_PROTECT as on the EN7571 (EN7571_TX_FAULT_STATUS_MASK); it is not
+confirmed on the EN7570, so the diag file of the transceiver also shows
+the raw words.
+
+Found in the 22-nov-2026 code audit (X1).
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/optical/airoha/en7570.h
++++ b/drivers/net/optical/airoha/en7570.h
+@@ -105,6 +105,12 @@ struct en7570_priv {
+ 	int bias_read_error;
+ 	/* Uncertain control write: inhibit further TEC/bias writes until reboot. */
+ 	int optical_control_error;
++	/* TX safety circuit: rearms and what each one found (diag). */
++	u32 rearm_cnt;
++	u32 safe_latch_cnt;
++	u32 last_safe_before;
++	u32 last_safe_after;
++	u32 last_rogue;
+ };
+ 
+ /*
+--- a/drivers/net/optical/airoha/en7570_main.c
++++ b/drivers/net/optical/airoha/en7570_main.c
+@@ -361,8 +361,15 @@ static int en7570_op_tx_timing_calibrate
+ 	return en7570_tgen(priv, lddla->pon_mode);
+ }
+ 
++/*
++ * TX fault status in SAFE_PROTECT, as on the EN7571 (EN7571_TX_FAULT_STATUS_MASK).
++ * Not confirmed on the EN7570: diag shows the raw words to check it.
++ */
++#define EN7570_TX_FAULT_STATUS	BIT(15)
++
+ static int en7570_op_tx_rearm(struct airoha_lddla *lddla)
+ {
++	struct en7570_priv *priv = container_of(lddla, struct en7570_priv, lddla);
+ 	u32 safe_before = 0, safe_after = 0, rogue = 0;
+ 	int ret;
+ 
+@@ -378,6 +385,23 @@ static int en7570_op_tx_rearm(struct air
+ 			    EN7570_SAFE_CIRCUIT_RESET);
+ 	lddla_rd32(lddla, EN7570_SAFE_PROTECT, &safe_after);
+ 
++	/*
++	 * The rearm itself does not change: it runs on every Upstream_Overhead
++	 * whatever the circuit had latched. Keep what it found, so that a real
++	 * fault (BEN stuck, overcurrent) does not go by unseen.
++	 */
++	priv->rearm_cnt++;
++	priv->last_safe_before = safe_before;
++	priv->last_safe_after = safe_after;
++	priv->last_rogue = rogue;
++	if (safe_before & EN7570_TX_FAULT_STATUS) {
++		priv->safe_latch_cnt++;
++		dev_warn_ratelimited(lddla->dev,
++				     "TX safety latch was set before rearm: safe %#010x -> %#010x, rogue %#010x (%u of %u rearms)\n",
++				     safe_before, safe_after, rogue,
++				     priv->safe_latch_cnt, priv->rearm_cnt);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -403,6 +427,9 @@ static void en7570_op_diag(struct airoha
+ 	seq_printf(s, "adc slope:   %lld nV/code  offset %d uV\n",
+ 		   priv->adc_slope_nv, priv->adc_offset_uv);
+ 	seq_printf(s, "rssi factor: %d (x1000)\n", priv->rssi_factor);
++	seq_printf(s, "tx_rearm:    %u safe_latch: %u last safe %#010x -> %#010x rogue %#010x\n",
++		   priv->rearm_cnt, priv->safe_latch_cnt, priv->last_safe_before,
++		   priv->last_safe_after, priv->last_rogue);
+ }
+ 
+ static int en7570_capture_snapshot(struct airoha_lddla *lddla,

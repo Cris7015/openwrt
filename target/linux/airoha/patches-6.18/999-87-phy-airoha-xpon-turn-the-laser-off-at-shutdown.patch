@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Tue, 24 Nov 2026 19:49:40 -0300
+Subject: [PATCH] phy: airoha: xpon: turn the laser off at shutdown
+
+No driver of the xPON chain (the PHY, the xPON MAC, the EN7570) has a
+shutdown callback or a reboot notifier, and the xPON interface going
+down keeps the activation alive on purpose. On reboot the laser keeps
+answering the OLT's grants until the SoC resets; after a halt or a
+power-off, which hang without resetting on this SoC (no pm_power_off),
+it keeps transmitting for good.
+
+Add a shutdown callback to the PHY driver that asserts TX_DISABLE and
+then the transceiver's VCC_DISABLE, the same states the probe requests
+the GPIOs in. The GPIOs go through pinctrl on a MMIO regmap and the
+callback runs in process context. A panic is left alone: it resets
+within a second (panic_timeout=1), and a notifier taking the pinctrl
+lock while another CPU holds it would keep the reset from happening.
+
+Found in the 22-nov-2026 code audit (X1).
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/phy/airoha/phy-airoha-xpon.c
++++ b/drivers/phy/airoha/phy-airoha-xpon.c
+@@ -1540,8 +1540,27 @@ static const struct of_device_id airoha_
+ };
+ MODULE_DEVICE_TABLE(of, airoha_xpon_phy_of_match);
+ 
++/*
++ * Nothing else turns the laser off when the system goes down: the GPON MAC
++ * keeps answering the OLT's grants until the SoC resets and, after a halt
++ * or a power-off, which hang without resetting, it keeps doing so for good.
++ * Assert TX_DISABLE first, then cut the transceiver supply. A panic does not
++ * come here; it resets within a second (panic_timeout).
++ */
++static void airoha_xpon_phy_shutdown(struct platform_device *pdev)
++{
++	struct airoha_xpon_phy *priv = platform_get_drvdata(pdev);
++
++	if (!priv)
++		return;
++
++	airoha_xpon_phy_set_tx_gpio(priv, false);
++	airoha_xpon_phy_set_vcc_enabled(priv, false);
++}
++
+ static struct platform_driver airoha_xpon_phy_driver = {
+ 	.probe = airoha_xpon_phy_probe,
++	.shutdown = airoha_xpon_phy_shutdown,
+ 	.driver = {
+ 		.name = "airoha-xpon-phy",
+ 		.of_match_table = airoha_xpon_phy_of_match,
