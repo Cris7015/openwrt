@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Cristian Papa <pcristian292@gmail.com>
+Date: Tue, 24 Nov 2026 19:21:17 -0300
+Subject: [PATCH] net: airoha: ppe: let an L2 bridge flow carry 512
+ connections
+
+In bridge mode the whole house is one L2 flow per direction, and the
+cap on its subflows is how many connections the PPE carries for it.
+With 256, after 999-81 and 42 h of normal use on the XR500v, the
+parents were still full about 725 times an hour (l2_subflow_full),
+and each time a new connection went through the CPU until a place
+was freed; the download parent held 195 of its 256 subflows on a quiet
+afternoon.
+
+Raised to 512 at run time (ppe_v1_l2_max_subflows) for 2.4 h of the
+same use: l2_subflow_full stayed at 0 and the upload parent went
+above 256 within seconds. softirq time was 1.7 % over those afternoon
+hours (the 42 h average with 256, nights included, was 1.0 %): the
+longer walk of rx_check over the flows of a packet without one does
+not show at these rates.
+
+Make 512 the default; the parameter keeps its 16..1024 range.
+
+Signed-off-by: Cristian Papa <pcristian292@gmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -3229,10 +3229,11 @@ static unsigned long airoha_ppe_v1_flow_
+ /*
+  * In bridge mode all the traffic of the house is a single MAC pair per
+  * direction, so the cap on the subflows of an L2 flow is how many of its
+- * connections the PPE carries. It is small because rx_check walks every flow
+- * for each packet that has none: do not raise the default before that
+- * changes. A subflow that carries nothing must then leave soon. Subflows
+- * are freed when their parent is full, at most once a second:
++ * connections the PPE carries. rx_check walks every flow for each packet that
++ * has none, so the cap also bounds that walk; on the XR500v 512 stopped the
++ * parents from filling up with softirq time still under 2 %. A subflow that
++ * carries nothing must still leave soon. Subflows are freed when their parent
++ * is full, at most once a second:
+  *
+  *  - one that owns a hardware entry, after ppe_v1_l2_idle seconds without
+  *    traffic. The PPE itself unbinds an entry that was idle for 15 s, so
+@@ -3242,11 +3243,11 @@ static unsigned long airoha_ppe_v1_flow_
+  *    unbound is a single packet, such as a port scan from the Internet or a
+  *    DNS query, and each of those took a place for the full idle time.
+  */
+-static unsigned int airoha_ppe_v1_l2_max_subflows = 256;
++static unsigned int airoha_ppe_v1_l2_max_subflows = 512;
+ module_param_named(ppe_v1_l2_max_subflows, airoha_ppe_v1_l2_max_subflows,
+ 		   uint, 0644);
+ MODULE_PARM_DESC(ppe_v1_l2_max_subflows,
+-		 "Hardware subflows one L2 bridge flow may have, 16 to 1024 (default: 256)");
++		 "Hardware subflows one L2 bridge flow may have, 16 to 1024 (default: 512)");
+ 
+ static unsigned int airoha_ppe_v1_l2_idle = 20;
+ module_param_named(ppe_v1_l2_idle, airoha_ppe_v1_l2_idle, uint, 0644);
