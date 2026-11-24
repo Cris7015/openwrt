@@ -1067,30 +1067,6 @@ index 47dd76acd..67e0f93a8 100644
  
  	{ .compatible = "allwinner,sun50i-a100" },
  	{ .compatible = "allwinner,sun50i-h6", },
-diff --git a/drivers/pmdomain/mediatek/Kconfig b/drivers/pmdomain/mediatek/Kconfig
-index 0ce66024e..f6c6da8b6 100644
---- a/drivers/pmdomain/mediatek/Kconfig
-+++ b/drivers/pmdomain/mediatek/Kconfig
-@@ -26,16 +26,17 @@ config MTK_SCPSYS_PM_DOMAINS
- 	  Control Processor System (SCPSYS) has several power management related
- 	  tasks in the system.
- 
-+endmenu
-+
- config AIROHA_CPU_PM_DOMAIN
- 	tristate "Airoha CPU power domain"
- 	default ARCH_AIROHA
- 	depends on HAVE_ARM_SMCCC
- 	depends on PM
-+	depends on ARCH_AIROHA
- 	select PM_GENERIC_DOMAINS
- 	help
- 	  Say y here to enable CPU power domain support for Airoha SoC.
- 
- 	  CPU frequency and power is controlled by ATF with SMC command to
- 	  set performance states.
--
--endmenu
 diff --git a/drivers/pmdomain/mediatek/airoha-cpu-pmdomain.c b/drivers/pmdomain/mediatek/airoha-cpu-pmdomain.c
 index 4903a4941..1ed6c4985 100644
 --- a/drivers/pmdomain/mediatek/airoha-cpu-pmdomain.c
