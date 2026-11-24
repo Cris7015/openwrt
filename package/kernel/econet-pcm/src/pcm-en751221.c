@@ -1256,6 +1256,9 @@ void pcm_en751221_voice_stop(void)
 }
 EXPORT_SYMBOL_GPL(pcm_en751221_voice_stop);
 
+/* Longest a voice read or write waits for the PCM (frames come every 10 ms). */
+#define PCM_IO_TIMEOUT_MS	200
+
 /* Blocking read of captured mic PCM (16-bit linear). */
 ssize_t pcm_en751221_voice_read(char __user *ubuf, size_t len)
 {
@@ -1265,10 +1268,13 @@ ssize_t pcm_en751221_voice_read(char __user *ubuf, size_t len)
 	if (!vs.active)
 		return -ENODEV;
 	if (kfifo_is_empty(&vs.cap)) {
-		ret = wait_event_interruptible(vs.cap_wq,
-					       !kfifo_is_empty(&vs.cap) || !vs.active);
-		if (ret)
+		ret = wait_event_interruptible_timeout(vs.cap_wq,
+					       !kfifo_is_empty(&vs.cap) || !vs.active,
+					       msecs_to_jiffies(PCM_IO_TIMEOUT_MS));
+		if (ret < 0)
 			return ret;
+		if (!ret)
+			return -ETIMEDOUT;
 		if (!vs.active)
 			return 0;
 	}
@@ -1286,10 +1292,13 @@ ssize_t pcm_en751221_voice_write(const char __user *ubuf, size_t len)
 	if (!vs.active)
 		return -ENODEV;
 	if (kfifo_is_full(&vs.play)) {
-		ret = wait_event_interruptible(vs.play_wq,
-					       !kfifo_is_full(&vs.play) || !vs.active);
-		if (ret)
+		ret = wait_event_interruptible_timeout(vs.play_wq,
+					       !kfifo_is_full(&vs.play) || !vs.active,
+					       msecs_to_jiffies(PCM_IO_TIMEOUT_MS));
+		if (ret < 0)
 			return ret;
+		if (!ret)
+			return -ETIMEDOUT;
 		if (!vs.active)
 			return -ENODEV;
 	}

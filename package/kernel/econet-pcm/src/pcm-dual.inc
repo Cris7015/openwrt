@@ -31,6 +31,7 @@ struct pcm_dual_line {
 	bool opened;
 	bool mute_cap;		/* on-hook seen while open: send silence (DC-DC buzz) */
 	u32 read_bytes, write_bytes;
+	u32 io_timeouts;	/* reads/writes that gave up after PCM_IO_TIMEOUT_MS */
 	u32 tx_short_frames, cap_drop_frames;
 	/* Delay line; all under lock. */
 	s16 hold[PCM_DUAL_MAX_HOLD][PCM_SAMP_PER_FRAME];
@@ -109,7 +110,7 @@ static int pcm_dual_status_show(struct seq_file *s, void *unused)
 			READ_ONCE(pd.rx_min[i]), READ_ONCE(pd.rx_max[i]));
 	for (i = 0; i < 2; i++) {
 		struct pcm_dual_line *l = &pd.line[i];
-		u32 cap, play, rd, wr, shorts, drops, depth, retro, late;
+		u32 cap, play, rd, wr, shorts, drops, depth, retro, late, tmo;
 		bool opened, ref;
 
 		spin_lock_irqsave(&l->lock, flags);
@@ -117,11 +118,11 @@ static int pcm_dual_status_show(struct seq_file *s, void *unused)
 		rd = l->read_bytes; wr = l->write_bytes; opened = l->opened;
 		shorts = l->tx_short_frames; drops = l->cap_drop_frames;
 		depth = l->hold_depth; retro = l->retro_frames;
-		ref = l->ref_mode; late = l->ref_late;
+		ref = l->ref_mode; late = l->ref_late; tmo = l->io_timeouts;
 		spin_unlock_irqrestore(&l->lock, flags);
-		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u hold=%u retro_frames=%u ref=%u ref_late=%u\n",
+		seq_printf(s, "phone%d opened=%u rx_dma=%u tx_dma=%u cap=%u play=%u read_bytes=%u write_bytes=%u tx_short_frames=%u cap_drop_frames=%u muted=%u hold=%u retro_frames=%u ref=%u ref_late=%u io_timeouts=%u\n",
 			i + 1, opened, dual_rx_ch[i], dual_tx_ch[i], cap, play, rd, wr, shorts, drops, READ_ONCE(l->mute_cap),
-			depth, retro, ref, late);
+			depth, retro, ref, late, tmo);
 	}
 	return 0;
 }
@@ -345,6 +346,7 @@ int pcm_en751221_dual_start(void)
 		init_waitqueue_head(&l->play_wq);
 		l->opened = false;
 		l->read_bytes = l->write_bytes = 0;
+		l->io_timeouts = 0;
 		ret = kfifo_alloc(&l->cap, VOICE_FIFO_SZ, GFP_KERNEL);
 		if (ret)
 			goto free_queues;
@@ -556,12 +558,24 @@ ssize_t pcm_en751221_dual_io(unsigned int index, char __user *buf, size_t len, b
 		return -EINVAL;
 	if (!capture && copy_from_user(tmp, buf, len))
 		return -EFAULT;
-	ret = wait_event_interruptible(*wq,
+	/*
+	 * Frames come every 10 ms; a PCM that stops must not keep the caller
+	 * (baresip's audio thread, which its main loop joins on hang-up) asleep
+	 * for good. The caller retries after an error while the line is open.
+	 */
+	ret = wait_event_interruptible_timeout(*wq,
 		!READ_ONCE(pcm_dual_running) || !READ_ONCE(l->opened) ||
 		(capture ? kfifo_len(&l->cap) >= want :
-		 kfifo_len(&l->play) + len <= dual_play_limit));
-	if (ret)
+		 kfifo_len(&l->play) + len <= dual_play_limit),
+		msecs_to_jiffies(PCM_IO_TIMEOUT_MS));
+	if (ret < 0)
 		return ret;
+	if (!ret) {
+		spin_lock_irqsave(&l->lock, flags);
+		l->io_timeouts++;
+		spin_unlock_irqrestore(&l->lock, flags);
+		return -ETIMEDOUT;
+	}
 	if (!pcm_dual_running || !l->opened)
 		return -ENODEV;
 	spin_lock_irqsave(&l->lock, flags);
