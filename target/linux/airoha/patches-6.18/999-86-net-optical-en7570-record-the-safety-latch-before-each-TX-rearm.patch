@@ -10,12 +10,12 @@ ROGUE_ONU_DET_CTRL before and after, but drops what it reads. A latch
 set by a real fault (BEN stuck on, overcurrent) is rearmed with no
 trace beyond the "safety circuit rearmed" line of every rearm.
 
-Keep the behaviour and keep what was read: count the rearms, keep the
-last raw words, and warn (ratelimited) and count when the TX fault
-status bit was set before the rearm. The bit is BIT(15) of
-SAFE_PROTECT as on the EN7571 (EN7571_TX_FAULT_STATUS_MASK); it is not
-confirmed on the EN7570, so the diag file of the transceiver also shows
-the raw words.
+Keep the behaviour and keep what was read: count the rearms and the
+ones that found the TX fault status bit set (BIT(15) of SAFE_PROTECT,
+as EN7571_TX_FAULT_STATUS_MASK), and keep the last raw words; all of it
+in the diag file of the transceiver. No log line: on the XR500v the bit
+is set before every rearm, the first two of a boot included (SAFE_PROTECT
+0x0fff8fff -> 0x0fff0fff), so a set bit alone is not a fault.
 
 Found in the 22-nov-2026 code audit (X1).
 
@@ -55,26 +55,27 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  	u32 safe_before = 0, safe_after = 0, rogue = 0;
  	int ret;
  
-@@ -378,6 +385,23 @@ static int en7570_op_tx_rearm(struct air
+@@ -378,6 +385,24 @@ static int en7570_op_tx_rearm(struct air
  			    EN7570_SAFE_CIRCUIT_RESET);
  	lddla_rd32(lddla, EN7570_SAFE_PROTECT, &safe_after);
  
 +	/*
 +	 * The rearm itself does not change: it runs on every Upstream_Overhead
 +	 * whatever the circuit had latched. Keep what it found, so that a real
-+	 * fault (BEN stuck, overcurrent) does not go by unseen.
++	 * fault (BEN stuck, overcurrent) can be told apart in diag.
 +	 */
 +	priv->rearm_cnt++;
 +	priv->last_safe_before = safe_before;
 +	priv->last_safe_after = safe_after;
 +	priv->last_rogue = rogue;
-+	if (safe_before & EN7570_TX_FAULT_STATUS) {
++	/*
++	 * On the XR500v the bit is set before every rearm, the first ones of
++	 * each boot included: the circuit latches while TX is off before an
++	 * activation. So a set bit alone is no fault; count it and keep the
++	 * raw words for diag, without a log line.
++	 */
++	if (safe_before & EN7570_TX_FAULT_STATUS)
 +		priv->safe_latch_cnt++;
-+		dev_warn_ratelimited(lddla->dev,
-+				     "TX safety latch was set before rearm: safe %#010x -> %#010x, rogue %#010x (%u of %u rearms)\n",
-+				     safe_before, safe_after, rogue,
-+				     priv->safe_latch_cnt, priv->rearm_cnt);
-+	}
 +
  	return ret;
  }
