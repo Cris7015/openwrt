@@ -253,6 +253,11 @@ ifneq ($(CONFIG_USE_APK),)
 	mkdir -p $(1)/etc/apk/repositories.d
 	$(call FeedSourcesAppendAPK,$(1)/etc/apk/repositories.d/distfeeds.list)
 	$(VERSION_SED_SCRIPT) $(1)/etc/apk/repositories.d/distfeeds.list
+	$(if $(CONFIG_TARGET_airoha_en751221), \
+		$(SED) '/\/targets\//d' -e 's|^https://|@owrt https://|' \
+			$(1)/etc/apk/repositories.d/distfeeds.list; \
+		echo '# XR500v: the official feeds are tagged @owrt so that "apk upgrade" keeps the patched packages of this image (baresip and libre; hostapd; dnsmasq; ...). Install from them with "apk add <package>@owrt". There is no official feed for this target.' \
+			>>$(1)/etc/apk/repositories.d/distfeeds.list)
 
 	rm -f $(1)/etc/uci-defaults/13_fix-group-user
 	rm -f $(1)/sbin/pkg_check
