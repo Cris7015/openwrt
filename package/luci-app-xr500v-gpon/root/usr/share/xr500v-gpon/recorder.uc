@@ -40,8 +40,11 @@ const WIN_MAX_SPAN = 7200;	// close events share one window, up to 2 h
 const WIN_KEEP = 20;
 const WINDOWS_FILE = STATE_DIR + '/windows.json.gz';
 
+// eye_minutes: no periodic eye scan unless the config asks for one. The
+// shipped config says 0 but a config from before the option had none, and
+// each scan realigns the receiver's CDR phase.
 let cfg = { interval: 60, persist_hours: 6, events_max: 500, event_writes_per_day: 100, windows_per_day: 10,
-	eye_minutes: 60 };
+	eye_minutes: 0 };
 const EYE_CAP = 1080;	// eye margin history: 45 days at one scan an hour
 let th = thresholds(null);
 let sink = null;	// daemon only: event -> overlay
